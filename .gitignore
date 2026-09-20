@@ -1,0 +1,16 @@
+# Python caches and virtual environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Deskpilot User Data & Settings (DO NOT UPLOAD)
+deskpilot_settings.json
+deskpilot_chats.json
+.deskpilot.lock
+
+# Downloaded Models & Generated Content
+generated_images/
+ai-imagegen/
+whisper_models/
+kokoro_models/

@@ -1,0 +1,9 @@
+openai
+pypdf
+Pillow
+kokoro-onnx
+sounddevice
+SpeechRecognition
+pyaudio
+faster-whisper
+numpy
