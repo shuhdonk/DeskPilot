@@ -68,5 +68,4 @@ Deskpilot degrades gracefully. You only need the `openai` package for the core t
 
 ```bash
 
-pip install openai
 
