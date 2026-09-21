@@ -268,7 +268,7 @@ _safe_stdio()
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.0.0"
+VERSION    = "1.0.1"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -432,7 +432,9 @@ TOOL_SCHEMAS: Dict[str, dict] = {
         "function": {
             "name": "run_javascript",
             "description": ("Execute JavaScript code locally using Node.js in a hidden subprocess. "
-                            f"Hard {JS_TIMEOUT} second timeout. Use console.log() to produce output."),
+                            f"Hard {JS_TIMEOUT} second timeout. Use console.log() to produce output. "
+                            "stdout is capped at 8000 chars (a truncation marker is appended) - "
+                            "for larger results write them to a file and read it back in chunks."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1616,6 +1618,8 @@ class DeskpilotApp:
         self._links: Dict[tuple, str] = {}         # (line, char offset) -> URL of clickable links in chat_text
         self._clients: Dict[tuple, Any] = {}       # (server_url, api_key) -> cached OpenAI client (keep-alive pooling)
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
+        self._pending_temperature: Optional[str] = None   # welcome-state temp change, applied to the chat the next send creates
+        self._pending_thinking: Optional[str] = None      # welcome-state thinking change, same
 
         # ── root window ───────────────────────────────────────────────────
         self.root = tk.Tk()
@@ -2006,10 +2010,15 @@ class DeskpilotApp:
     def _update_temp_topbar(self) -> None:
         """Topbar shows the ACTIVE chat's temperature. No server round-trip is
         needed - we send this value with every request, so it is always known.
-        Always a concrete number (blank/legacy -> TEMP_DEFAULT)."""
+        Always a concrete number (blank/legacy -> TEMP_DEFAULT). In the welcome
+        state (no active chat yet) it shows the pending value the user just set,
+        so the topbar never snaps back to the default under the combobox."""
         try:
             chat = self.current_chat()
-            t = chat_temperature(chat)
+            if chat is None and getattr(self, "_pending_temperature", None) is not None:
+                t = chat_temperature({"temperature": self._pending_temperature})
+            else:
+                t = chat_temperature(chat)
             # t is now always a float; show exactly what will be sent, never "Default"
             self.temp_top_label.configure(text=f"\U0001F321 {t}")
         except tk.TclError:
@@ -2332,6 +2341,14 @@ class DeskpilotApp:
             "thinking":    "High",  # per-chat level; Off/Low/Medium/High -> enable_thinking / reasoning_effort
             "messages": [],
         }
+        # Consume any welcome-state pending values: they describe the
+        # conversation the user is about to start, so the new chat inherits them.
+        if self._pending_temperature is not None:
+            self.chats["chats"][cid]["temperature"] = self._pending_temperature
+            self._pending_temperature = None
+        if self._pending_thinking is not None:
+            self.chats["chats"][cid]["thinking"] = self._pending_thinking
+            self._pending_thinking = None
         self.chats["order"].append(cid)
         save_chats(self.chats)
         self._refresh_chat_list()
@@ -2341,11 +2358,18 @@ class DeskpilotApp:
     #  Per-chat temperature -------------------------------------------------
 
     def _on_temp_selected(self) -> None:
-        """User picked a temperature for the active chat; persist immediately."""
+        """User picked a temperature for the active chat; persist immediately.
+
+        In the fresh-launch welcome state there is no active chat yet, so the
+        value is held as _pending_temperature and applied to the brand-new
+        conversation that the next send starts (see send_message) - otherwise
+        the first request would go out at the default (the "set it twice" bug)."""
         chat = self.current_chat()
         if chat is not None:
             chat["temperature"] = str(self.temp_combo.get())
             save_chats(self.chats)
+        else:
+            self._pending_temperature = str(self.temp_combo.get())
         self._update_temp_topbar()
 
     def _sync_temp_combo(self, chat: Optional[dict]) -> None:
@@ -2356,11 +2380,17 @@ class DeskpilotApp:
     #  Per-chat thinking toggle ------------------------------------------------
 
     def _on_thinking_selected(self) -> None:
-        """User picked a thinking level for the active chat; persist immediately."""
+        """User picked a thinking level for the active chat; persist immediately.
+
+        In the fresh-launch welcome state there is no active chat yet, so the
+        value is held as _pending_thinking and applied to the brand-new
+        conversation that the next send starts (see send_message)."""
         chat = self.current_chat()
         if chat is not None:
             chat["thinking"] = str(self.think_combo.get())
             save_chats(self.chats)
+        else:
+            self._pending_thinking = str(self.think_combo.get())
 
     def _sync_thinking_combo(self, chat: Optional[dict]) -> None:
         """Point the combobox at a chat's saved thinking level (blank/legacy -> High)."""
@@ -2511,6 +2541,9 @@ class DeskpilotApp:
         self._sync_temp_combo(chat)
         self._sync_thinking_combo(chat)
         self._update_temp_topbar()
+        # A real conversation is now active: welcome-state pending values are stale.
+        self._pending_temperature = None
+        self._pending_thinking = None
         # Restore a previously generated handoff accordion (survives chat switches;
         # _show_handoff re-persists harmlessly and refreshes the in-memory cache).
         if chat.get("handoff_summary"):
@@ -3668,10 +3701,31 @@ class DeskpilotApp:
                 if self._closed or self._stop_event.is_set():
                     break
                 name = tc["function"]["name"]
+                args_raw_dispatch = tc["function"].get("arguments") or "{}"
                 try:
-                    args = json.loads(tc["function"].get("arguments") or "{}")
+                    args = json.loads(args_raw_dispatch)
+                    # The finalizer above masks malformed model JSON as
+                    # {"_raw_arguments": ...} so history stays sendable to strict
+                    # servers - unmask it here, otherwise the call would reach the
+                    # handler and die with a confusing TypeError instead of the
+                    # clear "re-issue valid JSON" error below.
+                    if isinstance(args, dict) and "_raw_arguments" in args:
+                        orig_raw = str(args["_raw_arguments"])
+                        if orig_raw.strip() not in ("", "{}"):
+                            raise ValueError("masked malformed JSON")
+                        args = {}
                 except Exception:
-                    args = {}
+                    # Malformed tool-call arguments (common with local models on
+                    # large payloads): never silently run the tool with {} - that
+                    # executes a no-op and looks like "the tool produced no output".
+                    self._post(lambda n=name: self._ui_tool_call_accordion(n, {"_malformed_arguments": True}))
+                    err = (f"ERROR: The {name} tool call had malformed JSON arguments and "
+                           f"could not be parsed - it was NOT executed. Re-issue the call "
+                           f"with valid JSON (keep large payloads like code concise).")
+                    messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                     "name": name, "content": err})
+                    self._post(lambda n=name, r=err: self._ui_tool_output_accordion(n, err))
+                    continue
                 self._post(lambda n=name, a=args: self._ui_tool_call_accordion(n, a))
                 self._post(lambda s=f"🛠 Running {name}…": self._set_status(s))
                 self._post(lambda n=name: self._ui_tool_output_start(n))
@@ -3984,6 +4038,13 @@ class DeskpilotApp:
         return None
 
     def _tool_run_javascript(self, code: str = "") -> str:
+        # Fail LOUDLY when no code arrived: a malformed tool-call JSON used to
+        # silently dispatch this handler with empty args (an empty .js file runs
+        # fine and prints nothing), which looked like "the loop produced no output".
+        if not (code or "").strip():
+            return ("ERROR: No JavaScript code was received. The tool-call arguments were "
+                    "empty or malformed - re-issue the run_javascript call with the full "
+                    "'code' argument as valid JSON.")
         node = self._find_node()
         if not node:
             return "ERROR: Node.js ('node') was not found on PATH. Install it from https://nodejs.org"
@@ -4001,9 +4062,12 @@ class DeskpilotApp:
                                timeout=JS_TIMEOUT, creationflags=flags,
                                stdin=subprocess.DEVNULL, cwd=tempfile.gettempdir())
             out = (p.stdout or "")
+            # Mark the cap so a cut-off result is never mistaken for "no output".
+            if len(out) > 8000:
+                out = out[:8000] + "\n[... stdout truncated at 8000 chars - print less per call or write to a file and read it back]"
             if p.stderr:
                 out += ("\n[stderr]\n" + p.stderr) if out else ("[stderr]\n" + p.stderr)
-            return (out[:8000] or "(no output)")
+            return (out or "(no output)")
         except subprocess.TimeoutExpired:
             return f"ERROR: JavaScript execution timed out after {JS_TIMEOUT} seconds."
         except Exception as e:
