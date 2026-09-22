@@ -264,11 +264,268 @@ _safe_stdio()
 
 
 # ════════════════════════════════════════════════════════════════════════════
+#  MCP CLIENT (Model Context Protocol - stdio transport, hand-rolled)
+# ════════════════════════════════════════════════════════════════════════════
+# Deskpilot can attach external MCP servers configured in Settings -> MCP
+# Servers. Each server is a local subprocess speaking newline-delimited
+# JSON-RPC 2.0 on stdin/stdout (the standard MCP stdio transport). This is a
+# minimal, dependency-free client: initialize -> tools/list -> tools/call.
+# Every tool a server advertises shows up in the permission bar as
+# mcp_<server>_<tool> and defaults to "Ask Permission" - MCP servers are
+# arbitrary local programs, so they must never be silently auto-approved.
+
+MCP_PROTOCOL_VERSION = "2025-03-26"
+MCP_MAX_SERVERS = 8          # hard cap on configured servers
+MCP_INIT_TIMEOUT = 15        # seconds for spawn + initialize handshake
+MCP_CALL_TIMEOUT = 120       # seconds per tools/call (long-running tools)
+
+
+def mcp_tool_name(server: str, raw: str) -> str:
+    """Namespaced tool name: mcp_<server>_<tool>, sanitized to [A-Za-z0-9_]."""
+    def _clean(s: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_]", "_", s).strip("_") or "x"
+    return f"mcp_{_clean(server)}_{_clean(raw)}"
+
+
+def _parse_env_pairs(text: str) -> Dict[str, str]:
+    """Parse space-separated KEY=VALUE pairs (the Add-MCP-Server env field is a
+    single-line tk.Entry, so whitespace - not newlines - separates the pairs).
+    Malformed tokens without "=" are ignored."""
+    out: Dict[str, str] = {}
+    for pair in (text or "").split():
+        if "=" in pair:
+            k, v = pair.split("=", 1)
+            if k.strip():
+                out[k.strip()] = v.strip()
+    return out
+
+
+def mcp_tool_schema(server: str, raw: str, tool: dict) -> dict:
+    """Convert one MCP tool definition to an OpenAI function-calling schema."""
+    name = mcp_tool_name(server, raw)
+    desc = str(tool.get("description") or "").strip() or f"MCP tool {raw} from server {server}"
+    params = tool.get("inputSchema")
+    if not isinstance(params, dict):
+        params = {"type": "object", "properties": {}}
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": desc[:1000],
+            "parameters": params,
+        },
+    }
+
+
+class MCPClient:
+    """One MCP server subprocess + its JSON-RPC session.
+
+    A dedicated reader thread parses stdout into a pending-response queue;
+    call_tool() sends a request and blocks (with timeout) until the matching
+    response arrives. Notifications from the server are ignored. NOT safe for
+    concurrent call_tool() from multiple threads - Deskpilot executes tool
+    calls sequentially in one worker thread, which is all this client needs."""
+
+    def __init__(self, name: str, command: str, args: Optional[List[str]] = None,
+                 env: Optional[Dict[str, str]] = None):
+        self.name = name
+        self.command = command
+        self.args = list(args or [])
+        self.env = dict(env or {})
+        self.proc: Optional[subprocess.Popen] = None
+        self.tools: List[dict] = []
+        self._pending: Dict[int, "queue.Queue"] = {}
+        self._next_id = 0
+        self._lock = threading.Lock()
+        self._closed = False
+
+    # ── lifecycle ────────────────────────────────────────────────────────
+    def connect(self, timeout: float = MCP_INIT_TIMEOUT) -> List[dict]:
+        """Spawn the server, run the initialize handshake, return its tools.
+
+        Raises RuntimeError on any failure (spawn, protocol, timeout); the
+        subprocess is always cleaned up before re-raising."""
+        full_env = dict(os.environ)
+        full_env.setdefault("PYTHONUNBUFFERED", "1")   # piped stdout is block-buffered by default
+        full_env.update(self.env)
+        try:
+            self.proc = subprocess.Popen(
+                [self.command] + self.args,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=full_env, bufsize=1, text=True, encoding="utf-8", errors="replace")
+        except Exception as e:
+            raise RuntimeError(f"could not start '{self.command}': {e}")
+        threading.Thread(target=self._reader, daemon=True).start()
+        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        try:
+            init_result = self._request("initialize", {
+                "protocolVersion": MCP_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {"name": APP_NAME, "version": VERSION},
+            }, timeout=timeout)
+            if not isinstance(init_result, dict):
+                raise RuntimeError(f"unexpected initialize result: {str(init_result)[:200]}")
+            self._notify("notifications/initialized", {})
+            tools = self._request("tools/list", {}, timeout=timeout) or {}
+            self.tools = [t for t in (tools.get("tools") or []) if isinstance(t, dict)]
+            return self.tools
+        except Exception:
+            self.close()
+            raise
+
+    def close(self) -> None:
+        """Terminate the subprocess and fail all pending requests."""
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            pend, self._pending = self._pending, {}
+        for q in pend.values():
+            try:
+                q.put_nowait({"_error": "MCP server closed"})
+            except Exception:
+                pass
+        p = self.proc
+        if p is not None:
+            try:
+                if p.poll() is None:
+                    p.terminate()
+                    try:
+                        p.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+            except Exception:
+                pass
+            for stream in (p.stdin, p.stdout, p.stderr):
+                try:
+                    if stream:
+                        stream.close()
+                except Exception:
+                    pass
+
+    def ready(self) -> bool:
+        return (not self._closed and self.proc is not None
+                and self.proc.poll() is None)
+
+    # ── JSON-RPC core ────────────────────────────────────────────────────
+    def _reader(self) -> None:
+        """Parse stdout lines; route responses to waiters, ignore the rest."""
+        p = self.proc
+        try:
+            while True:
+                line = p.stdout.readline()
+                if not line:
+                    break
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    msg = json.loads(line)
+                except Exception:
+                    continue          # non-JSON noise on stdout - skip
+                mid = msg.get("id")
+                if isinstance(mid, int) and ("result" in msg or "error" in msg):
+                    with self._lock:
+                        q = self._pending.pop(mid, None)
+                    if q is not None:
+                        try:
+                            q.put_nowait(msg)
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+        # EOF: fail every still-waiting request so callers don't hang.
+        with self._lock:
+            pend, self._pending = self._pending, {}
+        for q in pend.values():
+            try:
+                q.put_nowait({"_error": "MCP server exited"})
+            except Exception:
+                pass
+
+    def _drain_stderr(self) -> None:
+        """Drain the server's stderr so a chatty server can't block on a full pipe."""
+        p = self.proc
+        try:
+            for _line in (p.stderr or []):
+                pass
+        except Exception:
+            pass
+
+    def _send(self, obj: dict) -> None:
+        p = self.proc
+        if p is None or p.poll() is not None or p.stdin is None:
+            raise RuntimeError(f"MCP server '{self.name}' is not running")
+        try:
+            p.stdin.write(json.dumps(obj, ensure_ascii=False) + "\n")
+            p.stdin.flush()
+        except Exception as e:
+            raise RuntimeError(f"could not write to MCP server '{self.name}': {e}")
+
+    def _request(self, method: str, params: dict, timeout: float) -> Any:
+        with self._lock:
+            self._next_id += 1
+            mid = self._next_id
+            q: "queue.Queue" = queue.Queue()
+            self._pending[mid] = q
+        try:
+            self._send({"jsonrpc": "2.0", "id": mid, "method": method, "params": params})
+        except Exception:
+            with self._lock:
+                self._pending.pop(mid, None)
+            raise
+        try:
+            msg = q.get(timeout=timeout)
+        except queue.Empty:
+            with self._lock:
+                self._pending.pop(mid, None)
+            raise RuntimeError(f"MCP server '{self.name}' timed out after {int(timeout)}s "
+                               f"responding to {method}")
+        if "_error" in msg:
+            raise RuntimeError(str(msg["_error"]))
+        if "error" in msg:
+            err = msg.get("error") or {}
+            detail = err.get("message") if isinstance(err, dict) else str(err)
+            raise RuntimeError(f"MCP server '{self.name}' error on {method}: {detail}")
+        return msg.get("result")
+
+    def _notify(self, method: str, params: dict) -> None:
+        self._send({"jsonrpc": "2.0", "method": method, "params": params})
+
+    # ── tools ────────────────────────────────────────────────────────────
+    def call_tool(self, raw_name: str, arguments: dict, timeout: float = MCP_CALL_TIMEOUT) -> str:
+        """Call one of the server's tools; returns its text output.
+
+        Raises RuntimeError on transport/protocol errors or when the tool
+        reports isError (the server's error text is included)."""
+        result = self._request("tools/call", {"name": raw_name, "arguments": arguments}, timeout)
+        if not isinstance(result, dict):
+            return str(result)
+        parts: List[str] = []
+        for item in (result.get("content") or []):
+            if not isinstance(item, dict):
+                continue
+            itype = item.get("type")
+            if itype == "text":
+                parts.append(str(item.get("text", "")))
+            elif itype == "image":
+                data = str(item.get("data", ""))
+                mime = str(item.get("mimeType", "image/png"))
+                parts.append(f"[image {mime}, {len(data)} base64 chars]")
+            else:
+                parts.append(json.dumps(item, ensure_ascii=False)[:500])
+        text = "\n".join(parts).strip() or "(tool returned no content)"
+        if result.get("isError"):
+            raise RuntimeError(f"MCP tool '{raw_name}' reported an error: {text[:1000]}")
+        return text
+
+
+# ════════════════════════════════════════════════════════════════════════════
 #  CONSTANTS
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.0.1"
+VERSION    = "1.1.0"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -567,6 +824,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "handoff_threshold_pct": 75,  # auto-handoff when context usage hits this % (0 = off)
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "allow_local_network": False,  # fetch_url may reach LAN/localhost/cloud-metadata addresses
+    "mcp_servers":       [],   # MCP stdio servers (Settings -> MCP Servers)
     "tts_enabled":       False,
     "tool_permissions":  dict(DEFAULT_PERMS),
 }
@@ -1620,6 +1878,13 @@ class DeskpilotApp:
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
         self._pending_temperature: Optional[str] = None   # welcome-state temp change, applied to the chat the next send creates
         self._pending_thinking: Optional[str] = None      # welcome-state thinking change, same
+        # ── MCP (Model Context Protocol) servers ────────────────────────────
+        self._mcp_clients: Dict[str, MCPClient] = {}   # server name -> connected client
+        self._mcp_lock = threading.Lock()              # guards _mcp_clients (iteration vs mutation across threads)
+        self._mcp_connect_lock = threading.Lock()      # serializes whole connect passes (no duplicate subprocesses on rapid saves)
+        self._mcp_connect_pending = threading.Event()  # set by _mcp_connect_all; consumed by the worker loop
+        self._mcp_tool_map: Dict[str, tuple] = {}      # mcp_<server>_<tool> -> (server, raw tool name)
+        self._mcp_perm_widgets: List[tk.Widget] = []   # MCP section widgets in the permission bar
 
         # ── root window ───────────────────────────────────────────────────
         self.root = tk.Tk()
@@ -1665,6 +1930,7 @@ class DeskpilotApp:
         self.root.after(300, self.apply_dark_titlebar)      # HWND must exist first
         self._poll_ui_queue()             # start draining worker-thread UI callbacks
         self._refresh_ctx_topbar()        # populate the top-bar context readout (background)
+        self._mcp_connect_all()           # start configured MCP servers (background thread)
 
         print(f"[Deskpilot] v{VERSION} ready — "
               f"pypdf={'✓' if PdfReader else '✗'}  Pillow={'✓' if ImageGrab else '✗'}  "
@@ -1920,7 +2186,8 @@ class DeskpilotApp:
         hsb.pack(side="right", fill="y")
         canvas.pack(side="left", fill="both", expand=True)
 
-        inner = tk.Frame(canvas, bg=COL["bg_deep"])
+        self._perm_inner = tk.Frame(canvas, bg=COL["bg_deep"])
+        inner = self._perm_inner
         canvas.create_window((0, 0), window=inner, anchor="nw")
         inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
 
@@ -1955,6 +2222,10 @@ class DeskpilotApp:
 
         # Fit the canvas to its content so labels + dropdowns are never clipped at
         # the bottom of the window, regardless of the user's chosen UI font size.
+        # MCP tools (discovered from connected servers) are appended after the
+        # built-in tools; _mcp_rebuild_permissions_bar() owns that section.
+        self._mcp_rebuild_permissions_bar()
+
         self._perm_canvas = canvas
         try:
             inner.update_idletasks()
@@ -3478,7 +3749,12 @@ class DeskpilotApp:
                 and not self._stop_event.is_set():
             # ── build request (only tools whose permission ≠ Off) ─────────
             enabled_tools = [s for n, s in TOOL_SCHEMAS.items()
-                             if self.settings.get("tool_permissions", {}).get(n, "ask") != "off"] or None
+                             if self.settings.get("tool_permissions", {}).get(n, "ask") != "off"]
+            # MCP tools from connected servers (namespaced mcp_<server>_<tool>).
+            enabled_tools += [s for s in self._mcp_schemas()
+                              if self.settings.get("tool_permissions", {}).get(
+                                  s["function"]["name"], "ask") != "off"]
+            enabled_tools = enabled_tools or None
             kwargs: Dict[str, Any] = dict(model=model,
                                 messages=[build_system_message(str(self.settings.get("file_workspace") or ""),
                                    str(self.settings.get("exa_api_key") or ""),
@@ -3814,15 +4090,18 @@ class DeskpilotApp:
             return f"ERROR: Tool '{name}' is disabled by the user (permission set to Off)."
         if perm == "ask" and not self._ask_permission_modal(name, args):
             return f"ERROR: User denied permission to run '{name}'."
-        handler = getattr(self, f"_tool_{name}", None)
-        if handler is None:
-            return f"ERROR: Unknown tool '{name}'."
-        try:
-            result = handler(**args) if args else handler()
-        except TypeError as e:
-            return f"ERROR: Invalid arguments for {name}: {e}"
-        except Exception as e:
-            return f"ERROR: {name} failed: {e}"
+        if name.startswith("mcp_"):
+            result = self._mcp_dispatch(name, args)
+        else:
+            handler = getattr(self, f"_tool_{name}", None)
+            if handler is None:
+                return f"ERROR: Unknown tool '{name}'."
+            try:
+                result = handler(**args) if args else handler()
+            except TypeError as e:
+                return f"ERROR: Invalid arguments for {name}: {e}"
+            except Exception as e:
+                return f"ERROR: {name} failed: {e}"
         if not isinstance(result, str):
             result = str(result)
         # Hard cap on tool output so a huge read/fetch can't blow the context window.
@@ -4694,12 +4973,22 @@ class DeskpilotApp:
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (metered; blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
             ("Allow Local Network (fetch_url)", "allow_local_network"),
+            ("MCP Servers (stdio subprocesses; tools appear in the permission bar)", "mcp_servers"),
         ]
         entries: Dict[str, tk.Entry] = {}
         model_combo: Optional[ttk.Combobox] = None
         local_net_var: Optional[tk.BooleanVar] = None
         custom_prompt_text: Optional[tk.Text] = None
         for i, (label, key) in enumerate(rows):
+            if key == "mcp_servers":
+                # Managed list of stdio MCP servers (Add/Remove); connecting is
+                # live - discovered tools appear in the permission bar.
+                tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
+                         font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+                mcp_frame = tk.Frame(top, bg=COL["bg_main"])
+                mcp_frame.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
+                self._draw_mcp_server_rows(mcp_frame, top)
+                continue
             tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
                      font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
             if key == "model_name":
@@ -4913,6 +5202,9 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 hp = HANDOFF_THRESHOLD_DEFAULT
             self.settings["handoff_threshold_pct"] = max(0, min(100, hp))
+            # MCP servers may have been added/removed in the dialog: reconnect
+            # everything so the permission bar matches the saved configuration.
+            self._mcp_connect_all()
             if not save_settings(self.settings):
                 messagebox.showwarning(
                     f"{APP_NAME} - Could not save settings",
@@ -4945,6 +5237,333 @@ class DeskpilotApp:
         tk.Button(btns, text="Cancel", command=top.destroy, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=6,
                   cursor="hand2", font=F(11)).pack(side="left", padx=6)
+
+    # ════════════════════════════════════════════════════════════════════
+    #  MCP SERVER MANAGEMENT (Settings + permission bar + dispatch)
+    # ════════════════════════════════════════════════════════════════════
+
+    def _mcp_servers_cfg(self) -> List[dict]:
+        """Sanitized list of configured MCP servers from settings."""
+        raw = self.settings.get("mcp_servers") or []
+        out: List[dict] = []
+        if isinstance(raw, list):
+            for s in raw[:MCP_MAX_SERVERS]:
+                if not isinstance(s, dict):
+                    continue
+                name = str(s.get("name", "")).strip()
+                command = str(s.get("command", "")).strip()
+                if not name or not command:
+                    continue
+                args = [str(a) for a in (s.get("args") or [])
+                        if isinstance(a, (str, int, float))][:32]
+                env_raw = s.get("env")
+                env = ({str(k): str(v) for k, v in env_raw.items() if isinstance(k, str)}
+                       if isinstance(env_raw, dict) else {})
+                out.append({"name": name, "command": command, "args": args, "env": env})
+        return out
+
+    def _mcp_tool_names(self) -> List[str]:
+        """Namespaced names of all currently-discovered MCP tools (stable order)."""
+        return list(self._mcp_tool_map.keys())
+
+    def _mcp_schemas(self) -> List[dict]:
+        """OpenAI tool schemas for every tool advertised by a connected server.
+
+        Also refreshes self._mcp_tool_map (namespaced name -> (server, raw))
+        which the dispatcher and permission bar use."""
+        out: List[dict] = []
+        new_map: Dict[str, tuple] = {}
+        # Snapshot under the lock: the Settings worker may add/remove servers
+        # while this runs on the chat worker thread, and mutating a dict
+        # mid-iteration raises RuntimeError (verified empirically).
+        with self._mcp_lock:
+            clients = list(self._mcp_clients.values())
+        for client in clients:
+            if not client.ready():
+                continue
+            for t in client.tools:
+                raw = str(t.get("name", "")).strip()
+                if not raw:
+                    continue
+                ns = mcp_tool_name(client.name, raw)
+                new_map[ns] = (client.name, raw)
+                out.append(mcp_tool_schema(client.name, raw, t))
+        self._mcp_tool_map = new_map   # full rebuild: stale entries drop out
+        return out
+
+    def _mcp_dispatch(self, name: str, args: dict) -> str:
+        """Execute a namespaced MCP tool call; returns its text output."""
+        entry = self._mcp_tool_map.get(name)
+        if entry is None:
+            return f"ERROR: MCP tool '{name}' is not available (server not connected)."
+        server_name, raw = entry
+        client = self._mcp_clients.get(server_name)
+        if client is None or not client.ready():
+            return (f"ERROR: MCP server '{server_name}' is not running. "
+                    f"Reconnect it in Settings -> MCP Servers.")
+        try:
+            return client.call_tool(raw, args)
+        except Exception as e:
+            return f"ERROR: {name} failed: {e}"
+
+    def _mcp_connect_all(self) -> None:
+        """(Re)connect every configured MCP server on a background thread.
+
+        A second call while a connect is already running just marks the work
+        pending; the in-flight worker re-runs once when it finishes, so rapid
+        double-Saves cannot spawn duplicate (leaked) server subprocesses."""
+        self._mcp_connect_pending.set()
+        threading.Thread(target=self._mcp_connect_worker_loop, daemon=True).start()
+
+    def _mcp_connect_worker_loop(self) -> None:
+        """Run connect passes until no newer save is pending (serialized)."""
+        while True:
+            with self._mcp_connect_lock:
+                try:
+                    self._mcp_connect_worker()
+                except Exception as e:
+                    print(f"[{APP_NAME}] MCP connect pass failed: {e}")
+            if not self._mcp_connect_pending.is_set():
+                return
+            self._mcp_connect_pending.clear()
+
+    def _mcp_connect_worker(self) -> None:
+        wanted = self._mcp_servers_cfg()
+        # Close servers that are no longer configured. Pop under the lock,
+        # close OUTSIDE it (close() can block ~3 s on a stuck subprocess).
+        with self._mcp_lock:
+            stale = [(n, c) for n, c in self._mcp_clients.items()
+                     if not any(w.get("name") == n for w in wanted)]
+            for n, _c in stale:
+                self._mcp_clients.pop(n, None)
+        for _n, c in stale:
+            try:
+                c.close()
+            except Exception:
+                pass
+        results: List[str] = []
+        for cfg in wanted:
+            name, command = cfg["name"], cfg["command"]
+            # Keep a healthy server whose config is unchanged ALIVE - saving
+            # unrelated settings (font size, temperature, ...) must not wipe its
+            # state. Restart only on config change or if the process died.
+            with self._mcp_lock:
+                old = self._mcp_clients.get(name)
+            if old is not None:
+                if (old.ready() and old.command == command
+                        and old.args == cfg["args"] and old.env == cfg["env"]):
+                    results.append(f"{name}: {len(old.tools)} tool(s) (kept alive)")
+                    continue
+                with self._mcp_lock:
+                    self._mcp_clients.pop(name, None)
+                try:
+                    old.close()
+                except Exception:
+                    pass
+            client = MCPClient(name, command, cfg["args"], cfg["env"])
+            try:
+                tools = client.connect()
+                with self._mcp_lock:
+                    self._mcp_clients[name] = client
+                results.append(f"{name}: {len(tools)} tool(s)")
+            except Exception as e:
+                results.append(f"{name}: FAILED ({str(e)[:120]})")
+        self._post(lambda rs=results: self._mcp_connect_done(rs))
+
+    def _mcp_connect_done(self, results: List[str]) -> None:
+        """Main-thread: refresh the permission bar's MCP section + status."""
+        self._mcp_schemas()   # refresh the namespaced tool map from live clients
+        self._mcp_rebuild_permissions_bar()
+        if results:
+            self._set_status("🔌 MCP " + "; ".join(results)[:200])
+
+    def _close_mcp_servers(self) -> None:
+        with self._mcp_lock:
+            clients = list(self._mcp_clients.values())
+            self._mcp_clients.clear()
+        for client in clients:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+    def _mcp_rebuild_permissions_bar(self) -> None:
+        """(Re)draw the MCP section of the permission bar: one dropdown per
+        discovered tool, defaulting to Ask Permission (MCP servers are
+        arbitrary local programs - never silently auto-approved)."""
+        for w in getattr(self, "_mcp_perm_widgets", []):
+            try:
+                if w.winfo_exists():
+                    w.destroy()
+            except tk.TclError:
+                pass
+        self._mcp_perm_widgets = []
+        for n in [k for k in list(self._perm_combos) if k.startswith("mcp_")]:
+            del self._perm_combos[n]
+        inner = getattr(self, "_perm_inner", None)
+        if inner is None:
+            return
+        names = self._mcp_tool_names()
+        if not names:
+            return
+        hdr = tk.Label(inner, text="🔌 MCP Tools", bg=COL["bg_deep"], fg=COL["accent"],
+                       font=F(10, "bold"))
+        hdr.pack(side="left", padx=(14, 7), pady=4)
+        self._mcp_perm_widgets.append(hdr)
+        for name in names:
+            server_name, raw = self._mcp_tool_map[name]
+            cell = tk.Frame(inner, bg=COL["bg_deep"])
+            cell.pack(side="left", padx=7, pady=4)
+            lab = tk.Label(cell, text=f"{raw} ({server_name})", bg=COL["bg_deep"],
+                           fg=COL["text_dim"], font=F(10))
+            lab.pack(anchor="w")
+            cb = ttk.Combobox(cell, values=list(PERM_LABELS.values()), state="readonly",
+                              width=13, style="Tool.TCombobox", font=F(11))
+            perm = self.settings.get("tool_permissions", {}).get(name, "ask")
+            cb.set(PERM_LABELS.get(perm, PERM_LABELS["ask"]))
+            cb.pack(anchor="w")
+
+            def on_change(e=None, name=name, cb=cb, lab=lab):
+                label = cb.get()
+                new_perm = PERM_VALUES.get(label, "ask")
+                self.settings["tool_permissions"][name] = new_perm
+                lab.configure(fg={"always": COL["success"],
+                                  "ask":    COL["warning"],
+                                  "off":    COL["danger"]}[new_perm])
+                save_settings(self.settings)
+
+            cb.bind("<<ComboboxSelected>>", on_change)
+            self._perm_combos[name] = (cb, lab)
+            self._mcp_perm_widgets.append(cell)
+            # color the initial state too
+            perm = self.settings.get("tool_permissions", {}).get(name, "ask")
+            lab.configure(fg={"always": COL["success"], "ask": COL["warning"],
+                              "off": COL["danger"]}[perm])
+        # re-fit the canvas to the (possibly larger) content
+        pc = getattr(self, "_perm_canvas", None)
+        if pc is not None:
+            try:
+                inner.update_idletasks()
+                need = int(inner.winfo_reqheight()) + 8
+                if need > int(pc.cget("height")):
+                    pc.configure(height=need)
+            except tk.TclError:
+                pass
+
+    def _draw_mcp_server_rows(self, frame: tk.Frame, parent_top: tk.Toplevel) -> None:
+        """Draw the configured MCP servers (name — command + Remove) and the
+        Add button inside the Settings dialog."""
+        for w in frame.winfo_children():
+            w.destroy()
+        for cfg in self._mcp_servers_cfg():
+            rowf = tk.Frame(frame, bg=COL["bg_main"])
+            rowf.pack(fill="x", pady=2)
+            desc = f"{cfg['name']}  —  {cfg['command']}"
+            if cfg["args"]:
+                desc += "  " + " ".join(cfg["args"])[:60]
+            tk.Label(rowf, text=desc, bg=COL["bg_main"], fg=COL["text"], font=F(10),
+                     anchor="w").pack(side="left", fill="x", expand=True)
+
+            def _remove(n=cfg["name"]):
+                self._mcp_remove_server(n)
+                self._draw_mcp_server_rows(frame, parent_top)
+
+            tk.Button(rowf, text="Remove", command=_remove, bg=COL["bg_raised"],
+                      fg=COL["danger"], activebackground="#5B2323", relief="flat", bd=0,
+                      padx=8, pady=1, cursor="hand2", font=F(9)).pack(side="right")
+        tk.Button(frame, text="+ Add MCP Server",
+                  command=lambda: self._mcp_add_server_dialog(parent_top),
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  relief="flat", bd=0, padx=8, pady=2, cursor="hand2", font=F(10)) \
+            .pack(anchor="w", pady=(4, 0))
+
+    def _mcp_remove_server(self, name: str) -> None:
+        servers = self._mcp_servers_cfg()
+        self.settings["mcp_servers"] = [s for s in servers if s.get("name") != name]
+        save_settings(self.settings)
+        with self._mcp_lock:
+            client = self._mcp_clients.pop(name, None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self._mcp_schemas()   # drop the removed server's tools from the map
+        self._mcp_rebuild_permissions_bar()
+
+    def _mcp_add_server_dialog(self, parent: tk.Toplevel) -> None:
+        d = tk.Toplevel(parent)
+        d.title(f"{APP_NAME} — Add MCP Server")
+        d.configure(bg=COL["bg_main"])
+        d.transient(parent)
+        try:
+            d.update_idletasks()
+        except tk.TclError:
+            pass
+        try:
+            d.grab_set()
+        except tk.TclError:
+            pass
+        fields = [("Name (e.g. filesystem)", "name"),
+                  ("Command (e.g. npx, or full path to an executable)", "command"),
+                  ("Args (space-separated, e.g. -m  mcp_server_fs  C:\\data)", "args"),
+                  ("Env vars (space-separated KEY=VALUE pairs; optional)", "env")]
+        ents: Dict[str, tk.Entry] = {}
+        for i, (label, key) in enumerate(fields):
+            tk.Label(d, text=label, bg=COL["bg_main"], fg=COL["text_dim"], font=F(10)) \
+                .grid(row=i, column=0, sticky="w", padx=(12, 8), pady=5)
+            e = tk.Entry(d, width=46, bg=COL["bg_deep"], fg=COL["text"],
+                         insertbackground=COL["text"], relief="flat", font=F(10))
+            e.grid(row=i, column=1, sticky="ew", padx=(0, 12), pady=5)
+            ents[key] = e
+        tk.Label(d, text=("Stdio MCP servers only (v1). The server runs as a local "
+                          "subprocess with your user privileges; its tools appear in the "
+                          "permission bar defaulting to Ask Permission."),
+                 bg=COL["bg_main"], fg=COL["text_dim"], font=F(9), wraplength=400,
+                 justify="left") \
+            .grid(row=len(fields), column=0, columnspan=2, sticky="w", padx=(12, 12), pady=(4, 8))
+
+        def ok():
+            name = ents["name"].get().strip()
+            command = ents["command"].get().strip()
+            if not name or not command:
+                messagebox.showwarning(f"{APP_NAME} - MCP Server",
+                                       "Name and Command are both required.", parent=d)
+                return
+            existing = {str(s.get("name")) for s in (self.settings.get("mcp_servers") or [])
+                        if isinstance(s, dict)}
+            if name in existing:
+                messagebox.showwarning(f"{APP_NAME} - MCP Server",
+                                       f"A server named '{name}' already exists.", parent=d)
+                return
+            servers = [s for s in (self.settings.get("mcp_servers") or []) if isinstance(s, dict)]
+            if len(servers) >= MCP_MAX_SERVERS:
+                messagebox.showwarning(f"{APP_NAME} - MCP Server",
+                                       f"Maximum of {MCP_MAX_SERVERS} servers.", parent=d)
+                return
+            args = ents["args"].get().strip().split()
+            env = _parse_env_pairs(ents["env"].get())
+            servers.append({"name": name, "command": command, "args": args, "env": env})
+            self.settings["mcp_servers"] = servers
+            save_settings(self.settings)
+            d.destroy()
+            self._mcp_connect_all()
+
+        btns = tk.Frame(d, bg=COL["bg_main"])
+        btns.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(0, 12))
+        tk.Button(btns, text="Add & Connect", command=ok, bg=COL["accent"], fg="#FFFFFF",
+                  activebackground="#2563EB", relief="flat", bd=0, padx=14, pady=5,
+                  cursor="hand2", font=F(11)).pack(side="left", padx=6)
+        tk.Button(btns, text="Cancel", command=d.destroy, bg=COL["bg_raised"], fg=COL["text"],
+                  activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=5,
+                  cursor="hand2", font=F(11)).pack(side="left", padx=6)
+        try:
+            d.lift()
+            d.focus_force()
+            ents["name"].focus_set()
+        except tk.TclError:
+            pass
+
 
     def _test_connection(self, url: str, top: tk.Toplevel) -> None:
         ok = False
@@ -5033,6 +5652,7 @@ class DeskpilotApp:
             pass
         self._mic_stop.set()          # release the microphone if dictation was running
         self.stop_tts()               # halt any in-flight TTS playback
+        self._close_mcp_servers()     # terminate MCP server subprocesses
         _release_instance_lock(SETTINGS_FILE.parent)   # drop our lock (no-op in --multi / tests)
         if not (save_settings(self.settings) and save_chats(self.chats)):
             try:
