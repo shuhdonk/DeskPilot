@@ -3,38 +3,40 @@
 _Clean Arch / CachyOS machine → working app. Do the steps **in order**.
 Each step is one block to copy-paste into a terminal._
 
+**Pasting tip (fish / Konsole):** select only the code line(s) themselves. fish runs every pasted line immediately, so a paste that carries extra blank lines makes it execute a flood of empty commands - you will see endless `❯` prompts. If that happens: Ctrl+C, then re-paste just the single command (or type it). Also note: fish does not support heredocs (`<<`) - every command in this doc is a single line for that reason.
+
 **Also needed (separately):** an OpenAI-compatible LLM server (e.g. LM Studio + a model).
 Deskpilot is the client — it needs a server to talk to.
 
 ---
 
-## Step 1 — System packages (terminal, one line)
+## Step 1 — System packages (terminal)
 
 Open a **terminal** and paste:
 
 ```bash
-sudo pacman -S --needed python python-tk portaudio nodejs curl
+sudo pacman -S --needed python tk portaudio nodejs curl git && python -c "import tkinter; print('tkinter OK:', tkinter.TkVersion)"
 ```
 
-(Python, tkinter, the mic library PyAudio builds against, Node.js for the `run_javascript` tool, and curl for Step 4.)
+(Python — tkinter is built into the `python` package, and `tk` provides the Tk library it links against (Arch has no separate `python-tk` package); plus the mic library PyAudio builds against, Node.js for the `run_javascript` tool, curl for Step 4, and git for Step 2. The second line verifies the tkinter import — it should print "tkinter OK: …".)
 
-## Step 2 — Put the app file in its folder (terminal)
+## Step 2 — Get the app onto this machine (terminal)
 
-Copy `deskpilot.py` to this machine (USB / scp / whatever), then paste — **replace the first path** with where you actually put it:
+Easiest: clone it from GitHub:
 
 ```bash
-mkdir -p ~/Deskpilot && cp /tmp/deskpilot.py ~/Deskpilot/
+git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot
 ```
+
+(No internet? Copy `deskpilot.py` over via USB / scp, then run `mkdir -p ~/Deskpilot && cp /tmp/deskpilot.py ~/Deskpilot/` instead.)
 
 ## Step 3 — Python packages (terminal, one line)
 
 ```bash
-cd ~/Deskpilot && python -m venv .venv && source .venv/bin/activate && pip install --upgrade pip && pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper numpy
+cd ~/Deskpilot && python -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper numpy
 ```
 
-(Creates an isolated environment and installs everything the app can use. Takes a few minutes.)
-
-> Every **new** terminal window needs: `source ~/Deskpilot/.venv/bin/activate` first.
+(Creates an isolated environment and installs everything the app can use. Takes a few minutes. No `source .../activate` needed - the commands call the venv's own pip directly, so this works in bash, zsh **and fish** (CachyOS's default shell). If you'd rather activate the env for your prompt: `source .venv/bin/activate.fish` in fish, or `source .venv/bin/activate` in bash/zsh.)
 
 ## Step 4 — Add the TTS model files (terminal, one line)
 
@@ -49,7 +51,7 @@ mkdir -p ~/Deskpilot/kokoro_models && cd ~/Deskpilot/kokoro_models && curl -L -O
 ## Step 5 — Test it runs (terminal)
 
 ```bash
-cd ~/Deskpilot && source .venv/bin/activate && python deskpilot.py
+cd ~/Deskpilot && .venv/bin/python deskpilot.py
 ```
 
 The Deskpilot window should open. Close it when you see it.
@@ -57,10 +59,16 @@ The Deskpilot window should open. Close it when you see it.
 ## Step 6 — Run it from now on
 
 ```bash
-source ~/Deskpilot/.venv/bin/activate && python ~/Deskpilot/deskpilot.py
+~/Deskpilot/.venv/bin/python ~/Deskpilot/deskpilot.py
 ```
 
-(Or make a launcher: right-click your desktop → *Create Launcher* → Command = the line above.)
+**Desktop shortcut (KDE Plasma):** Plasma 6 has no "Create Launcher" in the desktop right-click menu, so create a launcher file instead - paste this single line into your terminal (replace `username` with your user name):
+
+```bash
+printf '[Desktop Entry]\nType=Application\nName=Deskpilot\nExec=/home/username/Deskpilot/.venv/bin/python /home/username/Deskpilot/deskpilot.py\nIcon=utilities-terminal\nTerminal=false\n' > ~/Desktop/Deskpilot.desktop && chmod +x ~/Desktop/Deskpilot.desktop
+```
+
+The icon appears on the desktop. KDE marks new launcher files untrusted: right-click it once and choose **Allow Executing** (or *Trust File*), then double-click launches Deskpilot. (Optional: `cp ~/Desktop/Deskpilot.desktop ~/.local/share/applications/` also puts it in the application menu - Super key, type "Deskpilot" - where you can right-click → *Pin to Task Manager* for a permanent panel icon. On older Plasma 5 systems you could instead right-click the desktop → *Create Launcher*.)
 
 First run: Settings → Server URL → **Test Connection** → Model name → Save. Done.
 
@@ -70,7 +78,9 @@ First run: Settings → Server URL → **Test Connection** → Model name → Sa
 
 | Problem | Fix |
 |-|-|
-| `source .venv/bin/activate` says "no such file" | You're in the wrong folder — run `cd ~/Deskpilot` first, or use the full path from Step 6. |
+| `.venv/bin/pip` / `.venv/bin/python` says "no such file" | You're in the wrong folder — run `cd ~/Deskpilot` first, or use the full paths from Step 6. |
+| Sourcing `.venv/bin/activate` errors with '"case" builtin not inside of switch block' | You're in fish - it can't read the sh-style activate script. Use `source .venv/bin/activate.fish` instead (or skip activation; the steps above don't need it). |
+| Endless empty `❯` prompts after pasting | The paste carried extra newlines and fish ran each one as an empty command. Ctrl+C, check for a partial clone (`ls ~/Deskpilot`, `rm -rf` it if incomplete), then re-paste just the single command line. |
 | PyAudio build fails in Step 3 | `sudo pacman -S --needed portaudio`, then re-run Step 3's pip line. |
 | TTS button says "model files not found" | Step 4 — both files must be in `~/Deskpilot/kokoro_models/`. |
 | Dictation stuck on "Loading local Whisper model…" | First use needs internet (one-time ~150 MB download). |
