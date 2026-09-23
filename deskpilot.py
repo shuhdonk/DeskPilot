@@ -1235,6 +1235,67 @@ def fetch_model_ids(server_url: str, api_key: str = "", timeout: int = 8) -> Lis
             if m.get("id")]
 
 
+def loaded_model_ids(entries: List[dict]) -> List[str]:
+    """IDs of the entries a server reports as currently loaded (loaded=True).
+
+    Servers that do not send a "loaded" field return [] - callers must then treat
+    the loaded model as unknown rather than guessing."""
+    out: List[str] = []
+    for m in entries or []:
+        if isinstance(m, dict) and m.get("loaded") and m.get("id"):
+            mid = str(m["id"]).strip()
+            if mid and mid not in out:
+                out.append(mid)
+    return out
+
+
+def normalize_model_name(want: str, entries: List[dict]) -> tuple:
+    r"""Resolve a typed/picked model name to the exact server ID that must be sent.
+
+    Servers like Unsloth Studio expose both a namespaced "id" (the only string its
+    API accepts) and a shorter "display_name". Typing the display name - or an id
+    missing its namespace prefix - otherwise produces a 404 model_not_found at chat
+    time, so every candidate is resolved against the live /models entries first.
+
+    Returns (canonical_id, status):
+      "exact"     -> already a valid server id (unchanged)
+      "resolved"  -> matched exactly one entry by display_name / suffix / case
+      "ambiguous" -> several entries match; keep the text as typed
+      "unknown"   -> no entry matches; keep the text as typed (server decides)
+    """
+    want = str(want or "").strip()
+    ids = [str(m.get("id") or "").strip() for m in entries or [] if isinstance(m, dict)]
+    ids = [i for i in ids if i]
+    if not want:
+        return want, "unknown"
+    if want in ids:
+        return want, "exact"
+    low = want.lower()
+    ci = [i for i in ids if i.lower() == low]
+    if len(ci) == 1:
+        return ci[0], "resolved"
+    if len(ci) > 1:
+        return want, "ambiguous"
+    cands: List[str] = []
+    for m in entries or []:
+        if not isinstance(m, dict):
+            continue
+        mid = str(m.get("id") or "").strip()
+        if not mid:
+            continue
+        dname = str(m.get("display_name") or "").strip()
+        dl = dname.lower()
+        ml = mid.lower()
+        if (dl and (dl == low or low == ml.rsplit("/", 1)[-1])) or ml.endswith("/" + low):
+            if mid not in cands:
+                cands.append(mid)
+    if len(cands) == 1:
+        return cands[0], "resolved"
+    if len(cands) > 1:
+        return want, "ambiguous"
+    return want, "unknown"
+
+
 def _fmt_ctx(n: Any) -> str:
     """Format a context length for the top bar: 262144 -> '256K', 4096 -> '4K'.
     Powers of two use binary K (n/1024); other round numbers use decimal K; anything
@@ -3838,6 +3899,7 @@ class DeskpilotApp:
         thinking_ok = True          # flipped off if the server rejects enable_thinking
         turn_total = 0           # completion tokens accumulated this user prompt (resets per prompt)
         stream_retry_ok = True   # one automatic retry per step on a transient mid-stream drop
+        model_fix_ok = True      # one auto-correction of a stale model name per turn
 
         while (MAX_TOOL_STEPS == 0 or step < MAX_TOOL_STEPS) and not self._closed \
                 and not self._stop_event.is_set():
@@ -3894,6 +3956,39 @@ class DeskpilotApp:
                     thinking_ok = False           # server rejects the extension -> retry without it
                     kwargs.pop("extra_body", None)
                     continue
+                # Stale model name (404 model_not_found): re-read /models and, when one
+                # model is loaded, retry this step with its exact server ID. One attempt
+                # per turn, so a genuinely wrong server can never loop here.
+                low_msg = msg.lower()
+                if (model_fix_ok and ("model_not_found" in low_msg
+                                      or "is downloaded but not loaded" in low_msg
+                                      or "model not found" in low_msg)):
+                    model_fix_ok = False
+                    info = fetch_model_info((self.settings.get("server_url") or "").strip(),
+                                            (self.settings.get("api_key") or "").strip())
+                    loaded = loaded_model_ids(info)
+                    canon, status = normalize_model_name(model, info) if info else ("", "unknown")
+                    new_id = canon if status == "resolved" else ""
+                    if not new_id and len(loaded) == 1:
+                        new_id = loaded[0]
+                    if new_id and new_id != model:
+                        model = new_id
+                        kwargs["model"] = new_id
+                        self.settings["model_name"] = new_id
+                        hist = [h for h in (self.settings.get("model_history") or [])
+                                if isinstance(h, str) and h != new_id]
+                        hist.insert(0, new_id)
+                        self.settings["model_history"] = hist[:MODEL_HISTORY_MAX]
+                        save_settings(self.settings)
+                        self._post(lambda n=new_id: (
+                            self.render_note(f"🔧 Model Name corrected to the loaded model: {n}"),
+                            self._set_actual_model(n), self._update_topbar_labels())[0])
+                        continue
+                    opts = ", ".join(loaded) if loaded else "(none reported loaded)"
+                    self._post(lambda m=msg, o=opts: self.render_error(
+                        f"Model request failed:\n{m}\n\nModels the server reports as loaded: {o}\nSettings → Model Name must use one of those exact IDs."))
+                    self._post(self._finish_turn_ui)
+                    return
                 self._post(lambda m=msg: self.render_error(f"Model request failed:\n{m}"))
                 self._post(self._finish_turn_ui)
                 return
@@ -5149,8 +5244,10 @@ class DeskpilotApp:
         # background thread (same pattern as Test Connection). The request carries
         # no model name, so it works even with a stale/wrong saved model_name.
         m_row = next(i for i, (_, k) in enumerate(rows) if k == "model_name")
+        latest_entries: List[dict] = []      # last /models reply (used by Save to normalize)
+        loaded_ids: List[str] = []           # models the server reports as loaded right now
 
-        def _refresh_models(silent: bool = False) -> None:
+        def _refresh_models(silent: bool = False, auto_fix: bool = True) -> None:
             url = entries["server_url"].get().strip()
             key = entries["api_key"].get().strip()
             if not url:
@@ -5169,6 +5266,10 @@ class DeskpilotApp:
                     try:
                         if not top.winfo_exists():
                             return
+                        latest_entries.clear()
+                        latest_entries.extend(info)
+                        loaded_ids.clear()
+                        loaded_ids.extend(loaded_model_ids(info))
                         hist = [h for h in (self.settings.get("model_history") or [])
                                 if isinstance(h, str)]
                         merged: List[str] = []
@@ -5177,6 +5278,28 @@ class DeskpilotApp:
                                 merged.append(m)
                         model_combo.configure(values=merged[:MODEL_HISTORY_MAX], state="normal")
                         refresh_btn.configure(text="Refresh models")
+                        # Loaded-model row: the exact IDs chat requests must use.
+                        if loaded_ids:
+                            note = "Loaded on server (use these exact IDs): " + ", ".join(loaded_ids)
+                        elif info:
+                            note = "Server lists models but reports none loaded - pick one to load."
+                        else:
+                            note = "No model list from the server - saved history shown below."
+                        loaded_lbl.configure(text=note[:200])
+                        use_btn.configure(state=("normal" if len(loaded_ids) == 1 else "disabled"))
+                        # Auto-fill: a stale/unknown name + exactly one loaded model -> adopt it.
+                        # Only on the silent open-time fetch; a manual Refresh never overwrites
+                        # what the user just typed or picked.
+                        if auto_fix and len(loaded_ids) == 1:
+                            cur = str(model_combo.get()).strip()
+                            if cur != loaded_ids[0] and cur not in ids:
+                                model_combo.set(loaded_ids[0])
+                                self._set_status(
+                                    f"Model Name auto-corrected to the loaded model: {loaded_ids[0]}")
+                        elif auto_fix and len(loaded_ids) > 1:
+                            cur = str(model_combo.get()).strip()
+                            if cur not in ids:
+                                self._set_status("Several models are loaded - pick one from the dropdown")
                         self._update_ctx_topbar(info)       # top-bar context readout
                         if ids:
                             self._set_status(f"Model list updated: {len(ids)} model(s) from server")
@@ -5189,10 +5312,32 @@ class DeskpilotApp:
 
             threading.Thread(target=_worker, daemon=True).start()
 
-        refresh_btn = tk.Button(top, text="Refresh models", command=lambda: _refresh_models(False),
+        refresh_btn = tk.Button(top, text="Refresh models",
+                                command=lambda: _refresh_models(False, auto_fix=False),
                                 bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                                 relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
         refresh_btn.grid(row=m_row, column=2, sticky="e", padx=(0, 16), pady=6)
+
+        # "Use loaded model": copies the single loaded model's exact server ID into
+        # Model Name - the reliable fix when you do not know the name yourself.
+        use_btn = tk.Button(top, text="Use loaded model", state="disabled",
+                            bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                            relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
+        use_btn.grid(row=m_row, column=3, sticky="e", padx=(0, 16), pady=6)
+
+        def _use_loaded() -> None:
+            try:
+                if len(loaded_ids) == 1 and top.winfo_exists():
+                    model_combo.set(loaded_ids[0])
+                    self._set_status(f"Model Name set to loaded model: {loaded_ids[0]}")
+            except tk.TclError:
+                pass
+
+        use_btn.configure(command=_use_loaded)
+        # Loaded-model note: created here (the refresh callback references it), packed
+        # into the footer frame further down so it never collides with a grid row.
+        loaded_lbl = tk.Label(top, text="", bg=COL["bg_main"], fg=COL["text_dim"],
+                              font=F(9), justify="left")
 
         # Force keyboard focus into the dialog and its first field -- then keep
         # re-asserting it for a few seconds. On Windows, the window manager often
@@ -5279,8 +5424,17 @@ class DeskpilotApp:
             self.settings["custom_system_prompt"] = cp
             if local_net_var is not None:
                 self.settings["allow_local_network"] = bool(local_net_var.get())
-            # Model Name comes from the combobox (editable - free typing still works).
+            # Model Name comes from the combobox (editable - free typing still works),
+            # then resolved to the exact server ID: a display name or an id missing its
+            # namespace prefix would otherwise 404 at chat time.
             model_val = str(model_combo.get()).strip()
+            if model_val and latest_entries:
+                canon, status = normalize_model_name(model_val, latest_entries)
+                if status == "resolved" and canon != model_val:
+                    self._set_status(f"Model Name corrected to the server ID: {canon}")
+                    model_val = canon
+                elif status == "ambiguous":
+                    self._set_status("Model Name matches several server models - used as typed")
             self.settings["model_name"] = model_val
             if model_val:
                 hist = [h for h in (self.settings.get("model_history") or [])
@@ -5325,6 +5479,7 @@ class DeskpilotApp:
 
         btns = tk.Frame(top, bg=COL["bg_main"])
         btns.grid(row=len(rows), column=0, columnspan=2, pady=14)
+        loaded_lbl.pack(in_=btns, side="top", pady=(0, 4))   # "Loaded on server: <exact id>"
 
         tk.Label(btns, text=f"Data files saved in: {SETTINGS_FILE.parent}", bg=COL["bg_main"],
                  fg=COL["text_dim"], font=F(9)).pack(side="top")
