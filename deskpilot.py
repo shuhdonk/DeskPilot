@@ -72,6 +72,8 @@ import sys
 import tempfile
 import threading
 import time
+import traceback
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -860,6 +862,16 @@ def _bot_wall_note(text: str) -> Optional[str]:
 FETCH_BODY_LIMIT = 2 * 1024 * 1024   # max bytes downloaded from a single page (read in chunks)
 
 
+# Redirect hardening for fetch_url: every 3xx hop is re-validated against the SSRF
+# guard and the total hop count is capped (urllib's default opener follows redirects
+# blindly, which lets a public URL bounce a fetch into the LAN / cloud metadata).
+FETCH_MAX_REDIRECTS = 5       # total 3xx hops allowed per fetch_url request
+
+
+class _FetchRedirectBlocked(Exception):
+    """Raised mid-redirect by _ValidatingRedirectHandler; carries a user-facing reason."""
+
+
 def _ip_is_blocked(ip_str: str) -> bool:
     """True for addresses that must never be fetched by default: loopback, private LAN (RFC1918), link-local (incl. the 169.254.x cloud-metadata range) and other non-global ranges; unparseable input is blocked too."""
     try:
@@ -901,6 +913,38 @@ def _fetch_url_blocked(url: str, allow_local: bool = False) -> Optional[str]:
                     "fetching internal network addresses is blocked by default "
                     "(enable 'Allow Local Network' in Settings to override)")
     return None
+
+
+class _ValidatingRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Re-runs the SSRF guard on every redirect target and caps total hops.
+
+    Used only by _FETCH_OPENER (the fetch_url tool). A blocked hop raises
+    _FetchRedirectBlocked, which unwinds out of opener.open(); _tool_fetch_url
+    turns it into an error string. allow_local (Settings -> Allow Local Network)
+    disables the per-hop guard but the hop cap still applies."""
+
+    _allow_local = False   # set per request by _tool_fetch_url (default: guard ON)
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        hops = getattr(req, '_dp_hops', 0) + 1
+        if hops > FETCH_MAX_REDIRECTS:
+            raise _FetchRedirectBlocked(
+                f"stopped after {FETCH_MAX_REDIRECTS} redirects (redirect loop?)")
+        blocked = _fetch_url_blocked(newurl, self._allow_local)
+        if blocked:
+            raise _FetchRedirectBlocked(f"{blocked} [redirect #{hops}] -> {newurl}")
+        new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new_req is not None:
+            new_req._dp_hops = hops
+        return new_req
+
+
+# Module-level opener shared by all fetch_url calls (named handler instance so the
+# tool can flip _allow_local without relying on opener internals ordering).
+# _allow_local is re-read per request in _tool_fetch_url, so a Settings change
+# applies immediately without rebuilding the opener.
+_FETCH_REDIRECT_HANDLER = _ValidatingRedirectHandler()
+_FETCH_OPENER = urllib.request.build_opener(_FETCH_REDIRECT_HANDLER)
 
 
 # ── Screenshot handling: lightweight persistence + request-time payloads ─────
@@ -992,6 +1036,8 @@ def _prepare_request_messages(messages: List[dict]) -> List[dict]:
 
     out: List[dict] = []
     for i, m in enumerate(messages):
+        if not isinstance(m, dict):
+            continue          # corrupt history entry - skip, never raise
         c = m.get("content")
         is_shot = _is_screenshot_msg(m)
         has_ref = isinstance(c, list) and any(
@@ -1220,7 +1266,11 @@ def load_chats() -> Dict[str, Any]:
                 data = {"order": order, "chats": chats}
         except Exception:
             pass
-    _migrate_inline_images(data)        # one-time shrink of legacy base64 images (no-op after first run)
+    try:
+        _migrate_inline_images(data)    # one-time shrink of legacy base64 images (no-op after run)
+    except Exception as e:
+        # A corrupt history must never block startup: keep the data as loaded.
+        print(f"[{APP_NAME}] Inline-image migration skipped: {e}")
     return data
 
 
@@ -1246,6 +1296,8 @@ def _migrate_inline_images(chats: Dict[str, Any]) -> None:
         if not isinstance(chat, dict):
             continue
         for m in chat.get("messages") or []:
+            if not isinstance(m, dict):
+                continue
             c = m.get("content")
             if not isinstance(c, list):
                 continue
@@ -2690,6 +2742,16 @@ class DeskpilotApp:
         if not messagebox.askyesno(
                 APP_NAME, f"Delete “{chat.get('title')}” and its full history?", parent=self.root):
             return
+        # If this chat owns the in-flight turn, abort it BEFORE removing the
+        # record. Otherwise the worker keeps streaming and burning tokens on a
+        # conversation that no longer exists (its _ui_sync_messages() writes are
+        # silently dropped by the deleted-chat guard, so nothing is saved).
+        # stop_generation() only checks _busy, which can belong to a DIFFERENT
+        # chat - so set the event directly here.
+        stopping_run = bool(self._busy) and self._run_chat_id == cid
+        if stopping_run:
+            self._stop_event.set()
+            self._set_status("\u23f9 Stopping deleted chat\u2026")
         self.chats["chats"].pop(cid, None)
         if cid in self.chats["order"]:
             self.chats["order"].remove(cid)
@@ -2697,6 +2759,10 @@ class DeskpilotApp:
         if not self.chats["order"]:
             self.new_chat()
         else:
+            # NOTE: _run_chat_id deliberately keeps pointing at the deleted chat.
+            # _viewing_run_chat() returns True whenever it is None, so clearing it
+            # would let the dying worker stream into whatever chat loads next;
+            # leaving it set makes every render guard return False instead.
             was_current = (cid == self.current_chat_id)
             self._refresh_chat_list()
             if was_current or cid == self.current_chat_id:
@@ -2791,6 +2857,8 @@ class DeskpilotApp:
             self._render_welcome()
         else:
             for m in msgs:
+                if not isinstance(m, dict):
+                    continue      # corrupt entry - skip (rendering never raises)
                 role = m.get("role")
                 if role == "user":
                     self.render_user_message(m.get("content"))
@@ -2832,8 +2900,12 @@ class DeskpilotApp:
             title = self.chats["chats"][cid].get("title", "Untitled") or "Untitled"
             lb.insert("end", f"  {title}")   # leading spaces = item padding
         want = select_cid or self.current_chat_id
-        if want and want in self.chats["order"]:
-            idx = self.chats["order"].index(want)
+        # Selection indices are LISTBOX rows = positions in _chat_visible, never
+        # chats["order"].index(): while a search filter is active the two disagree
+        # and the wrong row (or none) gets highlighted. A chat hidden by the
+        # filter simply leaves the listbox with no selection.
+        if want and want in self._chat_visible:
+            idx = self._chat_visible.index(want)
             lb.selection_clear(0, "end")
             lb.selection_set(idx)
             lb.see(idx)
@@ -3589,7 +3661,10 @@ class DeskpilotApp:
             except tk.TclError:
                 pass
             self._active_md = None
-        self.render_note("⏹ Stopped by user")
+        # Only paint into the chat that actually ran the turn: a stop triggered by
+        # deleting that chat must not write into whatever chat is on screen now.
+        if self._viewing_run_chat():
+            self.render_note("\u23f9 Stopped by user")
         self._finish_turn_ui()
 
     def _finish_turn_ui(self) -> None:
@@ -3729,6 +3804,25 @@ class DeskpilotApp:
         self._clients.clear()
 
     def _chat_worker(self, chat_id: str, messages: List[dict]) -> None:
+        """Thread entry point: run the agentic loop, and NEVER let an exception
+        escape without handing the UI back to the user.
+
+        _busy is cleared only by _finish_turn_ui(), so an escaping exception
+        (corrupt history, a tool-schema/MCP hiccup while building the request,
+        any bug at all in the ~300 lines below) would kill this thread with
+        _busy stuck True: Send stays "Stop" and every later send_message()
+        returns silently until the app is restarted. The inner loop's own
+        error paths post _finish_turn_ui themselves; this net catches what
+        they cannot, on the abnormal-exit path only (no double-finish)."""
+        try:
+            self._chat_worker_inner(chat_id, messages)
+        except Exception as e:
+            traceback.print_exc()
+            self._post(lambda m=str(e): self.render_error(
+                f"Internal error during generation:\n{m}"))
+            self._post(self._finish_turn_ui)
+
+    def _chat_worker_inner(self, chat_id: str, messages: List[dict]) -> None:
         """Background daemon thread: streams model responses and executes tools.
         All UI access is marshalled through self._post (root.after)."""
         client = self._get_client()
@@ -4262,8 +4356,9 @@ class DeskpilotApp:
                     "needs, the user can enable 'Allow Local Network' in Settings.")
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Deskpilot)"})
         capped = False
+        _FETCH_REDIRECT_HANDLER._allow_local = bool(self.settings.get("allow_local_network"))
         try:
-            with urllib.request.urlopen(req, timeout=20) as resp:
+            with _FETCH_OPENER.open(req, timeout=20) as resp:
                 chunks: List[bytes] = []
                 total = 0
                 while True:
@@ -4276,13 +4371,23 @@ class DeskpilotApp:
                         break
                     chunks.append(chunk)
                 data = b"".join(chunks)
+                content_encoding = (resp.headers.get("Content-Encoding") or "").lower()
+        except _FetchRedirectBlocked as e:
+            return (f"ERROR: Refusing to fetch {url}: {e}. "
+                    "If this is a machine on your own network that the app genuinely "
+                    "needs, the user can enable 'Allow Local Network' in Settings.")
+        except urllib.error.HTTPError as e:
+            return f"ERROR: Failed to fetch {url}: HTTP {e.code} {e.reason}"
         except Exception as e:
             return f"ERROR: Failed to fetch {url}: {e}"
-        if data[:2] == b"\x1f\x8b":                        # gzip payload
+        if content_encoding == "gzip" or data[:2] == b"\x1f\x8b":   # gzip payload
             try:
                 data = gzip.decompress(data)
             except Exception:
                 pass
+            if len(data) > FETCH_BODY_LIMIT:      # cap DEcompressed size too (zip-bomb guard)
+                data = data[:FETCH_BODY_LIMIT]
+                capped = True
         raw = data.decode("utf-8", "replace")
         text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
         text = re.sub(r"(?s)<[^>]+>", " ", text)
