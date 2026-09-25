@@ -319,6 +319,66 @@ def mcp_tool_schema(server: str, raw: str, tool: dict) -> dict:
     }
 
 
+def _interruptible_wait(q, timeout: float, abort=None, out: Optional[list] = None) -> bool:
+    """Wait for a queue item / Event in STOP_POLL_S slices so Stop (or app close) can cut
+    the wait short. Accepts either a queue.Queue or a threading.Event.
+
+    Returns True when the item arrived / the event was set; False on timeout OR when
+    'abort' (a no-arg predicate such as 'Stop pressed') turned True. The caller decides
+    what a False means - normally: drop the pending slot and raise a clean error upstream.
+    For a Queue the fetched item is stored in out[0] (the wait itself consumes it, so the
+    caller must NOT get() again). Plain q.get(timeout=...) cannot be interrupted, which is
+    why a long MCP call or an unanswered permission modal used to hold the worker for its
+    entire timeout."""
+    # threading.Event and queue.Queue wait differently: Event.wait(timeout=..) returns a
+    # bool, Queue.get(timeout=..) raises Empty. Detect which one we were handed so both
+    # callers (MCP response queue, permission-modal Event) behave correctly.
+    is_event = hasattr(q, "is_set")
+
+    def _slice(seconds: float) -> bool:
+        if is_event:
+            return bool(q.wait(timeout=seconds))
+        try:
+            item = q.get(timeout=seconds)
+            if out is not None:
+                out.append(item)
+            return True
+        except queue.Empty:
+            return False
+
+    deadline = time.monotonic() + max(0.0, float(timeout))
+    while True:
+        # Compute the remaining budget BEFORE sleeping, so a timeout SHORTER than one poll
+        # slice is honored exactly instead of always costing a full STOP_POLL_S (the old loop
+        # slept first and only trimmed on the last pass).
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        if _slice(min(STOP_POLL_S, remaining)):
+            return True
+        if abort is not None and abort():
+            return False
+
+
+def _kill_process(proc) -> None:
+    """Terminate a child process, escalating to kill(). Never raises."""
+    try:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except Exception:
+                pass
+        if proc.poll() is None:
+            proc.kill()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        pass
+
+
 class MCPClient:
     """One MCP server subprocess + its JSON-RPC session.
 
@@ -464,7 +524,14 @@ class MCPClient:
         except Exception as e:
             raise RuntimeError(f"could not write to MCP server '{self.name}': {e}")
 
-    def _request(self, method: str, params: dict, timeout: float) -> Any:
+    def _request(self, method: str, params: dict, timeout: float, abort=None) -> Any:
+        """Send one JSON-RPC request and wait for its response.
+
+        'abort' is an optional no-arg predicate polled every STOP_POLL_S while waiting
+        (Stop pressed / app closing). When it turns True the pending slot is dropped and
+        RuntimeError is raised, so a long tools/call unwinds instead of holding the worker
+        for the whole MCP_CALL_TIMEOUT. The server subprocess itself is NOT killed here -
+        that would break keep-alive between turns; only this request is abandoned."""
         with self._lock:
             self._next_id += 1
             mid = self._next_id
@@ -476,13 +543,15 @@ class MCPClient:
             with self._lock:
                 self._pending.pop(mid, None)
             raise
-        try:
-            msg = q.get(timeout=timeout)
-        except queue.Empty:
+        got: list = []
+        if not _interruptible_wait(q, timeout, abort, out=got):
             with self._lock:
                 self._pending.pop(mid, None)
+            if abort is not None and abort():
+                raise RuntimeError(f"MCP server '{self.name}' call cancelled by the user")
             raise RuntimeError(f"MCP server '{self.name}' timed out after {int(timeout)}s "
                                f"responding to {method}")
+        msg = got[0]
         if "_error" in msg:
             raise RuntimeError(str(msg["_error"]))
         if "error" in msg:
@@ -495,12 +564,15 @@ class MCPClient:
         self._send({"jsonrpc": "2.0", "method": method, "params": params})
 
     # ── tools ────────────────────────────────────────────────────────────
-    def call_tool(self, raw_name: str, arguments: dict, timeout: float = MCP_CALL_TIMEOUT) -> str:
+    def call_tool(self, raw_name: str, arguments: dict, timeout: float = MCP_CALL_TIMEOUT,
+                  abort=None) -> str:
         """Call one of the server's tools; returns its text output.
 
         Raises RuntimeError on transport/protocol errors or when the tool
-        reports isError (the server's error text is included)."""
-        result = self._request("tools/call", {"name": raw_name, "arguments": arguments}, timeout)
+        reports isError (the server's error text is included). 'abort' is polled while
+        waiting so Stop can cut a long-running tool call short."""
+        result = self._request("tools/call", {"name": raw_name, "arguments": arguments},
+                               timeout, abort=abort)
         if not isinstance(result, dict):
             return str(result)
         parts: List[str] = []
@@ -527,7 +599,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.0"
+VERSION    = "1.1.7"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -546,6 +618,17 @@ CLIPBOARD_LIMIT  = 65536     # chars returned by get_clipboard_text (schema + co
 CHATS_SAVE_MIN_INTERVAL = 5.0   # min seconds between mid-turn chats.json writes (turn end always saves)
 CUSTOM_PROMPT_MAX = 4000        # char cap for the custom system prompt (Settings -> Custom System Prompt)
 JS_TIMEOUT       = 900        # seconds, run_javascript subprocess timeout
+TURN_TIME_LIMIT_DEFAULT = 0   # default wall-clock cap per user prompt (seconds; 0 = NO LIMIT).
+                              # The real value is the "Turn time limit" SETTING (Settings dialog,
+                              # clamped 0..86400) - see _turn_time_limit(). It stays a backstop for
+                              # the agentic loop when MAX_TOOL_STEPS == 0 so a model that keeps
+                              # calling tools cannot run forever, but it is checked at step
+                              # boundaries only and now defaults to unlimited: long turns are the
+                              # point of the app, and an unwanted cap kept cutting sessions short.
+TURN_TIME_LIMIT_MAX   = 86400 # upper bound for the setting (24 h); 0 always means "no limit".
+STOP_POLL_S      = 0.25       # max latency of the Stop button while a tool is blocking
+IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
+PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
 TOOL_OUTPUT_LIMIT = 96000   # max chars of ANY tool result sent back to the model (hard cap)
 MODEL_HISTORY_MAX = 20      # previously-used model names kept for the Model Name dropdown
 TEMP_VALUES       = ("0.0", "0.1", "0.2", "0.4", "0.6", "0.7", "0.8", "1.0", "1.2", "1.4", "1.6", "1.8", "2.0")  # per-chat temperature choices (0.0-2.0, step 0.2 + extra 0.1/0.7)
@@ -557,13 +640,42 @@ FORBIDDEN_SYSTEM_DIRS_WINDOWS = ("c:\\windows", "c:\\$recycle.bin", "c:\\system 
 FORBIDDEN_SYSTEM_DIRS_LINUX   = ("/etc", "/bin", "/sbin", "/boot", "/dev", "/lib", "/proc", "/sys")
 
 
+def _dir_prefix(parent_str: str) -> str:
+    """Separator-terminated prefix of a directory path, safe for ROOT folders.
+
+    A drive root (C: + separator) or '/' ALREADY ends with a separator, so naively
+    appending os.sep produced a doubled separator - a string no real child path ever
+    matches, which made every legal path look like it was OUTSIDE the folder. Strip first,
+    then add exactly one separator. Used by workspace confinement and the system-dir guard."""
+    return (parent_str or "").rstrip("/\\") + os.sep
+
+
 def _forbidden_dir_hit(p_str: str) -> Optional[str]:
     """Return the forbidden system dir that p_str (already lowercase) equals or is inside, else None."""
     forbidden = FORBIDDEN_SYSTEM_DIRS_WINDOWS if os.name == "nt" else FORBIDDEN_SYSTEM_DIRS_LINUX
     for d in forbidden:
         dl = d.lower()
-        if p_str == dl or p_str.startswith(dl + os.sep):
+        if p_str == dl or p_str.startswith(_dir_prefix(dl)):
             return d
+    return None
+
+
+def _traversal_component(raw: str) -> Optional[str]:
+    """Return the first path COMPONENT of raw that is a dot-only parent reference, else None.
+
+    Component-based on purpose: the original raw substring test ('".." in raw') also
+    rejected perfectly legal filenames - a..b.txt, foo...bar, report..2026.pdf. A name is
+    only suspicious when a WHOLE component consists of dots/spaces with 2+ dots: that covers
+    "..", "../..", and the dot/space-padded spellings (".. ", ". .", "...") that Windows
+    path parsing collapses into real parent hops. Mixed names like "a.." or "..a" are legal
+    (verified: Path("C:/tmp/a../b").resolve() stays inside C:/tmp, it is not a hop).
+    """
+    for part in re.split(r"[\\/]+", str(raw or "")):
+        # A component is a parent reference only if it is made ENTIRELY of dots/spaces
+        # and holds 2+ dots: "..", "../..", ".. ", ". .", "...". Names that mix letters
+        # with dots ("a..b.txt", "foo...bar", "a..", "..a") are legal and never hop.
+        if part.count(".") >= 2 and set(part) <= {" ", "."}:
+            return part
     return None
 
 # ── Dark modern palette ──────────────────────────────────────────────────────
@@ -822,8 +934,10 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "firecrawl_api_key": "",    # Firecrawl API key for firecrawl_scrape (metered); blank = tool disabled
     "ui_font_size":    12,    # base UI font size (Settings -> UI Font Size)
     "max_tokens":      0,    # per-reply token cap; 0 = server default (Settings -> Max Tokens)
+    "turn_time_limit": TURN_TIME_LIMIT_DEFAULT,  # seconds per user prompt; 0 = no limit
     "file_workspace":    "",    # optional folder confining read/write_local_file; blank = unrestricted
     "handoff_threshold_pct": 75,  # auto-handoff when context usage hits this % (0 = off)
+    "handoff_rearm_pct": 10,      # how much further the gauge must grow before a chat may summarize again
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "allow_local_network": False,  # fetch_url may reach LAN/localhost/cloud-metadata addresses
     "mcp_servers":       [],   # MCP stdio servers (Settings -> MCP Servers)
@@ -999,6 +1113,92 @@ def _is_screenshot_msg(m: dict) -> bool:
                 and str(p.get("text", "")).startswith(SCREENSHOT_MARKER):
             return True
     return False
+
+
+def _chat_image_paths(chat: Any) -> List[Path]:
+    """Absolute paths of every image file referenced by ONE chat record.
+
+    Screenshots (screen_*), user attachments (attach_*) and migrated legacy images
+    (screen_migrated_* / attach_migrated_*) are stored as lightweight "image_ref" parts -
+    just a path, the bytes live in GEN_DIR - so the chat record is the only source of truth
+    about which files belong to which conversation. Corrupt history entries (non-dict
+    messages or parts, blank paths) are skipped, never raised: chats.json is user-editable.
+    Paths are resolve()d so the same file written with different spellings compares equal."""
+    found: List[Path] = []
+    seen = set()
+    msgs = chat.get("messages") if isinstance(chat, dict) else None
+    for m in (msgs or []):
+        if not isinstance(m, dict):
+            continue          # corrupt history entry - skip, never raise
+        c = m.get("content")
+        if not isinstance(c, list):
+            continue
+        for p in c:
+            if not isinstance(p, dict) or p.get("type") != "image_ref":
+                continue
+            raw = str(p.get("path", "")).strip()
+            if not raw:
+                continue
+            try:
+                fp = Path(raw)
+                key = str(fp.resolve())
+            except Exception:
+                continue
+            if key not in seen:
+                seen.add(key)
+                found.append(fp)
+    return found
+
+
+def _image_store_dirs() -> List[Path]:
+    """Resolved roots that legitimately hold chat image files: the active GEN_DIR plus the
+    legacy next-to-script folder (records created before persistence moved to %LOCALAPPDATA%)."""
+    roots: List[Path] = []
+    for d in (GEN_DIR, BASE_DIR / "generated_images"):
+        try:
+            rp = Path(d).resolve()
+            if rp not in roots:
+                roots.append(rp)
+        except Exception:
+            pass
+    return roots
+
+
+def _path_in_image_store(fp: Path) -> bool:
+    """True when fp resolves inside one of the image stores.
+
+    delete_chat() only ever unlinks files the app itself wrote. chats.json is user-editable, so a
+    hand-written image_ref pointing at an unrelated file (a document, a photo in Pictures, a UNC
+    share) is SKIPPED instead of deleting user data."""
+    try:
+        r = fp.resolve()
+        parents = [r] + list(r.parents)
+    except Exception:
+        return False
+    for root in _image_store_dirs():
+        if root in parents:
+            return True
+    return False
+
+
+def _referenced_image_keys(chats: Dict[str, Any]) -> set:
+    """resolve() strings of every image file ANY chat record still points at.
+
+    Safety net for chat deletion: a file another conversation still references must
+    survive even if the deleted chat referenced it too."""
+    keys = set()
+    if not isinstance(chats, dict):
+        return keys
+    inner = chats.get("chats")
+    if not isinstance(inner, dict):
+        return keys
+    for chat in inner.values():
+        for fp in _chat_image_paths(chat):
+            try:
+                keys.add(str(fp.resolve()))
+            except Exception:
+                pass
+    return keys
 
 
 def _expand_image_ref(p: dict) -> dict:
@@ -1687,6 +1887,20 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
     return {"role": "system", "content": content}
 
 
+def _turn_time_limit(settings: dict) -> int:
+    """Wall-clock cap in seconds for ONE user prompt; 0 (or junk) means NO LIMIT.
+
+    Read from the settings file at turn start, so it is a user choice rather than a
+    constant baked into the source - and the shipped default is unlimited. It exists as
+    an opt-in backstop: with MAX_TOOL_STEPS == 0 a model that keeps calling tools would
+    otherwise run forever, but cutting a legitimate long turn off was never wanted."""
+    try:
+        v = int(float(settings.get("turn_time_limit", TURN_TIME_LIMIT_DEFAULT)))
+    except (TypeError, ValueError):
+        v = TURN_TIME_LIMIT_DEFAULT
+    return max(0, min(TURN_TIME_LIMIT_MAX, v))
+
+
 # ── Session handoff: auto-summary when context usage crosses a threshold ────────
 HANDOFF_THRESHOLD_DEFAULT = 75   # % of the context window; 0 disables auto-handoff
 
@@ -1724,13 +1938,53 @@ def _handoff_prompt(chat_title: str) -> str:
 
 
 def _handoff_file_path(data_dir: Path, chat_id: str) -> Path:
-    """Where a handoff summary for a chat is saved (next to the data files)."""
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-    return Path(data_dir) / f"handoff_{chat_id}_{stamp}.md"
+    """Rolling handoff file for a chat (next to the data files).
+
+    One stable name per chat - handoff_<chat_id>.md - so there is always exactly one
+    CURRENT notes file to pick up, and _atomic_write() keeps its immediately-previous
+    version as <name>.bak. The old timestamped-per-summary scheme scattered many files
+    with no way to tell which was latest."""
+    # chat ids are app-generated hex, but chats.json is user-editable: strip anything that
+    # could turn the id into a path (separators, drive prefixes) before building the name.
+    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(chat_id or "chat"))
+    return Path(data_dir) / f"handoff_{safe}.md"
+
+
+def _handoff_archive_path(rolling: Path) -> Path:
+    """Timestamped archive copy of a handoff summary (HANDOFF_KEEP_ARCHIVE).
+
+    Microsecond precision on purpose: a marathon turn can trigger two summaries inside
+    the same second (mid-turn gate, then an overflow in the next request), and a second-resolution name would silently overwrite the earlier archive."""
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    return rolling.with_name(rolling.stem + "_" + stamp + ".md")
+
+
+def _handoff_rearm_pct(settings: dict) -> int:
+    """How much the context gauge must grow (percent of the window) before a chat is
+    allowed to produce another handoff summary. 0 = re-fire on every step boundary.
+    Clamped 0..100; junk falls back to the default."""
+    try:
+        v = int(float(settings.get("handoff_rearm_pct", HANDOFF_REARM_PCT_DEFAULT)))
+    except (TypeError, ValueError):
+        v = HANDOFF_REARM_PCT_DEFAULT
+    return max(0, min(100, v))
 
 
 HANDOFF_TOOL_OUTPUT_CAP = 2500    # max chars of one tool result kept in a handoff request
 HANDOFF_IMAGE_PLACEHOLDER = "[image attached]"
+HANDOFF_SUMMARY_MAX_TOKENS = 2048   # bound on the summary itself (some servers reject it -> retried without)
+HANDOFF_REARM_PCT_DEFAULT = 10      # a chat may handoff again once usage has grown by this many % of the window
+HANDOFF_KEEP_ARCHIVE = True         # also keep a timestamped copy beside the rolling per-chat file
+
+# Budget used when the server reports NO context size (LM Studio / Ollama send no
+# context_length, so _ctx_window() is 0). The previous flat 120000 chars (~30K tokens)
+# was built from a history that had JUST overflowed - the summarization request then
+# overflowed too and the turn ended with 'Handoff summary failed' and no notes at all.
+HANDOFF_NO_WINDOW_BUDGET = 24000    # ~6K tokens of history; the ladder halves it on retry
+HANDOFF_FALLBACK_MIN_CHARS = 3000   # below this, deterministic notes are not worth writing
+HANDOFF_FALLBACK_MAX_CHARS = 20000  # hard cap on the model-free transcript fallback
+HANDOFF_RETRY_OVERFLOW   = 3        # halve the history budget this many times when the
+                                    # summary request itself is refused as too long
 
 
 def _handoff_budget_chars(total_ctx: int) -> int:
@@ -1739,14 +1993,20 @@ def _handoff_budget_chars(total_ctx: int) -> int:
     Handoff only fires when the server reports a context size (total_ctx tokens),
     so 65% of that window is a grounded figure - it leaves room for the system
     prompt, the instruction and the summary output itself. The fallback covers
-    direct calls with no context info (~30K tokens of history)."""
+    direct calls with no context info (~30K tokens of history).
+
+    Also reserves headroom: a handoff triggered at 95% of the window has far less room
+    than one triggered at 75%, so the budget is capped at (window - summary output -
+    prompt overhead) instead of a flat 65% - otherwise a late trigger would build a
+    summarization request that overflows too."""
     try:
         total_ctx = int(total_ctx or 0)
     except (TypeError, ValueError):
         total_ctx = 0
     if total_ctx > 0:
-        return max(8000, int(total_ctx * 0.65) * 4)
-    return 120000
+        room = min(int(total_ctx * 0.65), max(1024, total_ctx - HANDOFF_SUMMARY_MAX_TOKENS - 4096))
+        return max(8000, room * 4)
+    return HANDOFF_NO_WINDOW_BUDGET
 
 
 def _flatten_handoff_content(m: dict) -> Optional[str]:
@@ -1811,6 +2071,100 @@ def _trim_for_handoff(messages: List[dict], budget_chars: int) -> List[dict]:
     if ms and ms[0].get("role") != "user":
         ms.insert(0, {"role": "user", "content": "[Earlier conversation omitted for length]"})
     return ms
+
+
+def _handoff_gauge_text(used: int, total: int) -> str:
+    """Human-readable context gauge for handoff notes / accordion titles.
+
+    A server that reports no context_length (LM Studio, Ollama) leaves total at 0, and an
+    overflow-triggered handoff is now allowed in that state - so say 'window unknown'
+    rather than printing the meaningless '800/0 tokens'."""
+    u = int(used or 0)
+    t = int(total or 0)
+    if t <= 0:
+        return f"{u} tokens (window unknown)"
+    return f"{u}/{t} tokens"
+
+
+def _deterministic_handoff(chat: dict, max_chars: int = HANDOFF_FALLBACK_MAX_CHARS) -> str:
+    """Model-free handoff notes built straight from the chat history.
+
+    Last-resort salvage: used when the summarization request could not be completed -
+    almost always because it overflowed too (the usual case on a server that reports no
+    context_length, where there is no window to size the budget from). A digest is far
+    better than nothing: Start New Session / Auto-Continue feed this text into the fresh
+    chat, so a marathon turn still carries its state over instead of ending with an error.
+
+    Deliberately factual - no invented 'key decisions'. Reuses _sanitize_for_handoff so
+    images become placeholders and tool outputs stay capped, then fills the budget from the
+    NEWEST end (the tail is what a continuation needs most)."""
+    # Snapshot too: this runs on the handoff thread while the user may already be sending.
+    msgs = _sanitize_for_handoff(list((chat or {}).get("messages") or []))
+    if not msgs:
+        return ""
+    budget = max(1000, min(int(max_chars or 0), HANDOFF_FALLBACK_MAX_CHARS))
+
+    def _clip(s: str, n: int) -> str:
+        s = str(s or "")
+        return s if len(s) <= n else s[:n] + "…"
+
+    task = ""
+    for m in msgs:
+        if m.get("role") == "user" and str(m.get("content") or "").strip():
+            task = str(m["content"]).strip()
+            break
+
+    actions: List[str] = []
+    for m in msgs:
+        if m.get("role") != "assistant":
+            continue
+        for tc in (m.get("tool_calls") or []):
+            fn = (tc.get("function") or {}) if isinstance(tc, dict) else {}
+            actions.append(f"- ran {fn.get('name', '?')}({_clip(str(fn.get('arguments', '')), 160)})")
+
+    tail: List[str] = []
+    used = 0
+    for m in reversed(msgs):
+        body = _clip(str(m.get("content") or "").strip(), 500)
+        if not body:
+            continue
+        block = f"{m.get('role', '?')}: {body}"
+        if used + len(block) > budget:
+            break
+        tail.append(block)
+        used += len(block)
+    tail.reverse()
+
+    parts = ["_Model-written summary unavailable (the summary request itself failed), so "
+             "these notes are a deterministic digest of the conversation._", "",
+             "## Task", _clip(task, 600) or "(no user message found)", "",
+             "## What was done"]
+    parts += actions[:40] or ["- (no tool calls recorded)"]
+    parts += ["", "## Recent conversation (newest last)"] + tail
+    return "\n".join(parts)
+
+
+def is_context_overflow_error(msg: str) -> bool:
+    """True when a server error means "the context window is full".
+
+    Long agentic turns used to end with nothing saved: the request simply failed and
+    the error path never reached the handoff check. Recognizing these responses (both
+    OpenAI-style and llama.cpp/Unsloth wording) lets the app write a handoff summary
+    instead of losing an hour of work. Deliberately narrow - a 401 or a model_not_found
+    must NOT be mistaken for an overflow."""
+    low = str(msg or "").lower()
+    if any(k in low for k in ("context_length_exceeded", "maximum context length",
+                            "max_context_length_exceeded", "context window is too large",
+                            "prompt is too long", "input is too long",
+                            "reduce the length of the messages",
+                            "too many tokens", "exceeds the maximum context",
+                            "insufficient space", "context overflow")):
+        return True
+    # llama.cpp / Unsloth style: "the request exceeds the available context size (N)
+    # try increasing the context size" - matched as a phrase so bare numbers never trip it.
+    if "exceeds the available context" in low or "available context size" in low:
+        return True
+    return False
 
 
 def compute_speed_readout(usage: Optional[dict], full_content: str, full_reasoning: str,
@@ -1968,8 +2322,10 @@ class DeskpilotApp:
         self._supports_usage_opts = True
         self._ctx_used = 0          # last known prompt_tokens for the active session (set on main thread)
         self._ctx_total = 0         # context window size from /models metadata (main thread)
-        self._handoff_done: set = set()            # chat ids that already auto-handoffed this run
+        self._handoff_inflight: set = set()        # chats with a summary worker running RIGHT NOW
+        self._handoff_lock = threading.Lock()      # guards the set above (worker + main thread)
         self._last_handoff: Dict[str, str] = {}    # chat_id -> last rendered handoff summary text
+        self._ctx_used_run = 0          # gauge value as of the LAST model step (worker thread copy)
 
         self._code_buttons: List[tk.Button] = []
         self._image_thumbs: List[tuple] = []   # (photo ref, text index, path-or-None) of embedded thumbnails
@@ -2238,10 +2594,22 @@ class DeskpilotApp:
                   relief="flat", bd=0, width=3, cursor="hand2",
                   font=F(13)).pack(side="left", padx=(0, 6))
 
+        # The input box gets its OWN vertical scrollbar (user request): long prompts and
+        # Shift+Enter multi-line text were invisible with no way to scroll. It lives in a
+        # thin frame packed exactly where the Text used to be, so every button on the row
+        # keeps its original side="left" order (mic / TTS / temp+thinking / Send).
+        # Styling mirrors the chat pane scrollbar; Tk 9-safe (explicit bd/highlightthickness).
+        box = tk.Frame(inp, bg=COL["bg_deep"])
+        box.pack(side="left", fill="both", expand=True)
         self.input_text = tk.Text(
-            inp, height=3, wrap="word", bg=COL["bg_deep"], fg=COL["text"],
+            box, height=3, wrap="word", bg=COL["bg_deep"], fg=COL["text"],
             insertbackground=COL["text"], relief="flat", bd=0,
             font=F(12), padx=10, pady=8)
+        self.input_scroll = tk.Scrollbar(box, orient="vertical", command=self.input_text.yview,
+                                         bg=COL["bg_raised"], troughcolor=COL["bg_deep"],
+                                         highlightthickness=0, borderwidth=0)
+        self.input_text.configure(yscrollcommand=self.input_scroll.set)
+        self.input_scroll.pack(side="right", fill="y")
         self.input_text.pack(side="left", fill="both", expand=True)
         self.input_text.bind("<Return>", self._on_input_return)
         # Right-click context menu (Cut/Copy/Paste/Select All) on both text widgets;
@@ -2456,10 +2824,33 @@ class DeskpilotApp:
 
     # ── Session handoff (auto-summary at context threshold) ────────────────────
 
+    def _handoff_rearm_needed(self, chat: dict, used: int, total: int) -> bool:
+        """May this chat produce (another) handoff summary at "used" tokens?
+
+        A chat that has never handed off fires on the first crossing. One that already
+        has a summary re-fires only once the gauge has grown by handoff_rearm_pct percent
+        of the window since that summary was written - so a long agentic turn can refresh
+        the notes several times without a summary request after literally every step.
+        The old one-shot guard (handoff_summary present -> never again) is what made a
+        second overflow in the same chat unsalvageable."""
+        if total <= 0:
+            # No measurable window (server reports no context_length). The re-arm margin is
+            # a percentage OF the window, so with no window there is no defensible trigger -
+            # refuse rather than summarize at every step boundary. Both callers already gate
+            # on total > 0; this exists so a future caller cannot divide by zero.
+            return False
+        prev = int(chat.get("handoff_used") or 0)
+        if prev <= 0:
+            return True                     # no summary for this chat yet
+        rearm = _handoff_rearm_pct(self.settings)
+        if rearm <= 0:
+            return True
+        return (max(0, used - prev) / float(total)) * 100.0 >= float(rearm)
+
     def _maybe_trigger_handoff(self) -> None:
-        """After a completed turn, check whether this chat crossed the configured
-        context-usage threshold; if so (once per chat per run) generate a handoff
-        summary in the background. Inert when the server reports no context size."""
+        """After a completed turn: summarize if this chat crossed the configured
+        context-usage threshold (re-arming as the gauge keeps growing). Inert when the
+        server reports no context size."""
         if self._closed or self._busy:
             return
         total = int(self._ctx_total or 0)
@@ -2470,19 +2861,137 @@ class DeskpilotApp:
         if (used / total) * 100.0 < float(pct_set):
             return
         cid = self.current_chat_id
-        if not cid or cid in self._handoff_done:
+        if not cid:
             return
         chat = self.chats["chats"].get(cid)
         if not chat or not chat.get("messages"):
             return
-        # Persistent guard (restart case): a summary already saved for this chat must
-        # not be regenerated - the in-memory done-set alone would re-fire after launch.
-        if chat.get("handoff_summary"):
+        # Persistent guard (restart case): a saved summary is not regenerated until the
+        # gauge has grown by the re-arm margin - see _handoff_rearm_needed(). This is the ONLY
+        # repeat-suppression rule. The old in-memory "already handoffed this run" set defeated
+        # it: one mid-turn handoff silenced the end-of-turn auto-summary for that chat until
+        # restart - precisely when a marathon turn needs refreshed notes.
+        if not self._handoff_rearm_needed(chat, used, total):
             return
-        self._handoff_done.add(cid)
-        threading.Thread(target=self._handoff_worker,
-                         args=(cid, int(self._ctx_used or 0), int(self._ctx_total or 0)),
-                         daemon=True).start()
+        self._handoff_start(cid, int(self._ctx_used or 0), int(self._ctx_total or 0))
+
+    def _ctx_window(self) -> int:
+        """Context window size as seen from a worker thread.
+
+        _ctx_total is main-thread state; read through getattr so half-built instances
+        (tests that skip __init__) never raise AttributeError inside the agentic loop."""
+        try:
+            return int(getattr(self, "_ctx_total", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _begin_midturn_handoff(self, chat_id: str, used: int, total: int, why: str,
+                               force: bool = False) -> bool:
+        """Called from the worker at a step boundary: cut this turn short and write
+        handoff notes instead of pushing another request into an almost-full window.
+
+        Runs on the worker thread but only reads plain ints / settings (never a widget),
+        so the decision itself needs no _post; everything that touches the UI is queued.
+        Returns True when the caller must end the turn. Deliberately inert - no note, no
+        summary - when the feature is off or the chat has nothing to summarize, in which
+        case the turn continues exactly as before.
+
+        force=True (server itself refused the request because the window is full) skips the
+        gauge comparison and the re-arm margin: there is no point estimating how full a
+        window the server has already declared full, and LM Studio / Ollama report no
+        context_length at all, so total is 0 and the gauge-based gate could never open.
+        Without this, an overflow on those servers ended the turn with a bare error and
+        nothing saved - exactly the failure this feature exists to prevent. A threshold of 0
+        still means OFF (the user's explicit switch is never overridden), and the chat must
+        still have messages to summarize; _handoff_worker handles a zero total."""
+        if self._closed or self._stop_event.is_set():
+            return False
+        pct_set = _handoff_threshold_pct(self.settings)
+        if pct_set <= 0:
+            return False          # feature explicitly off (Settings -> Handoff threshold % = 0)
+        if not force:
+            # Gauge-based trigger: needs a measurable window and a real usage figure.
+            if total <= 0 or used <= 0:
+                return False
+            if (used / total) * 100.0 < float(pct_set):
+                return False
+        chat = self.chats["chats"].get(chat_id)
+        if not chat or not chat.get("messages"):
+            return False
+        if not force and not self._handoff_rearm_needed(chat, used, total):
+            return False
+        # No "already done" bookkeeping here on purpose: a mid-turn handoff must not silence
+        # the end-of-turn auto-handoff (see _maybe_trigger_handoff). Duplicate suppression is
+        # purely temporal - _handoff_start() refuses a SECOND concurrent worker for the same
+        # chat; re-arming after that is governed by the gauge plus the re-arm margin.
+        pend = {"chat_id": chat_id, "used": int(used), "total": int(total), "why": why}
+        self._post(lambda p=dict(pend): self._ui_finish_for_handoff(p))
+        return True
+
+    def _ui_finish_for_handoff(self, info: dict) -> None:
+        """Main thread: end a turn that was stopped on purpose to write handoff notes,
+        then start the summary request. _finish_turn_ui() is what releases _busy
+        (invariant 10), so it runs before anything that could go wrong."""
+        if self._closed:
+            return
+        cid = info.get("chat_id")
+        used = int(info.get("used") or 0)
+        total = int(info.get("total") or 0)
+        self._ctx_used = used
+        self._update_ctx_usage_label()
+        pct = _handoff_threshold_pct(self.settings)
+        msg = (f"\U0001F4CF Context {_handoff_gauge_text(used, total)} ({pct}% threshold) - " +
+               str(info.get("why") or "") + ". Stopping to write handoff notes\u2026")
+        self.render_note(msg)
+        # _finish_turn_ui() is what releases _busy (invariant 10), so it runs before anything
+        # that could go wrong - and it now carries the informative text through instead of
+        # stamping "Ready" over the reason the turn was cut short.
+        self._finish_turn_ui(status=msg)
+        if not cid:
+            return
+        self._handoff_start(cid, used, total)
+
+    def _handoff_start(self, chat_id: str, used_at: int = 0, total_at: int = 0) -> bool:
+        """Start ONE summary worker per chat; returns False when one is already running.
+
+        Without this guard two threads could summarize the same chat at once (a mid-turn
+        summary still in flight when the next turn ends) and both would write
+        handoff_<chat_id>.md - last writer wins, with a .bak that looks intentional but is
+        just a race. Only ONE suppression rule is temporal; whether a chat MAY summarize
+        again is decided by _handoff_rearm_needed()."""
+        lock = getattr(self, "_handoff_lock", None)
+        if lock is None:                      # half-built instances (tests that skip __init__)
+            lock = threading.Lock()
+            self._handoff_lock = lock
+        inflight = getattr(self, "_handoff_inflight", None)
+        if inflight is None:
+            inflight = set()
+            self._handoff_inflight = inflight
+        with lock:
+            if chat_id in inflight:
+                return False
+            inflight.add(chat_id)
+        threading.Thread(target=self._handoff_run,
+                         args=(chat_id, int(used_at or 0), int(total_at or 0)), daemon=True).start()
+        return True
+
+    def _handoff_run(self, chat_id: str, used_at: int = 0, total_at: int = 0) -> None:
+        """Thread body: run the summary worker, then ALWAYS release the in-flight slot.
+        The release lives here (not inside _handoff_worker) so every exit path - including its
+        early returns and any unexpected exception - frees the chat, and so a test that swaps
+        in a fake worker is released exactly like the real one."""
+        try:
+            self._handoff_worker(chat_id, used_at, total_at)
+        except Exception:
+            # Same policy as the chat worker's safety net: report it, never let a summary
+            # thread die with an unhandled exception (the notes file is best-effort).
+            traceback.print_exc()
+        finally:
+            inflight = getattr(self, "_handoff_inflight", None)
+            lock = getattr(self, "_handoff_lock", None)
+            if inflight is not None and lock is not None:
+                with lock:
+                    inflight.discard(chat_id)
 
     def _handoff_worker(self, chat_id: str, used_at: int = 0, total_at: int = 0) -> None:
         """Background: ask the model to summarize this chat, save it to a file, and
@@ -2502,52 +3011,97 @@ class DeskpilotApp:
         # history, sanitized so it stays small and works on non-vision models
         # (images -> text placeholders, tool outputs capped), and trimmed to fit
         # the context window alongside the prompt + summary output.
-        history = _trim_for_handoff(
-            _sanitize_for_handoff(chat.get("messages") or []),
-            _handoff_budget_chars(int(total_at or 0)))
-        if not history:
+        # Snapshot the history (shallow copy) instead of iterating the live list:
+        # _finish_turn_ui() released _busy before this thread started, so the user can
+        # already be typing/sending. A CPython list does not raise on a concurrent append,
+        # it would just silently pull the brand-new message into the summary.
+        sanitized = _sanitize_for_handoff(list(chat.get("messages") or []))
+        if not sanitized:
             return
-        kwargs: Dict[str, Any] = dict(
-            model=model,
-            messages=[
-                build_system_message(str(self.settings.get("file_workspace") or ""),
-                                     str(self.settings.get("exa_api_key") or ""),
-                                     str(self.settings.get("firecrawl_api_key") or ""),
-                                     str(self.settings.get("custom_system_prompt") or "")),
-                *history,
-                {"role": "user", "content": _handoff_prompt(title)},
-            ],
-            stream=False,
-            temperature=0,      # factual summary - no sampling noise
-            max_tokens=2048,    # bound the summary length (some servers reject it -> retry without)
-        )
-        try:
+        # Budget ladder. Start from the configured budget; if the SUMMARY request itself is
+        # refused as too long, halve it and try again. Without this, the first attempt -
+        # built from a history that just overflowed, and on a no-context_length server sized
+        # only by the fallback constant - fails and the turn ends with 'Handoff summary
+        # failed' and no notes at all.
+        budget = _handoff_budget_chars(int(total_at or 0))
+        attempts = 0
+        summary = ""
+        last_err = ""
+        while True:
+            history = _trim_for_handoff(sanitized, budget)
+            kwargs: Dict[str, Any] = dict(
+                model=model,
+                messages=[
+                    build_system_message(str(self.settings.get("file_workspace") or ""),
+                                         str(self.settings.get("exa_api_key") or ""),
+                                         str(self.settings.get("firecrawl_api_key") or ""),
+                                         str(self.settings.get("custom_system_prompt") or "")),
+                    *history,
+                    {"role": "user", "content": _handoff_prompt(title)},
+                ],
+                stream=False,
+                temperature=0,      # factual summary - no sampling noise
+                max_tokens=HANDOFF_SUMMARY_MAX_TOKENS,   # some servers reject it -> retried without
+            )
             try:
-                resp = client.chat.completions.create(**kwargs)
-            except Exception as e:
-                msg = str(e).lower()
-                if "max_tokens" in msg or "max_completion_tokens" in msg:
-                    kwargs.pop("max_tokens", None)
+                try:
                     resp = client.chat.completions.create(**kwargs)
-                else:
-                    raise
-            summary = (resp.choices[0].message.content or "").strip()
-        except Exception as e:
-            self._post(lambda m=str(e): self.render_error(f"Handoff summary failed:\n{m}"))
-            return
+                except Exception as e:
+                    emsg = str(e).lower()
+                    if "max_tokens" in emsg or "max_completion_tokens" in emsg:
+                        kwargs.pop("max_tokens", None)
+                        resp = client.chat.completions.create(**kwargs)
+                    else:
+                        raise
+                summary = (resp.choices[0].message.content or "").strip()
+                break
+            except Exception as e:
+                last_err = str(e)
+                # Overflow AND room left to shrink -> retry smaller. Any other failure (auth,
+                # connection, dead server) is not fixed by a shorter history: stop trying.
+                if (is_context_overflow_error(last_err)
+                        and attempts < HANDOFF_RETRY_OVERFLOW
+                        and budget // 2 >= HANDOFF_FALLBACK_MIN_CHARS):
+                    attempts += 1
+                    budget //= 2
+                    self._post(lambda b=budget: self.render_note(
+                        f"\U0001F4E6 Handoff summary too large - retrying with a smaller "
+                        f"history budget ({b} chars)…"))
+                    continue
+                break
+
         if not summary:
-            return
+            # Model-written summary unavailable: salvage the turn with a deterministic digest
+            # (no model call) so Start New Session / Auto-Continue still have something to carry
+            # over. An overflow is EXPECTED here (that is why this path exists) so it gets a note;
+            # any other final failure - including an auth/connection error reached after a
+            # successful shrink - is reported as an error too, because something is genuinely wrong.
+            if not is_context_overflow_error(last_err):
+                self._post(lambda m=last_err: self.render_error(f"Handoff summary failed:\n{m}"))
+            fallback = _deterministic_handoff(chat, max(
+                HANDOFF_FALLBACK_MIN_CHARS, min(budget, HANDOFF_FALLBACK_MAX_CHARS)))
+            if not fallback:
+                return
+            summary = fallback
+            self._post(lambda m=last_err: self.render_note(
+                f"\U0001F4E6 Wrote deterministic handoff notes instead "
+                f"(model summary unavailable: {m[:200]})"))
 
         # Save to a file next to the data files (best-effort; never blocks the UI).
+        # Rolling single file per chat (handoff_<chat_id>.md, previous version kept as
+        # .bak by _atomic_write) so there is always exactly one CURRENT notes file - plus
+        # an optional timestamped archive when a history of snapshots is wanted.
         file_path = ""
         try:
             fp = _handoff_file_path(SETTINGS_FILE.parent, chat_id)
             header = (f"# Session Handoff - {title}\n"
                       f"_Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} at "
-                      f"{int(used_at or 0)}/{int(total_at or 0)} tokens "
+                      f"{_handoff_gauge_text(used_at, total_at)} "
                       f"({_handoff_threshold_pct(self.settings)}% threshold)_\n\n")
-            fp.write_text(header + summary + "\n", encoding="utf-8")
+            _atomic_write(fp, header + summary + "\n")
             file_path = str(fp)
+            if HANDOFF_KEEP_ARCHIVE:
+                _atomic_write(_handoff_archive_path(fp), header + summary + "\n")
         except Exception:
             pass
 
@@ -2602,7 +3156,8 @@ class DeskpilotApp:
         # re-render (e.g. after a restart, where the gauge has been reset).
         used = int(self._ctx_used or 0) or int((chat or {}).get("handoff_used") or 0)
         total = int(self._ctx_total or 0) or int((chat or {}).get("handoff_total") or 0)
-        title = f"\U0001F4E6 Session Handoff \u00b7 {used}/{total} tokens ({pct}% threshold)"
+        title = (f"\U0001F4E6 Session Handoff \u00b7 {_handoff_gauge_text(used, total)} "
+                 f"({pct}% threshold)")
         sid = self._add_accordion(title, COL["warning"], expanded=True)
         self._render_handoff_body(sid, summary)
         # Action buttons on their own line (NOT elided - stay available when the
@@ -2628,6 +3183,15 @@ class DeskpilotApp:
                 relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=F(11))
             self._code_buttons.append(new_btn)
             self.chat_text.window_create(b1, window=new_btn)
+            self.chat_text.insert("end", "   ")
+            b2 = self.chat_text.index("end-1c")
+            go_btn = tk.Button(
+                self.chat_text, text="\u2795\u26a1 Auto-Continue",
+                command=lambda c=chat_id: self._auto_continue_session(c),
+                bg=COL["success"], fg="#FFFFFF", activebackground="#059669",
+                relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=F(11))
+            self._code_buttons.append(go_btn)
+            self.chat_text.window_create(b2, window=go_btn)
             self.chat_text.insert("end", "\n")
         except Exception:
             pass
@@ -2635,7 +3199,21 @@ class DeskpilotApp:
             self.render_note(f"Handoff saved to: {file_path}")
         self._autoscroll()
 
-    def _start_new_session(self, source_chat_id: str) -> None:
+    def _auto_continue_session(self, source_chat_id: str) -> None:
+        """Handoff accordion's Auto-Continue: start the fresh session AND immediately ask
+        the model to resume the task, so a long job survives its own context limit without
+        the user re-typing anything. Refuses while a turn is running (_busy) and when no
+        summary exists - it never silently starts an empty session."""
+        if self._closed or self._busy:
+            self._set_status("Wait for the current turn to finish before auto-continuing")
+            return
+        src = self.chats["chats"].get(source_chat_id)
+        if not src or not (src.get("handoff_summary") or self._last_handoff.get(source_chat_id)):
+            messagebox.showinfo(APP_NAME, "No handoff summary is available to carry over.")
+            return
+        self._start_new_session(source_chat_id, auto_send=True)
+
+    def _start_new_session(self, source_chat_id: str, auto_send: bool = False) -> None:
         """Open a fresh chat seeded with the handoff summary from `source_chat_id`,
         so the model is instantly up to speed and the token count resets."""
         src = self.chats["chats"].get(source_chat_id)
@@ -2652,6 +3230,12 @@ class DeskpilotApp:
             return
         intro = ("[Session Handoff] The previous session reached its context limit. "
                  "Here is a summary of the work so far - continue from here:\n\n" + summary)
+        if auto_send:
+            # One user message only (summary + the resume instruction together), so the
+            # new chat never opens with two consecutive user turns.
+            intro += ("\n\nResume the task described above now: pick up at 'Next steps', "
+                      "keep to the constraints already established, and do not repeat work "
+                      "listed under 'What was done'.")
         fresh["messages"].append({"role": "user", "content": intro})
         base = (src.get("title") or "Session").strip()[:24]
         fresh["title"] = f"Continued: {base}"
@@ -2659,6 +3243,19 @@ class DeskpilotApp:
         self._refresh_chat_list()
         self.render_user_message(intro)
         self._set_status("\u2795 New session started from handoff summary")
+        if auto_send and not self._busy:
+            # Deliberately NOT send_message(): the input box is empty and that path would
+            # append a second user message. Start the worker on the seeded history instead
+            # - same button/busy bookkeeping as any turn, so _finish_turn_ui still owns it.
+            self._busy = True
+            self._stop_event.clear()
+            self.send_btn.configure(text="\u23f9 Stop", bg=COL["danger"], activebackground="#B91C1C",
+                                    command=self.stop_generation)
+            self.speed_label.configure(text="\u26a1 \u2026")
+            cid = self.current_chat_id
+            self._run_chat_id = cid
+            threading.Thread(target=self._chat_worker,
+                             args=(cid, list(fresh["messages"])), daemon=True).start()
 
     def _refresh_ctx_topbar(self) -> None:
         """Background-fetch {server_url}/models and refresh the top-bar context
@@ -2801,7 +3398,7 @@ class DeskpilotApp:
             messagebox.showinfo(APP_NAME, "Select a conversation to delete.")
             return
         if not messagebox.askyesno(
-                APP_NAME, f"Delete “{chat.get('title')}” and its full history?", parent=self.root):
+                APP_NAME, f"Delete “{chat.get('title')}” and its full history? Its images/attachments will be deleted too.", parent=self.root):
             return
         # If this chat owns the in-flight turn, abort it BEFORE removing the
         # record. Otherwise the worker keeps streaming and burning tokens on a
@@ -2813,10 +3410,48 @@ class DeskpilotApp:
         if stopping_run:
             self._stop_event.set()
             self._set_status("\u23f9 Stopping deleted chat\u2026")
+        # ── Reclaim this chat's image files (backlog #4) ─────────────────────
+        # Screenshots and attachments live in GEN_DIR as orphan-proof "image_ref"
+        # paths. Nothing else can render them once the record is gone, so they are
+        # deleted here instead of piling up forever. The in-flight worker was already
+        # stopped above (and tools now honour Stop within STOP_POLL_S), and
+        # _ui_sync_messages() drops writes to a missing record, so no new reference
+        # can appear after the pop. Files are unlinked AFTER save_chats(): if
+        # something dies mid-deletion the persisted history never points at a
+        # missing file (a lost image degrades to a text placeholder, not a crash).
+
         self.chats["chats"].pop(cid, None)
         if cid in self.chats["order"]:
             self.chats["order"].remove(cid)
         save_chats(self.chats)
+
+        # Now that the record is gone from disk too, remove the files it owned.
+        # Guard: skip any path a REMAINING chat still references (should not happen -
+        # every capture/attach writes a unique name - but never delete data another
+        # conversation can still render).
+        try:
+            keep = _referenced_image_keys(self.chats)
+        except Exception:
+            keep = set()
+        removed = skipped = 0
+        for fp in _chat_image_paths(chat):
+            try:
+                if str(fp.resolve()) in keep:
+                    continue          # another conversation can still render it
+                if not _path_in_image_store(fp):
+                    skipped += 1      # outside the image stores - never touch user files
+                    continue
+                if fp.is_file():
+                    fp.unlink()
+                    removed += 1
+            except Exception:
+                pass      # a locked/missing file must not abort the deletion itself
+        if removed or skipped:
+            _txt = "Deleted " + str(removed) + " image file(s) with this chat"
+            if skipped:
+                _txt += " (" + str(skipped) + " outside the image store left alone)"
+            self._set_status(_txt)
+
         if not self.chats["order"]:
             self.new_chat()
         else:
@@ -3523,6 +4158,8 @@ class DeskpilotApp:
             if r:
                 w.delete(r[0], r[1])
             w.insert("insert", clip)
+            if w is self.input_text:
+                self._see_input("insert")
 
         menu.add_command(label="Cut", state=("normal" if has_sel else "disabled"), command=_cut)
         menu.add_command(label="Copy", state=("normal" if has_sel else "disabled"), command=_copy)
@@ -3539,6 +4176,18 @@ class DeskpilotApp:
         try:
             menu.tk_popup(event.x_root, event.y_root)
         except tk.TclError:
+            pass
+
+    def _see_input(self, where: str = "insert") -> None:
+        """Scroll the INPUT box so `where` is visible (main thread only).
+
+        Tk auto-scrolls on typed keys, but programmatic inserts (Shift+Enter newline,
+        dictation append, context-menu paste) do not - without this a long prompt ends up
+        scrolled off the top of the 3-line box. TclError-guarded for Tk 9 / half-built apps.
+        """
+        try:
+            self.input_text.see(where)
+        except (tk.TclError, AttributeError):
             pass
 
     def _at_bottom(self) -> bool:
@@ -3728,7 +4377,11 @@ class DeskpilotApp:
             self.render_note("\u23f9 Stopped by user")
         self._finish_turn_ui()
 
-    def _finish_turn_ui(self) -> None:
+    def _finish_turn_ui(self, status: Optional[str] = None) -> None:
+        """End a turn: persist history, release _busy, restore the Send button.
+
+        status= keeps an informative message visible (e.g. why a turn was cut short for a
+        context handoff); without it the bar reads "Ready"."""
         if self._closed:
             return
         # Mid-turn saves are throttled; make sure the final state of this turn
@@ -3742,7 +4395,7 @@ class DeskpilotApp:
                                     command=self.send_message)
         except tk.TclError:
             pass
-        self._set_status("Ready")
+        self._set_status(status or "Ready")
         self._collapse_reasoning_sections()   # close any still-open reasoning drawer(s)
         self._reasoning_sid = None             # next turn starts a fresh section
 
@@ -3753,6 +4406,7 @@ class DeskpilotApp:
     def _on_input_return(self, event) -> Optional[str]:
         if event.state & 0x0001:             # Shift+Enter → newline
             self.input_text.insert("insert", "\n")
+            self._see_input("insert")   # programmatic insert does NOT auto-scroll the caret
             return "break"
         self.send_message()
         return "break"
@@ -3833,7 +4487,9 @@ class DeskpilotApp:
         if not self._busy:
             return
         self._stop_event.set()
-        self._set_status("⏹ Stopping…")
+        # Tools now poll this event, so the turn unwinds within STOP_POLL_S; say what is
+        # happening while they do (a killed node/CLI subprocess takes a moment to die).
+        self._set_status("⏹ Stopping… (aborting any running tool)")
 
     def _get_client(self) -> Optional[Any]:
         """Return a cached OpenAI client for the current server/key.
@@ -3900,6 +4556,16 @@ class DeskpilotApp:
         turn_total = 0           # completion tokens accumulated this user prompt (resets per prompt)
         stream_retry_ok = True   # one automatic retry per step on a transient mid-stream drop
         model_fix_ok = True      # one auto-correction of a stale model name per turn
+        self._ctx_used_run = 0   # gauge as of the last completed step of THIS prompt (worker-side copy;
+                                 # _ctx_used is main-thread state and must not be written from here)
+        # Wall-clock backstop for this prompt, from the "Turn time limit" setting
+        # (0 = NO LIMIT, which is the default). MAX_TOOL_STEPS == 0 means the loop has no
+        # step cap, so a deadline is the only thing that can end a model that keeps calling
+        # tools - but it is opt-in now: a long turn must not be cut short unless the user
+        # asked for it. Checked at each step boundary; the per-tool abort path (Stop /
+        # _run_cancellable) is what stops a single long call mid-flight either way.
+        turn_limit = _turn_time_limit(self.settings)
+        turn_deadline = (time.monotonic() + turn_limit) if turn_limit else None
 
         while (MAX_TOOL_STEPS == 0 or step < MAX_TOOL_STEPS) and not self._closed \
                 and not self._stop_event.is_set():
@@ -3941,6 +4607,22 @@ class DeskpilotApp:
                 eb = chat_thinking_extra_body(self.chats["chats"].get(chat_id))
                 if eb is not None:
                     kwargs["extra_body"] = eb
+
+            if turn_deadline is not None and time.monotonic() > turn_deadline:
+                # Wall-clock backstop hit (only reachable when MAX_TOOL_STEPS == 0).
+                # If the context ALSO crossed the handoff threshold, prefer the handoff
+                # path - it saves the work AND explains itself. Otherwise render a plain
+                # note in the chat (not just the status bar), so a long aborted turn does
+                # not look like the app silently froze.
+                if self._begin_midturn_handoff(chat_id, int(self._ctx_used_run or 0),
+                                               self._ctx_window(),
+                                               "the " + str(turn_limit) + " s time limit was reached"):
+                    return
+                _msg = ("\u23f1 Turn stopped after the " + str(turn_limit) +
+                        " s time limit (" + str(step) + " tool steps).")
+                self._post(lambda m=_msg: self.render_note(m))
+                self._post(lambda m=_msg: self._finish_turn_ui(status=m))
+                return
 
             _cap = "" if MAX_TOOL_STEPS == 0 else f"/{MAX_TOOL_STEPS}"
             self._post(lambda s=f"🤖 Thinking… (step {step + 1}{_cap})": self._set_status(s))
@@ -3988,6 +4670,19 @@ class DeskpilotApp:
                     self._post(lambda m=msg, o=opts: self.render_error(
                         f"Model request failed:\n{m}\n\nModels the server reports as loaded: {o}\nSettings → Model Name must use one of those exact IDs."))
                     self._post(self._finish_turn_ui)
+                    return
+                # Context full: the request itself was refused. Save what this turn has
+                # produced by writing handoff notes (the summary request is trimmed to fit,
+                # so it can succeed when the real request cannot) instead of ending with a
+                # bare error and nothing carried over.
+                # The server itself says the window is full, so trust that over the
+                # char-based estimate (which lags behind tool output it has not seen).
+                _ctx_win = self._ctx_window()
+                _used_est = max(int(self._ctx_used_run or 0),
+                                estimate_prompt_tokens(kwargs["messages"]), _ctx_win)
+                if is_context_overflow_error(msg) and self._begin_midturn_handoff(
+                        chat_id, _used_est, _ctx_win,
+                        "the server refused the request (context full)", force=True):
                     return
                 self._post(lambda m=msg: self.render_error(f"Model request failed:\n{m}"))
                 self._post(self._finish_turn_ui)
@@ -4129,6 +4824,7 @@ class DeskpilotApp:
             # ── context usage: total session tokens (prompt + completion) ──
             tot = session_total_tokens(usage, full_content, full_reasoning,
                                        tool_acc, kwargs["messages"])
+            self._ctx_used_run = int(tot or 0)     # worker-side copy for the mid-turn gate
             self._post(lambda u=tot: self._set_ctx_used(u))
 
             # ── finalize tool calls accumulated from the stream ───────────
@@ -4218,9 +4914,40 @@ class DeskpilotApp:
 
             self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
             stream_retry_ok = True   # a completed step restores the one-retry budget
+
+            # ── mid-turn context gate ────────────────────────────────────────
+            # Deliberately checked AFTER the tool phase: the tool results just appended
+            # are exactly what a handoff summary needs. Continuing to the next request
+            # would push an almost-full window past the server's limit, and the turn used
+            # to die there with an error - hours of work and no notes. Here the loop stops
+            # on purpose and _ui_finish_for_handoff() writes the summary instead.
+            # Gate on the LARGER of the server's figure and a char estimate of what the NEXT
+            # request would really carry: 'tot' was measured when that request was made, so
+            # this step's tool results are NOT in it. A large tool output could push the next
+            # request past the window while the gauge still looked safe - the gate firing one
+            # step late is exactly the failure this feature exists to prevent. The estimate is
+            # only ever a lower bound here, and _begin_midturn_handoff() still refuses to act
+            # when the server reports no context size (no guessing).
+            _gate_used = max(int(tot or 0), estimate_prompt_tokens(messages))
+            if self._begin_midturn_handoff(chat_id, _gate_used, self._ctx_window(),
+                                           "the agentic loop is still running"):
+                return
+
             step += 1
 
-        if not self._closed and MAX_TOOL_STEPS != 0:
+        if self._closed:
+            return
+        if self._stop_event.is_set():
+            # Stop landed exactly on a step boundary (or before the very first
+            # iteration): the while-condition exited on its own, so no turn-ending
+            # path ran. With MAX_TOOL_STEPS == 0 the cap branch below is dead code,
+            # which left _busy stuck True forever - Send stayed "Stop" and every
+            # later send was silently ignored until restart. Finish the turn like
+            # any other user stop (partial reply already persisted).
+            self._post(self._ui_turn_stopped)
+        elif MAX_TOOL_STEPS != 0:
+            # Only reachable by exhausting the step cap (the deadline path returns
+            # inside the loop), so the "safety limit" wording is now accurate too.
             self._post(lambda: self.render_note(
                 f"⚠ Stopped after {MAX_TOOL_STEPS} tool iterations (safety limit)."))
             self._post(self._finish_turn_ui)
@@ -4259,6 +4986,13 @@ class DeskpilotApp:
         ev = threading.Event()
 
         def show():
+            # The post is queued on the main thread; if the user stopped the turn (or the
+            # app is closing) while it sat in the queue, do NOT open a dialog nobody asked
+            # for any more - just release the worker's wait with a "No".
+            if self._closed or self._stop_event.is_set():
+                ans["ok"] = False
+                ev.set()
+                return
             try:
                 ans["ok"] = messagebox.askyesno(
                     f"{APP_NAME} — Tool Permission",
@@ -4270,8 +5004,98 @@ class DeskpilotApp:
                 ev.set()
 
         self._post(show)
-        ev.wait(timeout=300)
+        # Sliced wait: a Stop press (or closing the app) must not leave the worker
+        # parked behind an unanswered permission dialog for 5 minutes. A cancelled
+        # wait answers "No" - the tool is NOT run, which is the safe default.
+        if not _interruptible_wait(ev, 300, lambda: self._closed or self._stop_event.is_set()):
+            return False
         return bool(ans["ok"])
+
+    def _abort_requested(self) -> bool:
+        """True when the user pressed Stop or the app is closing. Polled by every
+        blocking tool so a long-running call unwinds within STOP_POLL_S.
+
+        Reads via getattr defaults so half-built instances (tests that skip __init__)
+        never raise AttributeError inside a tool handler."""
+        if getattr(self, "_closed", False):
+            return True
+        ev = getattr(self, "_stop_event", None)
+        return ev is not None and ev.is_set()
+
+    def _run_cancellable(self, cmd: List[str], timeout: float,
+                         abort=None, cwd: Optional[str] = None
+                         ) -> Optional[subprocess.CompletedProcess]:
+        """Run a subprocess so Stop / app close can KILL it within STOP_POLL_S.
+
+        subprocess.run(timeout=...) cannot be interrupted: the worker sat inside a 900 s
+        node run (or a 15 min image generation) doing nothing while the user hammered
+        Stop, because the stop event was only examined between model steps. Here the
+        child is spawned with Popen and polled in STOP_POLL_S slices; on timeout OR when
+        'abort' turns True it is terminated (escalating to kill) and None is returned.
+
+        stdout/stderr are drained by reader threads into capped byte lists, so a chatty
+        child can never deadlock the poll loop on a full OS pipe buffer (the trap that
+        makes naive Popen+wait() worse than subprocess.run). Returns a CompletedProcess
+        on normal exit; None when cancelled or timed out."""
+        flags = 0x08000000 if os.name == "nt" else 0      # CREATE_NO_WINDOW (hidden)
+        # A spawn failure propagates; every caller wraps this call and turns it into
+        # an ERROR string (invariant: tool handlers never raise to the UI).
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, creationflags=flags,
+                                cwd=cwd or tempfile.gettempdir())
+
+        sink: Dict[str, list] = {"out": [], "err": []}
+        used: Dict[str, int] = {"out": 0, "err": 0}
+
+        def _drain(pipe, key: str) -> None:
+            try:
+                while True:
+                    # read1(): returns whatever one raw read yields instead of blocking
+                    # until the full chunk size is available.
+                    b = pipe.read1(65536)
+                    if not b:
+                        break
+                    if used[key] < PROC_OUTPUT_CAP:
+                        sink[key].append(b)
+                        used[key] += len(b)
+            except Exception:
+                pass
+
+        threads = [threading.Thread(target=_drain, args=(proc.stdout, "out"), daemon=True),
+                   threading.Thread(target=_drain, args=(proc.stderr, "err"), daemon=True)]
+        for t in threads:
+            t.start()
+
+        cancelled = False
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        while True:
+            rc = proc.poll()
+            if rc is not None:
+                break
+            if abort is not None and abort():
+                cancelled = True
+                _kill_process(proc)
+                break
+            if time.monotonic() >= deadline:
+                cancelled = True
+                _kill_process(proc)
+                break
+            time.sleep(STOP_POLL_S)
+
+        for t in threads:
+            t.join(timeout=2)          # pipes are closed at exit, so drains finish fast
+        for pipe in (proc.stdout, proc.stderr):
+            try:
+                if pipe:
+                    pipe.close()
+            except Exception:
+                pass
+        if cancelled:
+            return None
+        return subprocess.CompletedProcess(
+            args=cmd, returncode=proc.returncode,
+            stdout=b"".join(sink["out"]).decode("utf-8", "replace"),
+            stderr=b"".join(sink["err"]).decode("utf-8", "replace"))
 
     def _execute_tool(self, name: str, args: dict) -> str:
         perm = self.settings.get("tool_permissions", {}).get(name, "ask")
@@ -4457,6 +5281,9 @@ class DeskpilotApp:
                 chunks: List[bytes] = []
                 total = 0
                 while True:
+                    if self._abort_requested():
+                        return ("ERROR: Fetch was stopped by the user before it finished "
+                                f"(downloaded {total} bytes of {url}).")
                     chunk = resp.read(65536)
                     if not chunk:
                         break
@@ -4536,10 +5363,14 @@ class DeskpilotApp:
                     os.chmod(tmp.name, 0o600)
                 except OSError:
                     pass
-            flags = 0x08000000 if os.name == "nt" else 0    # CREATE_NO_WINDOW (hidden)
-            p = subprocess.run([node, tmp.name], capture_output=True, text=True,
-                               timeout=JS_TIMEOUT, creationflags=flags,
-                               stdin=subprocess.DEVNULL, cwd=tempfile.gettempdir())
+            p = self._run_cancellable([node, tmp.name], JS_TIMEOUT,
+                                      abort=self._abort_requested)
+            if p is None:
+                if self._abort_requested():
+                    return ("ERROR: JavaScript execution was stopped by the user before it "
+                            f"finished (the node process was killed after running under "
+                            f"{JS_TIMEOUT} s). Re-issue the call with shorter/cheaper code.")
+                return f"ERROR: JavaScript execution timed out after {JS_TIMEOUT} seconds."
             out = (p.stdout or "")
             # Mark the cap so a cut-off result is never mistaken for "no output".
             if len(out) > 8000:
@@ -4547,8 +5378,6 @@ class DeskpilotApp:
             if p.stderr:
                 out += ("\n[stderr]\n" + p.stderr) if out else ("[stderr]\n" + p.stderr)
             return (out or "(no output)")
-        except subprocess.TimeoutExpired:
-            return f"ERROR: JavaScript execution timed out after {JS_TIMEOUT} seconds."
         except Exception as e:
             return f"ERROR: Failed to execute JavaScript: {e}"
         finally:
@@ -4558,16 +5387,21 @@ class DeskpilotApp:
                 pass
 
     def _safe_path(self, raw_path: str) -> Path:
-        """Resolve a tool-supplied path with strict traversal + system-dir protection.
+        """Resolve a tool-supplied path with traversal + system-dir protection.
 
-        Raises PermissionError if the raw string contains '..' (path traversal -
-        deliberately a strict substring check) or if the resolved path equals or
-        sits inside a forbidden core system directory for this OS.
+        Raises PermissionError if any path COMPONENT of the (user-expanded) raw
+        string is a parent reference ('..', including dot/space-padded forms like
+        '.. ' or '. .') - see _traversal_component, which deliberately inspects
+        components rather than the raw substring so legal names such as a..b.txt or
+        foo...bar are NOT rejected. Also raises if the resolved path equals or sits
+        inside a forbidden core system directory for this OS.
         """
         raw = str(raw_path or "")
-        if ".." in raw:
+        expanded = os.path.expanduser(raw)
+        bad = _traversal_component(expanded)
+        if bad is not None:
             raise PermissionError(f"path traversal blocked ('..' not allowed): {raw!r}")
-        pth = Path(os.path.expanduser(raw)).resolve()
+        pth = Path(expanded).resolve()
         p_str = str(pth).lower()
         hit = _forbidden_dir_hit(p_str)
         if hit is not None:
@@ -4586,7 +5420,13 @@ class DeskpilotApp:
             if wsh is not None:
                 raise PermissionError(
                     f"file workspace itself is inside a protected system directory ({wsh}): {ws}")
-            if p_str != ws_str and not p_str.startswith(ws_str + os.sep):
+            # _dir_prefix(), NOT ws_str + os.sep: when File Workspace is a ROOT folder
+            # (a drive root like D: + separator, or '/' on Linux) it already ends with a
+            # separator, and appending another one matches NO child path - every legal file
+            # would then be refused as "outside the workspace". Lowercase string compare is
+            # kept deliberately: Path.is_relative_to() would break case-insensitive Windows
+            # matching after resolve() lowercases both sides.
+            if p_str != ws_str and not p_str.startswith(_dir_prefix(ws_str)):
                 raise PermissionError(f"path is outside the allowed file workspace ({ws}): {pth}")
         return pth
 
@@ -4724,11 +5564,18 @@ class DeskpilotApp:
 
         self._post(lambda: self._set_status("🎨 Generating image (local FLUX/SDXL, ~2-3 min)…"))
         try:
-            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=900)
-        except subprocess.TimeoutExpired:
-            return "ERROR: Image generation timed out after 15 minutes."
+            # cwd = the CLI folder. generate.py resolves everything from its own __file__, so
+            # this changes nothing today; it is defensive (a child that DID rely on a relative
+            # path would then find ai-imagegen/, not %TEMP%).
+            proc = self._run_cancellable(cmd, IMAGE_CLI_TIMEOUT, abort=self._abort_requested,
+                                         cwd=str(cli_dir))
         except Exception as e:
             return f"ERROR: Failed to run image CLI: {e}"
+        if proc is None:
+            if self._abort_requested():
+                return ("ERROR: Image generation was stopped by the user before it finished "
+                        "(the CLI process was killed).")
+            return f"ERROR: Image generation timed out after {IMAGE_CLI_TIMEOUT // 60} minutes."
 
         tail = (proc.stdout or "").strip().splitlines()[-6:]
         if proc.returncode != 0:
@@ -5017,6 +5864,7 @@ class DeskpilotApp:
             existing = self.input_text.get("1.0", "end-1c")
             prefix = "" if not existing else (" " if not existing.endswith((" ", "\n")) else "")
             self.input_text.insert("end-1c", prefix + text)
+            self._see_input("end")      # keep the newest dictated phrase visible
             self._set_status(f"🎤 Heard: {text[:60]}")
         except tk.TclError:
             pass
@@ -5167,8 +6015,10 @@ class DeskpilotApp:
             ("SearXNG URL (blank = LLM server IP :8080)", "searxng_url"),
             ("UI Font Size (8-20, default 12)",     "ui_font_size"),
             ("Max Tokens per reply (0 = server default)", "max_tokens"),
+            ("Turn time limit seconds (0 = NO LIMIT; cap a runaway tool loop)", "turn_time_limit"),
             ("File Workspace (confines Read/Write File tools; blank = unrestricted)", "file_workspace"),
             ("Handoff threshold % (auto-summary at this context usage; 0 = off)", "handoff_threshold_pct"),
+            ("Handoff re-arm % (grow this much more before summarizing again; 0 = every step)", "handoff_rearm_pct"),
             ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (metered; blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
@@ -5455,12 +6305,25 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 mt = 0
             self.settings["max_tokens"] = max(0, min(262144, mt))
+            # Turn time limit: seconds, clamped 0..TURN_TIME_LIMIT_MAX. 0 (the default) means
+            # NO LIMIT - a turn runs until it finishes or the user presses Stop.
+            try:
+                tl = int(float(self.settings.get("turn_time_limit", TURN_TIME_LIMIT_DEFAULT)))
+            except (TypeError, ValueError):
+                tl = TURN_TIME_LIMIT_DEFAULT
+            self.settings["turn_time_limit"] = max(0, min(TURN_TIME_LIMIT_MAX, tl))
             # Handoff threshold: numeric percent, clamped to 0..100 (invalid -> default).
             try:
                 hp = int(float(self.settings.get("handoff_threshold_pct", HANDOFF_THRESHOLD_DEFAULT)))
             except (TypeError, ValueError):
                 hp = HANDOFF_THRESHOLD_DEFAULT
             self.settings["handoff_threshold_pct"] = max(0, min(100, hp))
+            # Handoff re-arm margin: same clamping rule (invalid -> default).
+            try:
+                hr = int(float(self.settings.get("handoff_rearm_pct", HANDOFF_REARM_PCT_DEFAULT)))
+            except (TypeError, ValueError):
+                hr = HANDOFF_REARM_PCT_DEFAULT
+            self.settings["handoff_rearm_pct"] = max(0, min(100, hr))
             # MCP servers may have been added/removed in the dialog: reconnect
             # everything so the permission bar matches the saved configuration.
             self._mcp_connect_all()
@@ -5478,7 +6341,7 @@ class DeskpilotApp:
             self._set_status("⚙ Settings saved")
 
         btns = tk.Frame(top, bg=COL["bg_main"])
-        btns.grid(row=len(rows), column=0, columnspan=2, pady=14)
+        btns.grid(row=len(rows), column=0, columnspan=4, pady=14)   # spans the model row (cols 0-3)
         loaded_lbl.pack(in_=btns, side="top", pady=(0, 4))   # "Loaded on server: <exact id>"
 
         tk.Label(btns, text=f"Data files saved in: {SETTINGS_FILE.parent}", bg=COL["bg_main"],
@@ -5562,7 +6425,7 @@ class DeskpilotApp:
             return (f"ERROR: MCP server '{server_name}' is not running. "
                     f"Reconnect it in Settings -> MCP Servers.")
         try:
-            return client.call_tool(raw, args)
+            return client.call_tool(raw, args, abort=self._abort_requested)
         except Exception as e:
             return f"ERROR: {name} failed: {e}"
 
