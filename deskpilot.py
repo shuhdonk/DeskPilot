@@ -599,7 +599,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.7"
+VERSION    = "1.1.9"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -631,9 +631,30 @@ IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
 PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
 TOOL_OUTPUT_LIMIT = 96000   # max chars of ANY tool result sent back to the model (hard cap)
 MODEL_HISTORY_MAX = 20      # previously-used model names kept for the Model Name dropdown
-TEMP_VALUES       = ("0.0", "0.1", "0.2", "0.4", "0.6", "0.7", "0.8", "1.0", "1.2", "1.4", "1.6", "1.8", "2.0")  # per-chat temperature choices (0.0-2.0, step 0.2 + extra 0.1/0.7)
+TEMP_VALUES       = tuple(f"{v / 10:.1f}" for v in range(21))  # per-chat temperature choices: 0.0 .. 2.0 in 0.1 steps (21 values)
 TEMP_DEFAULT      = "0.7"                                    # default temperature (sent when a chat has no explicit value)
 THINK_VALUES      = ("Off", "Low", "Medium", "High")          # per-chat thinking level choices (no Extra High: == High on Qwen3.8)
+
+# Sampler parameters (Settings -> Sampling). Global for every chat session by design:
+# the chat UI stays uncluttered, so these live in Settings only and apply to all chats.
+#   target "top"  = a real OpenAI-schema chat.completions field (sent as a top-level kwarg)
+#   target "flat" = NOT in the OpenAI schema; flattened into the request JSON by the
+#                   openai client's extra_body, which is how llama.cpp/Unsloth/vLLM read them.
+#   off  = value at which the key is OMITTED from the request entirely (never a placeholder:
+#          repetition_penalty 0 means INFINITE repetition on llama.cpp and is invalid on
+#          OpenAI; presence/frequency 0 is their real neutral; top_k/min_p 0 = disabled.
+#          top_p has no in-range neutral, so it is off only when the field is blank).
+SAMPLING_SCHEMA = (
+    # key                  label                                                        lo     hi     int?   target off
+    ("top_p",              "Top P  (nucleus; 0-1, blank = server default)",             0.0,   1.0,   False, "top",  None),
+    ("top_k",              "Top K  (0 = off)",                                          0,     400,   True,  "flat", 0),
+    ("min_p",              "Min P  (0 = off)",                                          0.0,   1.0,   False, "flat", 0),
+    ("repetition_penalty", "Repetition Penalty  (1.0 = off; strongest of the three)",    1.0,   2.0,   False, "flat", 1.0),
+    ("presence_penalty",   "Presence Penalty  (-2 to 2, 0 = off)",                     -2.0,  2.0,   False, "top",  0),
+    ("frequency_penalty",  "Frequency Penalty  (-2 to 2, 0 = off)",                    -2.0,  2.0,   False, "top",  0),
+)
+SAMPLING_DEFAULTS = {k: "" for (k, _l, _lo, _hi, _i, _t, _o) in SAMPLING_SCHEMA}
+SAMPLING_FLAT_KEYS = tuple(k for (k, _l, _lo, _hi, _i, t, _o) in SAMPLING_SCHEMA if t == "flat")
 FLUSH_INTERVAL   = 0.05     # seconds between UI flushes while streaming
 # Core system directories that local file tools must never touch (security guard).
 FORBIDDEN_SYSTEM_DIRS_WINDOWS = ("c:\\windows", "c:\\$recycle.bin", "c:\\system volume information")
@@ -939,6 +960,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "handoff_threshold_pct": 75,  # auto-handoff when context usage hits this % (0 = off)
     "handoff_rearm_pct": 10,      # how much further the gauge must grow before a chat may summarize again
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
+    "sampling_defaults": dict(SAMPLING_DEFAULTS),  # sampler params applied to EVERY chat (Settings -> Sampling)
+    "show_sampling_note": True,   # render one "what was actually sent" note per user prompt
     "allow_local_network": False,  # fetch_url may reach LAN/localhost/cloud-metadata addresses
     "mcp_servers":       [],   # MCP stdio servers (Settings -> MCP Servers)
     "tts_enabled":       False,
@@ -1844,6 +1867,81 @@ def chat_thinking_extra_body(chat) -> Optional[dict]:
     return None
 
 
+
+def _coerce_sampling(raw, lo, hi, is_int):
+    """Coerce one sampler field. Blank/garbage -> None (key omitted). Clamped to [lo, hi]."""
+    if raw is None:
+        return None
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v != v:                      # NaN guard: NaN passes both clamp comparisons
+        return None
+    v = max(lo, min(hi, v))
+    return int(round(v)) if is_int else round(float(v), 6)
+
+
+def sampling_kwargs(settings) -> dict:
+    """Sampler parameters from Settings, split the way the API needs them.
+
+    Returns {"top": {...}, "flat": {...}}: 'top' are real OpenAI chat.completions fields
+    (merged straight into kwargs); 'flat' are llama.cpp/Unsloth/vLLM extensions that must
+    ride in extra_body. A key is OMITTED when blank/unparseable, when it sits at its
+    off-value, or when the server has rejected it. Values are clamped to their range and
+    sent verbatim otherwise - no snapping, no rounding beyond float cleanup.
+
+    Read on the worker thread at request-build time; never mutates settings."""
+    top: Dict[str, Any] = {}
+    flat: Dict[str, Any] = {}
+    src = (settings or {}).get("sampling_defaults")
+    if not isinstance(src, dict):
+        src = {}
+    for key, _label, lo, hi, is_int, target, off in SAMPLING_SCHEMA:
+        v = _coerce_sampling(src.get(key, ""), lo, hi, is_int)
+        if v is None:
+            continue
+        if off is not None and float(v) == float(off):
+            continue
+        (top if target == "top" else flat)[key] = v
+    return {"top": top, "flat": flat}
+
+
+def _sampling_note_enabled(settings) -> bool:
+    """Whether the per-prompt "Sent: ..." note is rendered (Settings checkbox; default ON)."""
+    v = (settings or {}).get("show_sampling_note", True)
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    return bool(v)
+
+def format_sampling_note(chat, top: dict, flat: dict, pruned: dict, thinking: Optional[dict]) -> str:
+    """One-line record of the sampling parameters that actually went on the wire.
+
+    Ground truth of the REQUEST, not of the settings dialog: keys omitted because they are
+    off show as 'off', and anything the server rejected is labelled 'rejected' so a silently
+    ignored parameter cannot masquerade as an applied one."""
+    parts = ["temp " + str(chat_temperature(chat))]
+    if thinking is None:
+        parts.append("thinking default")
+    elif "enable_thinking" in thinking:
+        parts.append("thinking off")
+    else:
+        eff = ((thinking.get("chat_template_kwargs") or {}).get("reasoning_effort"))
+        parts.append("thinking " + str(eff))
+    for key, _label, _lo, _hi, _i, _t, _o in SAMPLING_SCHEMA:
+        if key in pruned:
+            parts.append(key + " REJECTED")
+        elif key in top or key in flat:
+            parts.append(f"{key} {top.get(key, flat.get(key))}")
+        else:
+            parts.append(key + " off")
+    return "\u2699 Sent: " + "  \u00b7  ".join(parts)
+
+
 def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_key: str = "",
                          custom_prompt: str = "") -> dict:
     """System prompt injected at request time (never persisted to chat history).
@@ -2346,6 +2444,7 @@ class DeskpilotApp:
         self._clients: Dict[tuple, Any] = {}       # (server_url, api_key) -> cached OpenAI client (keep-alive pooling)
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
         self._pending_temperature: Optional[str] = None   # welcome-state temp change, applied to the chat the next send creates
+        self._sampling_sent: Optional[dict] = None   # last request's sampling payload (worker writes, note renders)
         self._pending_thinking: Optional[str] = None      # welcome-state thinking change, same
         # ── MCP (Model Context Protocol) servers ────────────────────────────
         self._mcp_clients: Dict[str, MCPClient] = {}   # server name -> connected client
@@ -4553,6 +4652,9 @@ class DeskpilotApp:
         step = 0
         usage_opts_ok = True
         thinking_ok = True          # flipped off if the server rejects enable_thinking
+        sampling_ok = True        # flipped off if the server rejects the sampler extension keys
+        pruned_keys = set()       # individual sampler keys a strict server rejected (kept out of later steps)
+        sampling_noted = False    # the "what was sent" note fires once per user prompt
         turn_total = 0           # completion tokens accumulated this user prompt (resets per prompt)
         stream_retry_ok = True   # one automatic retry per step on a transient mid-stream drop
         model_fix_ok = True      # one auto-correction of a stale model name per turn
@@ -4603,10 +4705,20 @@ class DeskpilotApp:
             # extensions (enable_thinking / chat_template_kwargs.reasoning_effort - not in
             # the OpenAI schema), sent via extra_body. Blank/legacy chats send nothing
             # (server default). Servers that reject it are retried without it (thinking_ok).
+            # Sampler parameters (Settings -> Sampling) ride in the SAME extra_body dict, so
+            # build them together: an assignment here would overwrite the other one.
+            _tb = None                # thinking extra_body for THIS step (None = server default)
+            eb: Dict[str, Any] = {}
             if thinking_ok:
-                eb = chat_thinking_extra_body(self.chats["chats"].get(chat_id))
-                if eb is not None:
-                    kwargs["extra_body"] = eb
+                _tb = chat_thinking_extra_body(self.chats["chats"].get(chat_id))
+                if _tb is not None:
+                    eb.update(_tb)
+            _sw = sampling_kwargs(self.settings)
+            kwargs.update(_sw["top"])
+            if sampling_ok:
+                eb.update({k: v for k, v in _sw["flat"].items() if k not in pruned_keys})
+            self._sampling_sent = dict(top=_sw["top"], flat=dict(eb), thinking=_tb)
+            kwargs["extra_body"] = eb
 
             if turn_deadline is not None and time.monotonic() > turn_deadline:
                 # Wall-clock backstop hit (only reachable when MAX_TOOL_STEPS == 0).
@@ -4628,20 +4740,47 @@ class DeskpilotApp:
             self._post(lambda s=f"🤖 Thinking… (step {step + 1}{_cap})": self._set_status(s))
             try:
                 stream = client.chat.completions.create(**kwargs)
+                # One note per user prompt recording the sampling parameters that actually left the
+                # app for THIS request (post-rejection), so "are my settings in effect?" is answerable
+                # from the chat log itself. Emitted after create() so a rejected-and-retried parameter
+                # is reported truthfully; the retry loop re-enters with sampling_noted already True.
+                if _sampling_note_enabled(self.settings) and not sampling_noted:
+                    sampling_noted = True
+                    _sn = self._sampling_sent or {}
+                    self._post(lambda c=self.chats["chats"].get(chat_id), t=_sn.get("top") or {},
+                               f=_sn.get("flat") or {}, p=set(pruned_keys), th=_sn.get("thinking"):
+                               self.render_note(format_sampling_note(c, t, f, p, th)))
             except Exception as e:
                 msg = str(e)
+                low_msg = msg.lower()
                 if usage_opts_ok and "stream_options" in msg.lower():
                     usage_opts_ok = False         # server rejected the option → retry without it
                     continue
-                if thinking_ok and any(k in msg.lower() for k in
+                if thinking_ok and any(k in low_msg for k in
                                        ("enable_thinking", "chat_template_kwargs", "reasoning_effort")):
                     thinking_ok = False           # server rejects the extension -> retry without it
                     kwargs.pop("extra_body", None)
                     continue
+                if sampling_ok and any(k in low_msg for k in SAMPLING_FLAT_KEYS):
+                    # Strict server (real OpenAI, many proxies): drop ONLY the offending sampler
+                    # extension key and retry, so one rejected field cannot silently kill the rest.
+                    hit = [k for k in SAMPLING_FLAT_KEYS if k in low_msg]
+                    dropped = False
+                    for k in hit:
+                        if k not in pruned_keys:
+                            pruned_keys.add(k); dropped = True
+                    if dropped:
+                        self._post(lambda ks=hit: self._set_status(
+                            "\u2699 Sampler parameter(s) rejected by the server, dropped: " + ", ".join(ks)))
+                        continue
+                if sampling_ok and "extra_body" in low_msg:
+                    sampling_ok = False       # whole extra_body block refused -> builtins only
+                    kwargs["extra_body"] = {k: v for k, v in (kwargs.get("extra_body") or {}).items()
+                                            if k not in SAMPLING_FLAT_KEYS}
+                    continue
                 # Stale model name (404 model_not_found): re-read /models and, when one
                 # model is loaded, retry this step with its exact server ID. One attempt
                 # per turn, so a genuinely wrong server can never loop here.
-                low_msg = msg.lower()
                 if (model_fix_ok and ("model_not_found" in low_msg
                                       or "is downloaded but not loaded" in low_msg
                                       or "model not found" in low_msg)):
@@ -6016,6 +6155,7 @@ class DeskpilotApp:
             ("UI Font Size (8-20, default 12)",     "ui_font_size"),
             ("Max Tokens per reply (0 = server default)", "max_tokens"),
             ("Turn time limit seconds (0 = NO LIMIT; cap a runaway tool loop)", "turn_time_limit"),
+            ("Sampling",  "sampling_defaults"),
             ("File Workspace (confines Read/Write File tools; blank = unrestricted)", "file_workspace"),
             ("Handoff threshold % (auto-summary at this context usage; 0 = off)", "handoff_threshold_pct"),
             ("Handoff re-arm % (grow this much more before summarizing again; 0 = every step)", "handoff_rearm_pct"),
@@ -6028,6 +6168,7 @@ class DeskpilotApp:
         entries: Dict[str, tk.Entry] = {}
         model_combo: Optional[ttk.Combobox] = None
         local_net_var: Optional[tk.BooleanVar] = None
+        _note_var: Optional[tk.BooleanVar] = None
         custom_prompt_text: Optional[tk.Text] = None
         for i, (label, key) in enumerate(rows):
             if key == "mcp_servers":
@@ -6041,6 +6182,32 @@ class DeskpilotApp:
                 continue
             tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
                      font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+            if key == "sampling_defaults":
+                # Sampler parameters (Top P / Top K / Min P / Repetition / Presence / Frequency),
+                # GLOBAL for every chat session by design - the chat UI stays uncluttered.
+                # Built in a sub-frame so these six rows never appear among the dialog's own
+                # children (the smoke suite counts plain Entries there positionally).
+                tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
+                         font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+                samp_frame = tk.Frame(top, bg=COL["bg_main"])
+                samp_frame.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
+                for _r, (_sk, _slabel, _lo, _hi, _si, _st, _so) in enumerate(SAMPLING_SCHEMA):
+                    tk.Label(samp_frame, text=_slabel, bg=COL["bg_main"], fg=COL["text_dim"],
+                             font=F(10)).grid(row=_r, column=0, sticky="w", padx=(0, 8))
+                    _se = tk.Entry(samp_frame, width=10, bg=COL["bg_deep"], fg=COL["text"],
+                                   insertbackground=COL["text"], relief="flat", font=F(10))
+                    _sv = (self.settings.get("sampling_defaults") or {}).get(_sk, "")
+                    _se.insert(0, "" if _sv is None else str(_sv))
+                    _se.grid(row=_r, column=1, sticky="w", pady=1)
+                    entries[_sk] = _se
+                _note_var = tk.BooleanVar(value=bool(self.settings.get("show_sampling_note", True)))
+                tk.Checkbutton(samp_frame, text="Show a \"Sent: ...\" note in chat after each reply, "
+                               "listing the sampling parameters that were actually sent",
+                               variable=_note_var, bg=COL["bg_main"], fg=COL["text_dim"],
+                               activebackground=COL["bg_main"], activeforeground=COL["text"],
+                               selectcolor=COL["bg_deep"], font=F(9)) \
+                    .grid(row=len(SAMPLING_SCHEMA), column=0, columnspan=2, sticky="w", pady=(4, 0))
+                continue
             if key == "model_name":
                 # Editable combobox: dropdown of live server models + previously
                 # used names, but free typing still works (exact IDs matter for
@@ -6324,6 +6491,18 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 hr = HANDOFF_REARM_PCT_DEFAULT
             self.settings["handoff_rearm_pct"] = max(0, min(100, hr))
+            # Sampling: coerce + clamp each field; blank/garbage -> "" (key omitted from requests).
+            _samp: Dict[str, Any] = {}
+            for _sk, _sl, _lo, _hi, _si, _st, _so in SAMPLING_SCHEMA:
+                _sv = _coerce_sampling(entries.get(_sk).get() if entries.get(_sk) else "", _lo, _hi, _si)
+                _samp[_sk] = "" if _sv is None else _sv
+            self.settings["sampling_defaults"] = _samp
+            # The six fields also land in `entries`, so the generic loop above wrote them as
+            # top-level settings keys too. Drop that duplication - they live in ONE place.
+            for _sk, *_rest in SAMPLING_SCHEMA:
+                self.settings.pop(_sk, None)
+            if _note_var is not None:
+                self.settings["show_sampling_note"] = bool(_note_var.get())
             # MCP servers may have been added/removed in the dialog: reconnect
             # everything so the permission bar matches the saved configuration.
             self._mcp_connect_all()
