@@ -599,7 +599,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.9"
+VERSION    = "1.1.10"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -959,6 +959,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "file_workspace":    "",    # optional folder confining read/write_local_file; blank = unrestricted
     "handoff_threshold_pct": 75,  # auto-handoff when context usage hits this % (0 = off)
     "handoff_rearm_pct": 10,      # how much further the gauge must grow before a chat may summarize again
+    "handoff_notes_dir": "",      # folder for handoff notes; blank = <this folder>/deskpilot_data/handoff_notes
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "sampling_defaults": dict(SAMPLING_DEFAULTS),  # sampler params applied to EVERY chat (Settings -> Sampling)
     "show_sampling_note": True,   # render one "what was actually sent" note per user prompt
@@ -1941,6 +1942,284 @@ def format_sampling_note(chat, top: dict, flat: dict, pruned: dict, thinking: Op
             parts.append(key + " off")
     return "\u2699 Sent: " + "  \u00b7  ".join(parts)
 
+# --- Tier 3 (v1.1.10): "Verify parameters" behavioural probe (Settings -> Sampling) ----------
+# v1.1.9 shipped the REQUEST-side ground truth ("Sent: ..."). This answers what a log cannot:
+# does the server ACCEPT each configured key, and does its OUTPUT look like the settings are
+# live? Everything here is EVIDENCE, never proof - a server can accept a key and ignore it, and
+# identical output at temperature 0 is consistent with (not proof of) honouring that setting.
+# Requests stay deliberately tiny: capped by VERIFY_MAX_TOKENS, ONE user message each (no chat
+# history, no system prompt), so a probe run cannot inflate the context window.
+VERIFY_MAX_TOKENS         = 64    # hard cap on every probe request
+VERIFY_TIMEOUT            = 30    # seconds per probe request (max_retries=0: no hidden retries)
+VERIFY_DETERMINISM_TRIES  = 2     # identical requests at temperature 0, compared
+VERIFY_REPETITION_COPIES  = 6     # "repeat this line N times" exact-copy task
+VERIFY_REPETITION_LINE    = "the quick brown fox"
+VERIFY_ACCEPT_PROMPT      = "Reply with exactly this word and nothing else: ok"
+VERIFY_DETERMINISM_PROMPT = "Name a number from one to nine. Answer with that single digit only."
+
+
+def verify_repetition_prompt(copies: int = VERIFY_REPETITION_COPIES,
+                             line: str = VERIFY_REPETITION_LINE) -> str:
+    return ("Repeat the following line exactly " + str(int(copies)) + " times, one line per copy, "
+            "with no numbering and no other text:\n" + line)
+
+
+def verify_repeat_count(text: str, line: str = VERIFY_REPETITION_LINE,
+                        copies: int = VERIFY_REPETITION_COPIES) -> int:
+    """How many reply lines are EXACTLY the requested line (after strip).
+
+    Exact copies only: a server applying repetition_penalty paraphrases some of them, which is
+    the expected behaviour of a live penalty - not a failure."""
+    n = 0
+    for raw in str(text or "").splitlines():
+        if raw.strip() == line:
+            n += 1
+    return n
+
+
+def _probe_error_keys(err_text: str, keys) -> list:
+    """Which of the given keys the server actually NAMED in its error message.
+
+    Per-key attribution, same ladder as the turn path (v1.1.9): one rejected field must never be
+    reported as "all samplers rejected"."""
+    low = str(err_text or "").lower()
+    return [k for k in keys if k and k.lower() in low]
+
+
+def _probe_first_line(err: str) -> str:
+    txt = " ".join(str(err or "").split())
+    return (txt[:180] + "...") if len(txt) > 180 else txt
+
+
+def _probe_reply_text(resp) -> tuple:
+    """(text, usage) from a completion response - tolerant of both non-stream and stream shapes."""
+    text = ""
+    try:
+        choices = list(getattr(resp, "choices", None) or [])
+        if choices:
+            ch = choices[0]
+            msg = getattr(ch, "message", None)
+            if msg is not None:
+                text = str(getattr(msg, "content", "") or "")
+            else:
+                d = getattr(ch, "delta", None)
+                if d is not None:
+                    text = str(getattr(d, "content", "") or "")
+    except Exception:
+        text = ""
+    return text, getattr(resp, "usage", None)
+
+
+def _probe_completions(client, timeout):
+    """The completions endpoint for ONE probe request, with a hard per-request timeout.
+
+    The openai client has no per-call timeout argument; with_options() is how the SDK expresses
+    one (client.timeout bounds EVERY request). Older/mocked clients without it fall back silently -
+    those are tests and stubs, where the real HTTP timeout is not what is under test."""
+    comp = client.chat.completions
+    if not timeout:
+        return comp
+    try:
+        return comp.with_options(timeout=int(timeout), max_retries=0)
+    except Exception:
+        return comp
+
+
+def _probe_create(client, kw: dict, timeout=None) -> tuple:
+    """Send ONE probe request; returns (text, usage, error_string) and never raises.
+
+    A max_tokens/max_completion_tokens refusal is a server limitation, NOT a sampler verdict, so
+    the request is retried once without the token cap (same rule as the handoff worker)."""
+    kw = dict(kw)
+    comp = _probe_completions(client, timeout)
+    try:
+        resp = comp.create(**kw)
+    except Exception as e:
+        low = str(e).lower()
+        if "max_tokens" in low or "max_completion_tokens" in low:
+            kw.pop("max_tokens", None)
+            kw.pop("max_completion_tokens", None)
+            try:
+                resp = comp.create(**kw)
+            except Exception as e2:
+                return "", None, str(e2)
+        else:
+            return "", None, str(e)
+    _txt, _usage = _probe_reply_text(resp)
+    return _txt, _usage, None
+
+
+def _probe_accept(client, model: str, top: dict, flat: dict, max_tokens: int,
+              timeout=None) -> tuple:
+    """Probe 1 - does the server ACCEPT the configured keys? Returns (lines, usage)."""
+    configured = list(top.keys()) + list(flat.keys())
+    if not configured:
+        return ["ACCEPT: no sampler parameters are configured, so there is nothing to send - "
+                "fill at least one Sampling field first."], None
+    kw = dict(model=model, messages=[{"role": "user", "content": VERIFY_ACCEPT_PROMPT}],
+             stream=False, temperature=0.0, max_tokens=int(max_tokens))
+    kw.update(top)
+    eb = dict(flat)
+    if eb:
+        kw["extra_body"] = eb
+    text, usage, err = _probe_create(client, kw, timeout)
+    if err is None:
+        return ["ACCEPT: all configured keys accepted (" + ", ".join(sorted(configured)) + ")."], usage
+    low = str(err).lower()
+    named = set(_probe_error_keys(err, configured))
+    if "extra_body" in low and flat:
+        named |= set(flat.keys())            # whole extension block refused -> every key in it
+        lines = ["ACCEPT: this server refuses the extension block (extra_body) - extensions "
+                 "unsupported: " + ", ".join(sorted(flat.keys()))]
+    elif named:
+        lines = ["ACCEPT: rejected " + ", ".join(sorted(named)) + " -> " + _probe_first_line(err)]
+    else:
+        lines = ["ACCEPT: request failed for a reason unrelated to sampler keys -> " +
+                 _probe_first_line(err)]
+    # Second, bounded attempt WITHOUT what was refused, so the surviving (OpenAI-schema) keys get
+    # their own verdict instead of being lumped in with the rejected ones.
+    rest_top = {k: v for k, v in top.items() if k not in named}
+    kw2 = dict(model=model, messages=[{"role": "user", "content": VERIFY_ACCEPT_PROMPT}],
+              stream=False, temperature=0.0, max_tokens=int(max_tokens))
+    kw2.update(rest_top)
+    _t2, u2, err2 = _probe_create(client, kw2, timeout)
+    if usage is None:
+        usage = u2
+    if err2 is None:
+        lines.append("ACCEPT: accepted " + (", ".join(sorted(rest_top)) if rest_top
+                                            else "(nothing left to test)"))
+    else:
+        named2 = set(_probe_error_keys(err2, list(rest_top.keys())))
+        if named2:
+            lines.append("ACCEPT: rejected " + ", ".join(sorted(named2)) + " -> " +
+                         _probe_first_line(err2))
+        elif rest_top:
+            lines.append("ACCEPT: no verdict for " + ", ".join(sorted(rest_top)) +
+                         " - request failed for another reason -> " + _probe_first_line(err2))
+    return lines, usage
+
+
+def _probe_determinism(client, model: str, max_tokens: int, tries: int, timeout=None) -> list:
+    """Probe 2 - identical requests at temperature 0; the spread of the replies is the evidence."""
+    kw = dict(model=model, messages=[{"role": "user", "content": VERIFY_DETERMINISM_PROMPT}],
+             stream=False, temperature=0.0, max_tokens=int(max_tokens))
+    outs, errs = [], []
+    for _ in range(max(1, int(tries))):
+        t, _u, err = _probe_create(client, kw, timeout)
+        if err:
+            errs.append(_probe_first_line(err))
+        outs.append(t.strip())
+    got = [o for o in outs if o]
+    if not got:
+        return ["DETERMINISM: no usable reply (" + (errs[0] if errs else "empty responses") + ")."]
+    distinct = len(set(got))
+    tail = "" if not errs else "  (" + str(len(errs)) + " attempt(s) errored)"
+    if distinct == 1 and len(got) >= 2:
+        return ["DETERMINISM: " + str(len(got)) + "/" + str(len(outs)) + " identical replies at "
+                "temperature 0 - consistent with the server honouring temperature. NOT proof it "
+                "applies the other keys." + tail]
+    if distinct > 1:
+        return ["DETERMINISM: " + str(distinct) + " DISTINCT replies from " + str(len(got)) +
+                " IDENTICAL requests at temperature 0 -> sampling is being applied (or this server "
+                "is non-deterministic). If you set temperature 0, that gap is the evidence." + tail]
+    return ["DETERMINISM: only one reply survived - retry with a loaded model / check the server."]
+
+
+def _probe_repetition(client, model: str, flat: dict, max_tokens: int, copies: int,
+                     timeout=None) -> list:
+    """Probe 3 - repetition_penalty behavioural check. Informational by design, not pass/fail."""
+    rp = flat.get("repetition_penalty")
+    if rp is None:
+        return ["REPETITION: repetition_penalty is not configured (blank, or 1.0 = off), "
+                "so there is nothing to observe."]
+    kw = dict(model=model, messages=[{"role": "user",
+                                      "content": verify_repetition_prompt(copies)}],
+              stream=False, temperature=0.0, max_tokens=int(max_tokens),
+              extra_body={"repetition_penalty": rp})
+    text, _u, err = _probe_create(client, kw, timeout)
+    if err:
+        return ["REPETITION: request failed -> " + _probe_first_line(err)]
+    n = verify_repeat_count(text, copies=copies)
+    head = ("REPETITION (informational): asked for " + str(int(copies)) + " exact copies at "
+            "repetition_penalty=" + str(rp) + " -> " + str(n) + " exact.")
+    if n >= int(copies):
+        return [head + " Verbatim copying survived the penalty: consistent with a weak/off penalty."]
+    return [head + " Deviation is the EXPECTED effect of a live penalty - evidence the parameter "
+            "reached the sampler, not proof of its internal value."]
+
+
+def _probe_context(models_info, model: str) -> list:
+    """Probe 4 - what the server reports about itself (context window)."""
+    info = [m for m in (models_info or []) if isinstance(m, dict)]
+    entry = None
+    for m in info:
+        if str(m.get("id", "")).strip() == str(model).strip():
+            entry = m
+            break
+    if entry is None:
+        loaded = [m for m in info if m.get("loaded")]
+        if len(loaded) == 1:
+            entry = loaded[0]
+    try:
+        ctx = int((entry or {}).get("context_length") or 0)
+    except (TypeError, ValueError):
+        ctx = 0
+    if ctx > 0:
+        return ["SERVER: context_length " + format(ctx, ",") + " (" +
+                str((entry or {}).get("id") or model) + ") - the context gauge and the handoff "
+                "threshold work on this server."]
+    if not info:
+        return ["SERVER: no /models reply - model name and context length are unverifiable."]
+    return ["SERVER: reports NO context_length for the selected model (LM Studio/Ollama style) - "
+            "the gauge and handoff threshold cannot work; probes 2-3 stay meaningful. Listed: " +
+            ", ".join(str(m.get("id")) for m in info[:5])]
+
+
+def _probe_usage_line(usage) -> str:
+    if usage is None:
+        return ("USAGE: the server echoed no usage object - token counts (and the context gauge) "
+                "stay blank on this build.")
+    parts = []
+    for label, attr in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
+        v = getattr(usage, attr, None)
+        parts.append(label + "=" + (str(v) if v is not None else "?"))
+    return "USAGE: echoed " + " ".join(parts)
+
+
+def run_sampling_verify(client, model: str, top: dict, flat: dict, models_info=None, *,
+                        max_tokens: int = VERIFY_MAX_TOKENS,
+                        tries: int = VERIFY_DETERMINISM_TRIES,
+                        copies: int = VERIFY_REPETITION_COPIES, timeout: int = VERIFY_TIMEOUT,
+                        report=None) -> list:
+    """The bounded probe sequence. Returns report LINES; never raises (each probe reports its own
+    failure). Runs on a worker thread and touches NO widget, NO chat record and NO file."""
+    lines: List[str] = []
+    mt = max(1, min(int(max_tokens), VERIFY_MAX_TOKENS))      # every probe request stays tiny
+
+    def emit(group) -> None:
+        """Publish one finished probe (and keep it in the returned report).
+
+        `report` is how the UI shows progress on a slow server - the caller passes a function
+        that marshals to the main thread. Report callbacks must never break the probe."""
+        lines.extend(group)
+        if report is not None:
+            try:
+                report(list(group))
+            except Exception:
+                pass
+
+    try:
+        _a, usage = _probe_accept(client, model, top, flat, mt, timeout)
+        emit(_a)
+        emit([_probe_usage_line(usage)])
+        emit(_probe_determinism(client, model, mt, tries, timeout))
+        emit(_probe_repetition(client, model, flat, mt, copies, timeout))
+        emit(_probe_context(models_info, model))
+    except Exception as e:                    # a probe must never escape its own report line
+        lines.append("PROBE ABORTED: " + _probe_first_line(e))
+    return lines
+
+
 
 def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_key: str = "",
                          custom_prompt: str = "") -> dict:
@@ -2002,6 +2281,28 @@ def _turn_time_limit(settings: dict) -> int:
 # ── Session handoff: auto-summary when context usage crosses a threshold ────────
 HANDOFF_THRESHOLD_DEFAULT = 75   # % of the context window; 0 disables auto-handoff
 
+# Handoff NOTES live in a working folder, NOT in the AppData data store (settings/chats/images stay
+# where resolve_data_dir() put them - only notes moved here). Workspace convention: one "<app>_data"
+# folder per app. ONE FILE PER HANDOFF - a new handoff never overwrites an earlier one.
+# Resolution order for a BLANK setting: USER_WORKSPACE_ROOT/deskpilot_data/handoff_notes when that
+# workspace exists on this machine (notes land where the assistant can read them), otherwise
+# <script folder>/deskpilot_data/handoff_notes - so a copy of this script on any other machine still
+# keeps notes in a working folder next to the app. Settings can point it anywhere absolute.
+USER_WORKSPACE_ROOT = Path(r"C:\Users\Shuhdonk\Downloads\DeskPilot_Working_Directory")
+DEFAULT_HANDOFF_NOTES_SUBDIR = Path("deskpilot_data") / "handoff_notes"
+HANDOFF_PREV_NOTES_LISTED = 5        # how many earlier notes the header of a new note lists
+HANDOFF_TITLE_SLUG_MAX = 40          # chat title chars kept in the note filename
+
+
+def default_handoff_notes_dir() -> Path:
+    """The notes folder used when Settings -> Handoff notes folder is blank (never AppData)."""
+    try:
+        if USER_WORKSPACE_ROOT.is_dir():
+            return USER_WORKSPACE_ROOT / DEFAULT_HANDOFF_NOTES_SUBDIR
+    except Exception:
+        pass
+    return BASE_DIR / DEFAULT_HANDOFF_NOTES_SUBDIR
+
 
 def _handoff_threshold_pct(settings: dict) -> int:
     """The configured auto-handoff threshold as an integer percent (0-100).
@@ -2035,26 +2336,146 @@ def _handoff_prompt(chat_title: str) -> str:
     )
 
 
-def _handoff_file_path(data_dir: Path, chat_id: str) -> Path:
-    """Rolling handoff file for a chat (next to the data files).
+def _safe_note_component(text) -> str:
+    """One filesystem-safe filename component from arbitrary text.
 
-    One stable name per chat - handoff_<chat_id>.md - so there is always exactly one
-    CURRENT notes file to pick up, and _atomic_write() keeps its immediately-previous
-    version as <name>.bak. The old timestamped-per-summary scheme scattered many files
-    with no way to tell which was latest."""
-    # chat ids are app-generated hex, but chats.json is user-editable: strip anything that
-    # could turn the id into a path (separators, drive prefixes) before building the name.
-    safe = re.sub(r"[^A-Za-z0-9_.-]", "_", str(chat_id or "chat"))
-    return Path(data_dir) / f"handoff_{safe}.md"
+    chats.json is USER-EDITABLE, so chat ids and titles are untrusted input here: every character
+    that could build a path (separators, drive colons) is flattened to '_'. Components made only of
+    dots are replaced outright - 'a..b' stays legal, '.'/'..' become 'chat', so an id can never turn
+    into a parent-directory hop. Length-capped so a long chat title cannot make an unusable name."""
+    s = re.sub(r"[^A-Za-z0-9_.-]", "_", str(text or ""))
+    s = s.strip("._-")[:HANDOFF_TITLE_SLUG_MAX]
+    return s or "chat"
 
 
-def _handoff_archive_path(rolling: Path) -> Path:
-    """Timestamped archive copy of a handoff summary (HANDOFF_KEEP_ARCHIVE).
+def _handoff_notes_dir(settings) -> Optional[Path]:
+    r"""Folder that receives handoff notes, read from Settings AT CALL TIME.
 
-    Microsecond precision on purpose: a marathon turn can trigger two summaries inside
-    the same second (mid-turn gate, then an overflow in the next request), and a second-resolution name would silently overwrite the earlier archive."""
-    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-    return rolling.with_name(rolling.stem + "_" + stamp + ".md")
+    Blank/missing/junk -> default_handoff_notes_dir() (the app working folder); any
+    absolute path is honoured. Returns None when the folder cannot be created - the caller then skips
+    the file write and tells the user, because a note must never block the UI and notes are never
+    written to the AppData data store on the assumption that it is always writable.
+
+    Never mutates settings (settings files stay exactly where resolve_data_dir() put them)."""
+    raw = (settings or {}).get("handoff_notes_dir", "")
+    if isinstance(raw, str):
+        raw = raw.strip()
+    else:
+        raw = ""
+    cand = default_handoff_notes_dir() if not raw else Path(raw).expanduser()
+    try:
+        cand.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return None
+    try:
+        return cand.resolve()
+    except Exception:
+        return cand
+
+
+def _handoff_note_path(notes_dir: Path, chat_id: str, title: str = "",
+                       when=None) -> Path:
+    """One file PER HANDOFF (never overwritten), inside notes_dir.
+
+    <chatid>_<YYYYMMDD-HHMMSS-microseconds>[_<title slug>].md - id first so a folder lists grouped by
+    chat and chronologically inside each chat; microsecond stamp because a marathon turn can trigger two
+    summaries inside the same second (mid-turn gate, then an overflow on the next request) and a
+    second-resolution name would silently overwrite the earlier one. The old design overwrote one rolling
+    handoff_<chatid>.md per chat, so every older session's notes were lost."""
+    stamp = (when or datetime.now()).strftime("%Y%m%d-%H%M%S-%f")
+    safe = _safe_note_component(chat_id)
+    slug = _safe_note_component(title)
+    tail = "" if slug == "chat" else "_" + slug
+    stem = f"{safe}_{stamp}{tail}"
+    fp = Path(notes_dir) / (stem + ".md")
+    # Windows clock resolution is ~1 ms, so datetime.now() CAN repeat its microsecond field across two
+    # calls in a burst (mid-turn gate, then an overflow on the very next request). A collision would
+    # silently overwrite the earlier note - exactly what per-handoff naming exists to prevent - so a
+    # numeric suffix keeps every handoff's filename unique even at the same clock tick. The suffix
+    # separator is '__' with a zero-padded counter on purpose: '_' (0x5F) sorts AFTER '.' (0x2E), so
+    # "chat_<stamp>__02.md" ranks NEWER than "chat_<stamp>.md" in the newest-first listing, and the
+    # zero padding keeps __02 < __10 ordering correct. A '-N' suffix would sort OLDER and invert it.
+    n = 2
+    try:
+        while fp.exists() and n <= 200:
+            fp = Path(notes_dir) / (stem + "__" + f"{n:02d}" + ".md")
+            n += 1
+    except Exception:
+        pass
+    return fp
+
+
+def _handoff_note_files(notes_dir, chat_id: str) -> List[Path]:
+    """Existing note files of ONE chat, newest first (empty list when the folder is absent).
+
+    The prefix match must be exact: chat 'a' must not pick up chat 'ab' notes."""
+    if not notes_dir:
+        return []
+    prefix = _safe_note_component(chat_id) + "_"
+    try:
+        found = [p for p in Path(notes_dir).glob(prefix + "*.md") if p.name.startswith(prefix)]
+    except Exception:
+        return []
+    return sorted(found, key=lambda p: p.name, reverse=True)
+
+
+def _handoff_previous_note_paths(notes_dir, chat_id: str, limit: int = HANDOFF_PREV_NOTES_LISTED) -> List[Path]:
+    """The earlier handoff notes for this chat (newest first), for the header chain line."""
+    files = _handoff_note_files(notes_dir, chat_id)
+    return files[:max(0, int(limit))]
+
+
+HANDOFF_NOTES_LISTED_SEEDED = 5      # how many note files the seeded handoff message lists
+
+
+def _handoff_notes_context(settings, chat_id: str,
+                           current_note: str = "") -> tuple:
+    r"""(notes_intro, [note paths]) for a chat - pure function, NEVER touches the filesystem.
+
+    Used by Start New Session / Auto-Continue so the continued session is told WHERE the handoff
+    notes live and WHICH files belong to the chat being continued, newest first, the file written by
+    this very handoff leading the list (the in-memory record kept by _show_handoff; after a restart
+    that map is empty, so the newest file on disk heads the list). The model can then open them for
+    the full record of every previous session and append progress. A blank setting names the default
+    folder WITHOUT creating it: this text goes into an outgoing prompt, not onto the disk, so
+    listing a folder that does not exist yet must be harmless (the worker creates it on first write)."""
+    raw = (settings or {}).get("handoff_notes_dir", "")
+    ndir = str(raw).strip() if isinstance(raw, str) and str(raw).strip() \
+        else str(default_handoff_notes_dir())
+    paths = []
+    seen = set()
+    cur = str(current_note or "")
+    if cur:
+        paths.append(Path(cur))
+        seen.add(str(Path(cur)).lower())
+    for p in _handoff_previous_note_paths(Path(ndir), chat_id,
+                                         HANDOFF_NOTES_LISTED_SEEDED):
+        k = str(p).lower()
+        if k not in seen:
+            paths.append(p)
+            seen.add(k)
+    if not paths:
+        return "folder: " + ndir + " (no note file recorded for this chat yet)", []
+    intro = "folder: " + ndir + " - newest notes for the chat being continued:\n- " + \
+        "\n- ".join(str(p) for p in paths)
+    return intro, paths
+
+
+def _handoff_header(title: str, used_at: int, total_at: int, pct: int,
+                    chat_id: str, prev_notes: List[Path]) -> str:
+    """Markdown header written above every handoff summary.
+
+    Names the previous note file(s) for this chat so a new session's notes point back at the older
+    sessions they continue - the chain is explicit in the file, not only in the chat record."""
+    if prev_notes:
+        prev_line = "- Previous handoff notes: " + ", ".join(str(p) for p in prev_notes)
+    else:
+        prev_line = "- Previous handoff notes: none (first handoff for this chat)"
+    return (f"# Session Handoff - {title}\n"
+            f"- Chat: {title} ({chat_id})\n"
+            f"_Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} at "
+            f"{_handoff_gauge_text(used_at, total_at)} ({pct}% threshold)_\n"
+            f"{prev_line}\n\n")
 
 
 def _handoff_rearm_pct(settings: dict) -> int:
@@ -2072,7 +2493,6 @@ HANDOFF_TOOL_OUTPUT_CAP = 2500    # max chars of one tool result kept in a hando
 HANDOFF_IMAGE_PLACEHOLDER = "[image attached]"
 HANDOFF_SUMMARY_MAX_TOKENS = 2048   # bound on the summary itself (some servers reject it -> retried without)
 HANDOFF_REARM_PCT_DEFAULT = 10      # a chat may handoff again once usage has grown by this many % of the window
-HANDOFF_KEEP_ARCHIVE = True         # also keep a timestamped copy beside the rolling per-chat file
 
 # Budget used when the server reports NO context size (LM Studio / Ollama send no
 # context_length, so _ctx_window() is 0). The previous flat 120000 chars (~30K tokens)
@@ -2423,6 +2843,7 @@ class DeskpilotApp:
         self._handoff_inflight: set = set()        # chats with a summary worker running RIGHT NOW
         self._handoff_lock = threading.Lock()      # guards the set above (worker + main thread)
         self._last_handoff: Dict[str, str] = {}    # chat_id -> last rendered handoff summary text
+        self._last_handoff_file: Dict[str, str] = {}   # v1.1.10: chat_id -> note file that handoff wrote
         self._ctx_used_run = 0          # gauge value as of the LAST model step (worker thread copy)
 
         self._code_buttons: List[tk.Button] = []
@@ -2445,6 +2866,7 @@ class DeskpilotApp:
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
         self._pending_temperature: Optional[str] = None   # welcome-state temp change, applied to the chat the next send creates
         self._sampling_sent: Optional[dict] = None   # last request's sampling payload (worker writes, note renders)
+        self._verify_running = False            # a "Verify parameters" probe is in flight (Settings -> Sampling)
         self._pending_thinking: Optional[str] = None      # welcome-state thinking change, same
         # ── MCP (Model Context Protocol) servers ────────────────────────────
         self._mcp_clients: Dict[str, MCPClient] = {}   # server name -> connected client
@@ -3186,21 +3608,27 @@ class DeskpilotApp:
                 f"\U0001F4E6 Wrote deterministic handoff notes instead "
                 f"(model summary unavailable: {m[:200]})"))
 
-        # Save to a file next to the data files (best-effort; never blocks the UI).
-        # Rolling single file per chat (handoff_<chat_id>.md, previous version kept as
-        # .bak by _atomic_write) so there is always exactly one CURRENT notes file - plus
-        # an optional timestamped archive when a history of snapshots is wanted.
+        # Write the notes to the working folder (best-effort; never blocks the UI). ONE FILE PER
+        # HANDOFF - a new handoff never overwrites an earlier one, and the header lists this chat's
+        # previous note files so a new session can reference the sessions it continues. Notes go to
+        # Settings -> Handoff notes folder (blank = <script folder>/deskpilot_data/handoff_notes);
+        # the AppData data store is NOT a notes location. _atomic_write() still keeps the immediately
+        # previous content of THIS file as .bak (it exists for single-shot files too).
         file_path = ""
         try:
-            fp = _handoff_file_path(SETTINGS_FILE.parent, chat_id)
-            header = (f"# Session Handoff - {title}\n"
-                      f"_Generated {datetime.now().strftime('%Y-%m-%d %H:%M')} at "
-                      f"{_handoff_gauge_text(used_at, total_at)} "
-                      f"({_handoff_threshold_pct(self.settings)}% threshold)_\n\n")
-            _atomic_write(fp, header + summary + "\n")
-            file_path = str(fp)
-            if HANDOFF_KEEP_ARCHIVE:
-                _atomic_write(_handoff_archive_path(fp), header + summary + "\n")
+            notes_dir = _handoff_notes_dir(self.settings)
+            if notes_dir is None:
+                self._post(lambda d=str((self.settings or {}).get("handoff_notes_dir")
+                                         or default_handoff_notes_dir()):
+                           self.render_note(f"\U0001F4E6 Handoff summary was NOT written - the notes "
+                                            f"folder is not usable: {d}"))
+            else:
+                prev = _handoff_previous_note_paths(notes_dir, chat_id)
+                fp = _handoff_note_path(notes_dir, chat_id, title)
+                header = _handoff_header(title, used_at, total_at,
+                                         _handoff_threshold_pct(self.settings), chat_id, prev)
+                _atomic_write(fp, header + summary + "\n")
+                file_path = str(fp)
         except Exception:
             pass
 
@@ -3248,6 +3676,7 @@ class DeskpilotApp:
                 chat["handoff_total"] = int(total_at)
             save_chats(self.chats)
         self._last_handoff[chat_id] = summary
+        self._last_handoff_file[chat_id] = file_path   # v1.1.10: the note THIS handoff wrote
         if self._closed or self.current_chat_id != chat_id:
             return
         pct = _handoff_threshold_pct(self.settings)
@@ -3307,41 +3736,78 @@ class DeskpilotApp:
             self._set_status("Wait for the current turn to finish before auto-continuing")
             return
         src = self.chats["chats"].get(source_chat_id)
-        if not src or not (src.get("handoff_summary") or self._last_handoff.get(source_chat_id)):
-            messagebox.showinfo(APP_NAME, "No handoff summary is available to carry over.")
+        if not src:
+            messagebox.showinfo(APP_NAME, "The source chat of this handoff no longer exists.")
             return
+        # A missing summary is NOT checked here: _start_new_session validates BOTH sources (the
+        # persisted / in-memory summary and the chat note files), so a notes-only handoff is not a
+        # dead end and the manual Start New Session button keeps exactly the same contract.
         self._start_new_session(source_chat_id, auto_send=True)
 
     def _start_new_session(self, source_chat_id: str, auto_send: bool = False) -> None:
-        """Open a fresh chat seeded with the handoff summary from `source_chat_id`,
-        so the model is instantly up to speed and the token count resets."""
+        """Open a fresh chat seeded with the handoff summary AND the handoff NOTES of
+        `source_chat_id` (notes folder + its newest note files), so the model is instantly up to
+        speed, the token count resets, and the full written record stays reachable. Refuses only
+        when BOTH sources are empty."""
         src = self.chats["chats"].get(source_chat_id)
         if not src:
             return
         # Persistent chat record first (survives restarts), in-memory cache as fallback.
         summary = src.get("handoff_summary") or self._last_handoff.get(source_chat_id, "")
-        if not summary:
-            messagebox.showinfo(APP_NAME, "No handoff summary is available to carry over.")
+        notes_intro, note_paths = _handoff_notes_context(
+            self.settings, source_chat_id, self._last_handoff_file.get(source_chat_id, ""))
+        if not summary and not note_paths:
+            messagebox.showinfo(
+                APP_NAME,
+                "No handoff summary is available to carry over, and this chat has no handoff "
+                "notes (its notes folder appears to be empty).")
             return
         self.new_chat()
         fresh = self.current_chat()
         if fresh is None:
             return
-        intro = ("[Session Handoff] The previous session reached its context limit. "
-                 "Here is a summary of the work so far - continue from here:\n\n" + summary)
+        if summary:
+            intro = ("[Session Handoff] The previous session reached its context limit. "
+                     "Here is a summary of the work so far - continue from here:\n\n" + summary)
+        else:
+            # Notes-only handoff (the condensed summary is gone, e.g. a chat record written before
+            # summaries were persisted): announce that plainly instead of promising a summary that is
+            # not there, and point at the notes as the only record.
+            intro = ("[Session Handoff] The previous session reached its context limit. Its condensed"
+                     " summary is unavailable, so the handoff notes below are the ONLY record of the"
+                     " work done so far - read them before continuing.")
+        # v1.1.10: the notes FOLDER and this chat's newest note files travel WITH the summary, so
+        # the continued session (and any assistant with file tools there) can open them and read the
+        # FULL record of every earlier session - the accordion summary is only what the model condensed
+        # at handoff time, not everything that was done. The folder is named even when this chat has no
+        # note file yet (a legacy summary-only handoff), so the append instruction below always names a
+        # concrete destination and never dangles on a file that was not listed.
+        intro += "\n\nHandoff notes on disk: " + notes_intro + (
+            "\nIf this folder is readable from your tools, open these files for the full record of"
+            " past sessions; if it is not reachable, say so once and continue with the summary above."
+            if note_paths else
+            "\nIf this folder is readable from your tools, list it and read any note file belonging to"
+            " the chat being continued; if it is not reachable, say so once.")
         if auto_send:
-            # One user message only (summary + the resume instruction together), so the
-            # new chat never opens with two consecutive user turns.
-            intro += ("\n\nResume the task described above now: pick up at 'Next steps', "
-                      "keep to the constraints already established, and do not repeat work "
-                      "listed under 'What was done'.")
+            # One user message only (summary + notes references + the resume instruction together),
+            # so the new chat never opens with two consecutive user turns.
+            intro += ("\n\nResume the task described above now: pick up at 'Next steps', keep to"
+                      " the constraints already established, do not repeat work listed under 'What"
+                      " was done', and append a dated section (date + what changed + next steps) to"
+                      " the newest note file named above" +
+                      ("" if note_paths else " (create one in that folder if none exists)") +
+                      " if that folder is writable.")
         fresh["messages"].append({"role": "user", "content": intro})
         base = (src.get("title") or "Session").strip()[:24]
         fresh["title"] = f"Continued: {base}"
         save_chats(self.chats)
         self._refresh_chat_list()
         self.render_user_message(intro)
-        self._set_status("\u2795 New session started from handoff summary")
+        # Files that travel with the handoff are counted; the folder is named in EVERY seeded intro
+        # (a chat with no note file yet still needs its destination spelled out), so say "folder only".
+        self._set_status("\u2795 New session started from handoff summary - notes " + (
+            "folder + %d note file(s) referenced" % len(note_paths) if note_paths
+            else "folder referenced (no note file for this chat yet)"))
         if auto_send and not self._busy:
             # Deliberately NOT send_message(): the input box is empty and that path would
             # append a second user message. Start the worker on the seeded history instead
@@ -6159,6 +6625,7 @@ class DeskpilotApp:
             ("File Workspace (confines Read/Write File tools; blank = unrestricted)", "file_workspace"),
             ("Handoff threshold % (auto-summary at this context usage; 0 = off)", "handoff_threshold_pct"),
             ("Handoff re-arm % (grow this much more before summarizing again; 0 = every step)", "handoff_rearm_pct"),
+            ("Handoff notes folder (blank = app working folder; one file per handoff)", "handoff_notes_dir"),
             ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (metered; blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
@@ -6207,6 +6674,16 @@ class DeskpilotApp:
                                activebackground=COL["bg_main"], activeforeground=COL["text"],
                                selectcolor=COL["bg_deep"], font=F(9)) \
                     .grid(row=len(SAMPLING_SCHEMA), column=0, columnspan=2, sticky="w", pady=(4, 0))
+                # Tier 3 (v1.1.10): behavioural probe for the six keys above. It reports EVIDENCE from tiny
+                # bounded requests into a read-only box - it writes NOTHING to chat history, chats.json or
+                # settings, and lives inside this sub-frame, so the dialog's own plain-Entry count is unchanged.
+                verify_btn = tk.Button(samp_frame, text="Verify parameters", font=F(10), bg=COL["bg_raised"],
+                   fg=COL["text"], activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
+                   cursor="hand2", command=lambda: self._verify_sampling(verify_btn, verify_out))
+                verify_out = tk.Text(samp_frame, width=58, height=6, wrap="word", state="disabled",
+                   bg=COL["bg_deep"], fg=COL["text_dim"], insertbackground=COL["text"], relief="flat", font=F(9))
+                verify_btn.grid(row=len(SAMPLING_SCHEMA) + 1, column=0, sticky="w", pady=(6, 0))
+                verify_out.grid(row=len(SAMPLING_SCHEMA) + 2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
                 continue
             if key == "model_name":
                 # Editable combobox: dropdown of live server models + previously
@@ -6256,6 +6733,44 @@ class DeskpilotApp:
         tk.Button(top, text="Browse...", command=_browse_ws, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
                   cursor="hand2", font=F(10)).grid(row=ws_row, column=2, sticky="e", padx=(0, 16), pady=6)
+
+        # Handoff notes folder row: picker + the EFFECTIVE folder shown live, so it is always
+        # obvious where notes are being written (blank field = the app default working folder).
+        nd_row = next(i for i, (_, k) in enumerate(rows) if k == "handoff_notes_dir")
+
+        def _browse_notes() -> None:
+            cur = entries["handoff_notes_dir"].get().strip()
+            d = filedialog.askdirectory(parent=top, title="Choose the handoff notes folder",
+                                        initialdir=(cur or str(default_handoff_notes_dir())))
+            if d:
+                entries["handoff_notes_dir"].delete(0, "end")
+                entries["handoff_notes_dir"].insert(0, d)
+                _update_notes_note()
+
+        def _effective_notes_dir() -> str:
+            try:
+                raw = entries["handoff_notes_dir"].get().strip()
+            except tk.TclError:
+                return ""
+            cand = default_handoff_notes_dir() if not raw else Path(raw).expanduser()
+            return str(cand)
+
+        def _update_notes_note() -> None:
+            try:
+                notes_dir_lbl.configure(text="Notes will be written to:\n" + _effective_notes_dir())
+            except tk.TclError:
+                pass
+
+        nd_btns = tk.Frame(top, bg=COL["bg_main"])
+        nd_btns.grid(row=nd_row, column=2, sticky="e", padx=(0, 16), pady=6)
+        tk.Button(nd_btns, text="Browse...", command=_browse_notes, bg=COL["bg_raised"], fg=COL["text"],
+                  activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
+                  cursor="hand2", font=F(10)).pack(side="left")
+        notes_dir_lbl = tk.Label(nd_btns, text="", bg=COL["bg_main"], fg=COL["text_dim"],
+                                 font=F(9), justify="left", wraplength=260)
+        notes_dir_lbl.pack(side="left", padx=(8, 0))
+        _update_notes_note()
+        entries["handoff_notes_dir"].bind("<KeyRelease>", lambda _e: _update_notes_note())
 
         # Model Name row: Refresh button re-fetches {server_url}/models in a
         # background thread (same pattern as Test Connection). The request carries
@@ -6426,6 +6941,26 @@ class DeskpilotApp:
                         "That folder cannot be used as the File Workspace:\n\n"
                         f"{e}\n\nLeave the field blank to keep the file tools unrestricted.")
                     return
+            # Handoff notes folder: blank = default_handoff_notes_dir(); anything else must be an absolute
+            # folder this app can create. Validated BEFORE mutating self.settings (same reason as File
+            # Workspace: a bad value must not leak the other edited fields into live memory). Notes are
+            # working files - never store them inside a protected system directory.
+            nd_raw = entries["handoff_notes_dir"].get().strip() if "handoff_notes_dir" in entries else ""
+            nd_p = None
+            if nd_raw:
+                try:
+                    nd_p = Path(os.path.expanduser(nd_raw)).resolve()
+                    hit = _forbidden_dir_hit(str(nd_p).lower())
+                    if hit is not None:
+                        raise PermissionError(f"that folder is inside a protected system directory ({hit})")
+                    nd_p.mkdir(parents=True, exist_ok=True)
+                except Exception as e:
+                    messagebox.showwarning(
+                        f"{APP_NAME} - Handoff notes folder",
+                        "That folder cannot be used for handoff notes:\n\n"
+                        f"{e}\n\nLeave the field blank to use the app working folder: "
+                        f"{default_handoff_notes_dir()}")
+                    return
             # Custom System Prompt: multi-line text box (not a plain entry).
             # Validate BEFORE mutating self.settings so an over-limit prompt's early
             # return can't leak the other edited fields into live memory.
@@ -6460,6 +6995,8 @@ class DeskpilotApp:
                 self.settings["model_history"] = hist[:MODEL_HISTORY_MAX]
             if ws_raw:
                 self.settings["file_workspace"] = str(ws_p)   # normalized absolute path
+            if nd_p is not None:
+                self.settings["handoff_notes_dir"] = str(nd_p)   # normalized absolute path
             # UI Font Size: numeric, clamped to 8..20 (invalid input -> default)
             try:
                 fs = int(float(self.settings.get("ui_font_size", FONT_BASE)))
@@ -6866,6 +7403,125 @@ class DeskpilotApp:
         except tk.TclError:
             pass
 
+
+    # ------------------------------------------------------------------------------
+    #  SAMPLER VERIFICATION (Settings -> Sampling -> "Verify parameters", tier 3)
+    # ------------------------------------------------------------------------------
+
+    def _verify_report(self, out_box, lines=(), status: str = "", clear: bool = False) -> None:
+        """Write probe output into the read-only results box - ALWAYS via _post (invariant 4).
+
+        `out_box` belongs to a Settings dialog the user can close mid-run, so every write checks
+        winfo_exists() and swallows TclError; a vanished widget must never kill the probe thread."""
+        def apply() -> None:
+            if self._closed:
+                return
+            try:
+                if out_box is not None and out_box.winfo_exists():
+                    if clear:
+                        out_box.configure(state="normal")
+                        out_box.delete("1.0", "end")
+                    else:
+                        out_box.configure(state="normal")
+                    for ln in list(lines):
+                        out_box.insert("end", str(ln) + "\n")
+                    out_box.see("end")
+                    out_box.configure(state="disabled")
+            except tk.TclError:
+                pass
+            if status:
+                self._set_status(status)
+        self._post(apply)
+
+    def _verify_set_button(self, btn, state: str) -> None:
+        """Enable/disable the button on EVERY exit path (mirrors the _chat_worker wrapper)."""
+        if btn is None:
+            return
+        self._post(lambda: self._enable_verify_button(btn, state))
+
+    def _enable_verify_button(self, btn, state: str) -> None:
+        try:
+            if btn.winfo_exists():
+                btn.configure(state=state)
+        except tk.TclError:
+            pass
+
+    def _verify_client(self):
+        """A PRIVATE client for probes only - never the pooled chat client.
+
+        timeout + max_retries=0 are the point: a chat turn wants keep-alive and SDK retries, a
+        probe wants exactly one bounded attempt per request. Keeping them separate means this
+        feature cannot perturb the turn path's samplers/thinking/handoff behaviour at all."""
+        if OpenAI is None:
+            return None
+        url = (self.settings.get("server_url") or "").strip()
+        key = (self.settings.get("api_key") or "").strip() or "sk-local"
+        try:
+            return OpenAI(base_url=url or None, api_key=key,
+                          timeout=VERIFY_TIMEOUT, max_retries=0)
+        except Exception:
+            return None
+
+    def _verify_sampling(self, btn=None, out_box=None) -> None:
+        """Settings -> Sampling -> "Verify parameters". Main-thread entry point.
+
+        Refuses while a turn is live (_busy): the probe must not stack requests onto a running
+        conversation. One run at a time; results go ONLY into the read-only box (never into chat
+        history, chats.json, settings, or a file)."""
+        if self._closed:
+            return
+        if getattr(self, "_verify_running", False):
+            self._verify_report(out_box, ["(verification already running - please wait)"],
+                               "Sampling verification in progress&")
+            return
+        model = (self.settings.get("model_name") or "").strip()
+        if self._busy:
+            self._verify_report(
+                out_box,
+                [f"REFUSED: a chat turn is running. Verification waits for it to finish - "
+                 f"two concurrent request streams make the verdict meaningless."],
+                "Verification refused while a turn is running")
+            return
+        if not model:
+            self._verify_report(out_box, ["REFUSED: Model Name is empty - set it first."],
+                               "Verification refused: no model name")
+            return
+        if OpenAI is None:
+            self._verify_report(out_box, ["REFUSED: the 'openai' package is not installed."],
+                                "Verification refused: openai not installed")
+            return
+        self._verify_running = True
+        self._verify_set_button(btn, "disabled")
+        threading.Thread(target=self._verify_worker, args=(btn, out_box, model),
+                         daemon=True).start()
+
+    def _verify_worker(self, btn, out_box, model: str) -> None:
+        """Daemon thread: run the bounded probe sequence. All UI via _verify_report/_post."""
+        try:
+            self._verify_report(out_box, [], "Verifying sampling parameters&", clear=True)
+            client = self._verify_client()
+            if client is None:
+                self._verify_report(out_box, ["REFUSED: could not create an API client "
+                                              "(check Server URL / API Key)."],
+                                    "Verification failed: no API client")
+                return
+            url = (self.settings.get("server_url") or "").strip()
+            key = (self.settings.get("api_key") or "").strip()
+            info = fetch_model_info(url, key) if url else []
+            _sw = sampling_kwargs(self.settings)
+            lines = run_sampling_verify(client, model, _sw["top"], _sw["flat"], info,
+                                        timeout=VERIFY_TIMEOUT,
+                                        report=lambda group: self._verify_report(out_box, group))
+            self._verify_report(out_box, [" evidence only: a server can accept a key and ignore "
+                                          "it "])
+            self._verify_report(out_box, [], "Sampling verification finished")
+        except Exception as e:
+            traceback.print_exc()
+            self._verify_report(out_box, ["Verification aborted: " + _probe_first_line(e)],
+                                "Sampling verification aborted")
+        finally:
+            self._verify_running = False
+            self._verify_set_button(btn, "normal")
 
     def _test_connection(self, url: str, top: tk.Toplevel) -> None:
         ok = False
