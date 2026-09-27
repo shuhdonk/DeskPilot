@@ -57,6 +57,7 @@ from __future__ import annotations
 import atexit
 import base64
 import ctypes
+import ctypes.wintypes
 import gzip
 import io
 import html as html_mod
@@ -599,7 +600,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.10"
+VERSION    = "1.1.12"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -671,9 +672,54 @@ def _dir_prefix(parent_str: str) -> str:
     return (parent_str or "").rstrip("/\\") + os.sep
 
 
+_SYS_DIR_NAMES_NT = ("$recycle.bin", "system volume information")
+
+
+def _system_dir_roots(system_drive: str, drive_types: Dict[str, int]) -> List[str]:
+    r"""System-critical Windows roots, independent of the boot-drive letter (v1.1.12).
+
+    FORBIDDEN_SYSTEM_DIRS_WINDOWS pins C:\, so a machine booted from D:\ - and every
+    secondary/removable drive's $Recycle.Bin / System Volume Information - was not
+    covered. This returns:
+      * <SystemDrive>:\windows        (e.g. d:\windows when SystemDrive=D:)
+      * $recycle.bin + system volume information on each drive whose GetDriveTypeW is
+        REMOVABLE(2) or FIXED(3).
+    Pure function (drive letters + types injected) so the headless suite can pin the
+    logic without real drives; this machine has no D:/E:. Callers pass raw strings."""
+    roots: List[str] = []
+    sd = (system_drive or "").rstrip("\\/").lower()
+    if re.fullmatch(r"[a-z]:", sd):
+        roots.append(sd + "\\windows")
+    for letter, dtype in drive_types.items():
+        if dtype in (2, 3):
+            base = str(letter).lower() + ":\\"
+            for name in _SYS_DIR_NAMES_NT:
+                roots.append(base + name)
+    return roots
+
+
+def _nt_drive_types() -> Dict[str, int]:
+    """GetDriveTypeW for A-Z (unreadable letters raise -> skipped)."""
+    out: Dict[str, int] = {}
+    try:
+        k32 = ctypes.windll.kernel32
+        for ch in "ABCDEFGHIJKLMNOPQRSTUVWXYZ":
+            try:
+                out[ch] = int(k32.GetDriveTypeW(ch + ":\\"))
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return out
+
+
 def _forbidden_dir_hit(p_str: str) -> Optional[str]:
     """Return the forbidden system dir that p_str (already lowercase) equals or is inside, else None."""
-    forbidden = FORBIDDEN_SYSTEM_DIRS_WINDOWS if os.name == "nt" else FORBIDDEN_SYSTEM_DIRS_LINUX
+    if os.name == "nt":
+        forbidden = list(FORBIDDEN_SYSTEM_DIRS_WINDOWS) + _system_dir_roots(
+            os.environ.get("SystemDrive", ""), _nt_drive_types())
+    else:
+        forbidden = list(FORBIDDEN_SYSTEM_DIRS_LINUX)
     for d in forbidden:
         dl = d.lower()
         if p_str == dl or p_str.startswith(_dir_prefix(dl)):
@@ -5224,9 +5270,9 @@ class DeskpilotApp:
                     continue
                 if thinking_ok and any(k in low_msg for k in
                                        ("enable_thinking", "chat_template_kwargs", "reasoning_effort")):
-                    thinking_ok = False           # server rejects the extension -> retry without it
-                    kwargs.pop("extra_body", None)
-                    continue
+                    thinking_ok = False           # server rejects the extension -> retry: kwargs is
+                    continue                        # rebuilt at the top of every step and gated by
+                                                    # this flag (the old in-place pop was inert)
                 if sampling_ok and any(k in low_msg for k in SAMPLING_FLAT_KEYS):
                     # Strict server (real OpenAI, many proxies): drop ONLY the offending sampler
                     # extension key and retry, so one rejected field cannot silently kill the rest.
@@ -6536,7 +6582,11 @@ class DeskpilotApp:
                     pass   # SR's __exit__ crashes if the stream never opened; harmless here
         except Exception as e:
             if "WaitTimeout" not in type(e).__name__:
-                self._post(lambda m=str(e): self._set_status(f"🎤 Dictation error: {m}"))
+                _sm = str(e)
+                if "pyaudio" in _sm.lower():
+                    _sm = ("Dictation needs PyAudio, which is not available in this build "
+                           "(pip install pyaudio; compiled exe: rebuild with --hidden-import pyaudio)")
+                self._post(lambda m=_sm: self._set_status("\U0001F3A4 " + m))
         finally:
             self._mic_active = False
 
@@ -6597,10 +6647,104 @@ class DeskpilotApp:
         walk(self.root)
 
     def open_settings(self) -> None:
+        # Hardening (v1.1.12): the modal grab is taken at map time, BEFORE the ~600 lines
+        # of dialog build. If that build throws, the half-built dialog has no Cancel button
+        # and the grab outlives it; destroying the Toplevel releases the grab, so report
+        # and clean up here instead of leaving a frozen shell on screen.
+        try:
+            self._open_settings_inner()
+        except Exception as e:
+            traceback.print_exc()
+            title = f"{APP_NAME} \u2014 Settings"
+            try:
+                for w in self.root.winfo_children():
+                    if isinstance(w, tk.Toplevel) and w.winfo_exists() and w.title() == title:
+                        w.destroy()
+            except tk.TclError:
+                pass
+            try:
+                self._set_status("Settings dialog failed to build: " + str(e)[:120])
+            except Exception:
+                pass
+
+    def _open_settings_inner(self) -> None:
         top = tk.Toplevel(self.root)
         top.title(f"{APP_NAME} — Settings")
         top.configure(bg=COL["bg_main"])
         top.transient(self.root)
+
+        # v1.1.11 Option A: every settings row lives inside a scrollable Canvas body;
+        # the Save/Test/Cancel footer is pinned OUTSIDE it, so shrinking the window
+        # can never clip rows off the bottom - they scroll into view instead.
+        # (Layout binds + geometry land after the footer exists - end of method.)
+        body = tk.Frame(top, bg=COL["bg_main"])
+        canvas = tk.Canvas(body, bg=COL["bg_main"], highlightthickness=0, bd=0)
+        vbar = tk.Scrollbar(body, orient="vertical", command=canvas.yview,
+                            bg=COL["bg_raised"], troughcolor=COL["bg_deep"],
+                            highlightthickness=0, borderwidth=0)
+        canvas.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=COL["bg_main"])
+        _inner_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _sync_scrollregion(*_a) -> None:
+            # The scroll region must be the inner frame's NATURAL size: left free,
+            # Tk stretches a "nsew" canvas window to the viewport height, which pins
+            # the scrollbar thumb at 100% and scrolling stops working.
+            try:
+                canvas.configure(scrollregion=canvas.bbox("all") or (0, 0, 1, 1))
+            except tk.TclError:
+                pass
+
+        def _on_canvas_resize(e) -> None:
+            # Rows follow the window width (labels + fields re-flow, never clipped).
+            try:
+                canvas.itemconfigure(_inner_win, width=max(e.width, 1))
+            except tk.TclError:
+                pass
+
+        def _wheel(e):
+            # Widget-local (add="+") binds on the body widgets only - no root-level
+            # handler exists, so nothing can leak onto other windows after destroy.
+            # Windows: <MouseWheel> delta=120/notch (~3 lines ~ one settings row);
+            # X11 wheels: Button-4/5 (~1 line); touchpads send many small deltas.
+            try:
+                if getattr(e, "num", None) == 4:
+                    d = 1        # X11 wheel up
+                elif getattr(e, "num", None) == 5:
+                    d = -1       # X11 wheel down
+                else:
+                    d = (e.delta > 0) - (e.delta < 0)
+            except (AttributeError, ValueError, TypeError):
+                d = 0
+            if d:
+                try:
+                    # Fraction-based stepping: yview_scroll("units") means pixels on
+                    # some Tk builds and lines on others - fractions are exact. ~60px
+                    # per Windows notch (~4 rows), ~18px for small trackpad deltas.
+                    bb = canvas.bbox("all")
+                    total = (bb[3] - bb[1]) if bb else 0
+                    px = 60 if abs(int(getattr(e, "delta", 0) or 0)) >= 120 else 18
+                    if total > 0:
+                        top_ = canvas.yview()[0] - d * (px / total)
+                        canvas.yview_moveto(max(0.0, min(top_, 1.0)))
+                except tk.TclError:
+                    pass
+            return "break"   # own the wheel; no propagation to siblings / root
+
+        def _bind_body_wheel(w) -> None:
+            for c in w.winfo_children():
+                if isinstance(c, (tk.Text, tk.Listbox)):
+                    continue        # multi-line boxes keep their native scrolling
+                _bind_body_wheel(c)
+            try:
+                w.bind("<MouseWheel>", _wheel, add="+")
+                w.bind("<Button-4>", _wheel, add="+")
+                w.bind("<Button-5>", _wheel, add="+")
+            except tk.TclError:
+                pass
+
         # Map the window BEFORE grabbing: on some Tk builds (e.g. Tk 9) a grab
         # taken while the toplevel is still unmapped leaves keyboard focus on
         # the main window, so typing in the fields below silently goes nowhere.
@@ -6641,22 +6785,21 @@ class DeskpilotApp:
             if key == "mcp_servers":
                 # Managed list of stdio MCP servers (Add/Remove); connecting is
                 # live - discovered tools appear in the permission bar.
-                tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
+                tk.Label(inner, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
                          font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
-                mcp_frame = tk.Frame(top, bg=COL["bg_main"])
+                mcp_frame = tk.Frame(inner, bg=COL["bg_main"])
                 mcp_frame.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
                 self._draw_mcp_server_rows(mcp_frame, top)
                 continue
-            tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
+            tk.Label(inner, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
                      font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
             if key == "sampling_defaults":
                 # Sampler parameters (Top P / Top K / Min P / Repetition / Presence / Frequency),
                 # GLOBAL for every chat session by design - the chat UI stays uncluttered.
                 # Built in a sub-frame so these six rows never appear among the dialog's own
                 # children (the smoke suite counts plain Entries there positionally).
-                tk.Label(top, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
-                         font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
-                samp_frame = tk.Frame(top, bg=COL["bg_main"])
+                # Label row: the generic tk.Label(inner, ...) above this branch already placed it.
+                samp_frame = tk.Frame(inner, bg=COL["bg_main"])
                 samp_frame.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
                 for _r, (_sk, _slabel, _lo, _hi, _si, _st, _so) in enumerate(SAMPLING_SCHEMA):
                     tk.Label(samp_frame, text=_slabel, bg=COL["bg_main"], fg=COL["text_dim"],
@@ -6689,14 +6832,14 @@ class DeskpilotApp:
                 # Editable combobox: dropdown of live server models + previously
                 # used names, but free typing still works (exact IDs matter for
                 # strict servers like Unsloth Desktop).
-                model_combo = ttk.Combobox(top, values=[], width=44,
+                model_combo = ttk.Combobox(inner, values=[], width=44,
                                            style="Tool.TCombobox", font=F(11))
                 model_combo.set(self.settings.get("model_name", ""))
                 model_combo.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
                 continue
             if key == "custom_system_prompt":
                 # Multi-line: persona/style instructions can run to several lines.
-                custom_prompt_text = tk.Text(top, width=44, height=5, wrap="word",
+                custom_prompt_text = tk.Text(inner, width=44, height=5, wrap="word",
                                              bg=COL["bg_deep"], fg=COL["text"],
                                              insertbackground=COL["text"], relief="flat",
                                              font=F(10))
@@ -6705,14 +6848,14 @@ class DeskpilotApp:
                 continue
             if key == "allow_local_network":
                 local_net_var = tk.BooleanVar(value=bool(self.settings.get("allow_local_network", False)))
-                tk.Checkbutton(top, text="Allow fetch_url to reach local network addresses "
+                tk.Checkbutton(inner, text="Allow fetch_url to reach local network addresses "
                                "(localhost, LAN, cloud metadata) - off by default",
                                variable=local_net_var, bg=COL["bg_main"], fg=COL["text"],
                                activebackground=COL["bg_main"], activeforeground=COL["text"],
                                selectcolor=COL["bg_deep"], font=F(11)) \
                     .grid(row=i, column=1, sticky="w", pady=6, padx=(0, 8))
                 continue
-            e = tk.Entry(top, width=44, bg=COL["bg_deep"], fg=COL["text"],
+            e = tk.Entry(inner, width=44, bg=COL["bg_deep"], fg=COL["text"],
                          insertbackground=COL["text"], relief="flat",
                          show="*" if key in ("api_key", "exa_api_key", "firecrawl_api_key") else "")
             e.insert(0, self.settings.get(key, ""))
@@ -6730,7 +6873,7 @@ class DeskpilotApp:
                 entries["file_workspace"].delete(0, "end")
                 entries["file_workspace"].insert(0, d)
 
-        tk.Button(top, text="Browse...", command=_browse_ws, bg=COL["bg_raised"], fg=COL["text"],
+        tk.Button(inner, text="Browse...", command=_browse_ws, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
                   cursor="hand2", font=F(10)).grid(row=ws_row, column=2, sticky="e", padx=(0, 16), pady=6)
 
@@ -6761,7 +6904,7 @@ class DeskpilotApp:
             except tk.TclError:
                 pass
 
-        nd_btns = tk.Frame(top, bg=COL["bg_main"])
+        nd_btns = tk.Frame(inner, bg=COL["bg_main"])
         nd_btns.grid(row=nd_row, column=2, sticky="e", padx=(0, 16), pady=6)
         tk.Button(nd_btns, text="Browse...", command=_browse_notes, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
@@ -6844,7 +6987,7 @@ class DeskpilotApp:
 
             threading.Thread(target=_worker, daemon=True).start()
 
-        refresh_btn = tk.Button(top, text="Refresh models",
+        refresh_btn = tk.Button(inner, text="Refresh models",
                                 command=lambda: _refresh_models(False, auto_fix=False),
                                 bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                                 relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
@@ -6852,7 +6995,7 @@ class DeskpilotApp:
 
         # "Use loaded model": copies the single loaded model's exact server ID into
         # Model Name - the reliable fix when you do not know the name yourself.
-        use_btn = tk.Button(top, text="Use loaded model", state="disabled",
+        use_btn = tk.Button(inner, text="Use loaded model", state="disabled",
                             bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                             relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
         use_btn.grid(row=m_row, column=3, sticky="e", padx=(0, 16), pady=6)
@@ -6890,7 +7033,22 @@ class DeskpilotApp:
                 child_open = any(
                     isinstance(c, tk.Toplevel) and c.winfo_exists()
                     for c in top.winfo_children())
-                if not inside and not child_open:
+                # v1.1.12: leave other applications alone. The poller exists to undo OUR
+                # OWN main window stealing keyboard focus back after a Toplevel opens (the
+                # documented Windows quirk), which always happens with our PID in the
+                # foreground. If the Windows foreground window belongs to another process
+                # (Alt-Tab away), stay out of it. Any failure -> False = original behaviour.
+                foreign = False
+                if os.name == "nt":
+                    try:
+                        fg_hwnd = int(ctypes.windll.user32.GetForegroundWindow())
+                        fg_pid = ctypes.wintypes.DWORD()
+                        ctypes.windll.user32.GetWindowThreadProcessId(
+                            fg_hwnd, ctypes.byref(fg_pid))
+                        foreign = bool(fg_hwnd) and int(fg_pid.value) != os.getpid()
+                    except Exception:
+                        foreign = False
+                if not inside and not child_open and not foreign:
                     top.lift()
                     top.focus_force()
                     entries["server_url"].focus_set()
@@ -7052,20 +7210,81 @@ class DeskpilotApp:
             self._invalidate_clients()   # server URL / API key may have changed
             self._update_topbar_labels()
             self._refresh_ctx_topbar()   # server/model may have changed - refresh context readout
+            _save_settings_geometry()
             top.destroy()
             self._apply_ui_font()   # live re-scale of all fonts (no restart needed)
             self._set_status("⚙ Settings saved")
 
         btns = tk.Frame(top, bg=COL["bg_main"])
-        btns.grid(row=len(rows), column=0, columnspan=4, pady=14)   # spans the model row (cols 0-3)
+        body.grid(row=0, column=0, sticky="nsew")      # scrollable rows above the footer
+        btns.grid(row=1, column=0, sticky="ew", pady=(14, 10))   # pinned at the bottom
+        top.columnconfigure(0, weight=1)
+        top.rowconfigure(0, weight=1)     # body absorbs resize; footer keeps its height
+        inner.columnconfigure(1, weight=1)    # entry column stretches with the window width
+        canvas.bind("<Configure>", _on_canvas_resize)
+        inner.bind("<Configure>", _sync_scrollregion)
+        _bind_body_wheel(canvas)          # AFTER every body widget exists (recursive)
+        # Expose the binder so widgets built LATER (MCP Add/Remove row redraws) can join
+        # the set: Tk does NOT propagate <MouseWheel> to ancestors, so an unbound new
+        # child is a scroll dead-zone (probe _probe_wheel_propagation.py).
+        self._settings_bind_wheel = _bind_body_wheel
+
+        # -- Persistent geometry (v1.1.11 Option A, second half) ------
+        top.update_idletasks()            # inner/btns natural request sizes valid now
+        reqw = (inner.winfo_reqwidth() + vbar.winfo_reqwidth() + 24)   # rows + bar + pad
+        reqh = inner.winfo_reqheight() + btns.winfo_reqheight() + 28   # + footer padding
+        cap_w, cap_h = top.winfo_screenwidth(), top.winfo_screenheight()
+        saved_geo = str(self.settings.get("settings_geometry") or "").strip()
+        m_ = re.fullmatch(r"(-?\d+)x(-?\d+)([+-]\d+)([+-]\d+)", saved_geo)
+        if m_:
+            # Restore the exact position + size of the previous session.
+            gw, gh, gx, gy = int(m_[1]), int(m_[2]), int(m_[3]), int(m_[4])
+            sw, sh = cap_w, cap_h
+            # Unplugged-monitor / off-screen geometry: recentre on the main screen.
+            if not (gx > -gw + 60 and gx < sw - 60 and gy > -gh + 60 and gy < sh - 60):
+                gx, gy = max(0, (sw - gw) // 2), max(0, (sh - gh) // 2)
+            top.geometry(f"{gw}x{gh}{gx:+d}{gy:+d}")
+        else:
+            # FIRST open ever: the dialog's natural FULL size - exactly what it
+            # rendered at before scrollbars existed - capped to (nearly) the full
+            # screen height, so a tall dialog on a short display scrolls with the
+            # footer visible instead of pushing rows under the bottom edge.
+            # No offset part in the string -> the WM centers the window.
+            top.geometry(f"{min(reqw, cap_w - 40)}x{min(reqh, cap_h - 40)}")
+
+        def _save_settings_geometry() -> None:
+            # Routes BOTH Close buttons (Save/Cancel) and WM_DELETE_WINDOW: remembers
+            # where the dialog was; settings CONTENTS are untouched by this path.
+            try:
+                if top.winfo_exists():
+                    self.settings["settings_geometry"] = top.geometry()
+            except tk.TclError:
+                pass
+
+        def _close_settings() -> None:
+            _save_settings_geometry()
+            top.destroy()
+            # Flush to disk NOW. Contents at this point are exactly the last-saved
+            # settings plus the new geometry, so Cancel semantics are untouched; before
+            # v1.1.12 an unclean app kill lost the geometry with no second chance.
+            try:
+                save_settings(self.settings)
+            except Exception:
+                pass
+
+        top.protocol("WM_DELETE_WINDOW", _close_settings)
         loaded_lbl.pack(in_=btns, side="top", pady=(0, 4))   # "Loaded on server: <exact id>"
 
         tk.Label(btns, text=f"Data files saved in: {SETTINGS_FILE.parent}", bg=COL["bg_main"],
                  fg=COL["text_dim"], font=F(9)).pack(side="top")
 
         def test():
+            # Read every field on the MAIN thread: Test must try the key as TYPED in the
+            # dialog, not the previously saved settings (a freshly pasted key was tested
+            # against the stale saved one -> bogus 401 before v1.1.12).
             url = (entries["server_url"].get().strip() or "http://localhost:11434/v1")
-            threading.Thread(target=self._test_connection, args=(url, top), daemon=True).start()
+            key = entries["api_key"].get().strip()
+            threading.Thread(target=self._test_connection, args=(url, key, top), daemon=True).start()
 
         tk.Button(btns, text="Save", command=save, bg=COL["accent"], fg="#FFFFFF",
                   activebackground="#2563EB", relief="flat", bd=0, padx=18, pady=6,
@@ -7073,7 +7292,7 @@ class DeskpilotApp:
         tk.Button(btns, text="Test Connection", command=test, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=6,
                   cursor="hand2", font=F(11)).pack(side="left", padx=6)
-        tk.Button(btns, text="Cancel", command=top.destroy, bg=COL["bg_raised"], fg=COL["text"],
+        tk.Button(btns, text="Cancel", command=_close_settings, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=6,
                   cursor="hand2", font=F(11)).pack(side="left", padx=6)
 
@@ -7311,10 +7530,16 @@ class DeskpilotApp:
                       fg=COL["danger"], activebackground="#5B2323", relief="flat", bd=0,
                       padx=8, pady=1, cursor="hand2", font=F(9)).pack(side="right")
         tk.Button(frame, text="+ Add MCP Server",
-                  command=lambda: self._mcp_add_server_dialog(parent_top),
+                  command=lambda: self._mcp_add_server_dialog(parent_top, frame),
                   bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                   relief="flat", bd=0, padx=8, pady=2, cursor="hand2", font=F(10)) \
             .pack(anchor="w", pady=(4, 0))
+        # Rows were destroyed + rebuilt above: re-apply the dialog wheel binding. The very
+        # first build lands here BEFORE the binder exists (getattr -> None); at the end of
+        # open_settings the canvas-wide bind covers everything, so nothing is missed.
+        _b = getattr(self, "_settings_bind_wheel", None)
+        if _b is not None:
+            _b(frame)
 
     def _mcp_remove_server(self, name: str) -> None:
         servers = self._mcp_servers_cfg()
@@ -7330,7 +7555,8 @@ class DeskpilotApp:
         self._mcp_schemas()   # drop the removed server's tools from the map
         self._mcp_rebuild_permissions_bar()
 
-    def _mcp_add_server_dialog(self, parent: tk.Toplevel) -> None:
+    def _mcp_add_server_dialog(self, parent: tk.Toplevel,
+                               redraw_frame: Optional[tk.Frame] = None) -> None:
         d = tk.Toplevel(parent)
         d.title(f"{APP_NAME} — Add MCP Server")
         d.configure(bg=COL["bg_main"])
@@ -7387,6 +7613,14 @@ class DeskpilotApp:
             save_settings(self.settings)
             d.destroy()
             self._mcp_connect_all()
+            # Show the new row IMMEDIATELY in the open dialog (pre-v1.1.12 the list only
+            # refreshed after closing and reopening Settings).
+            if redraw_frame is not None:
+                try:
+                    if redraw_frame.winfo_exists():
+                        self._draw_mcp_server_rows(redraw_frame, parent)
+                except tk.TclError:
+                    pass
 
         btns = tk.Frame(d, bg=COL["bg_main"])
         btns.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(0, 12))
@@ -7523,11 +7757,13 @@ class DeskpilotApp:
             self._verify_running = False
             self._verify_set_button(btn, "normal")
 
-    def _test_connection(self, url: str, top: tk.Toplevel) -> None:
+    def _test_connection(self, url: str, key: str, top: tk.Toplevel) -> None:
+        # `key` comes from the LIVE dialog entry, captured on the main thread by the
+        # caller; this method runs on a worker thread and must not touch widgets.
         ok = False
         detail = ""
         try:
-            key = (self.settings.get("api_key") or "").strip()
+            key = (key or "").strip()
             req = urllib.request.Request(
                 url.rstrip("/") + "/models",
                 headers={
