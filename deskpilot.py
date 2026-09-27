@@ -1680,17 +1680,31 @@ def _apply_urls(widget: tk.Text, seg: str, tags: List[str], app) -> None:
     The start position is captured via 'end-1c' BEFORE inserting anything -
     Tk's index('end') reports one line past the last real content (implicit
     trailing newline), so querying it mid-way would mis-key the registry.
-    Offsets then advance by exactly the characters inserted."""
+    Offsets then advance by exactly the characters inserted; newlines inside a
+    segment bump ln0 and reset off0, so URLs on later lines are keyed to the
+    right registry entry (the old flat offset made every URL after the first
+    line of a multi-line message unclickable)."""
     try:
         ln0, off0 = (int(x) for x in widget.index("end-1c").split(".")[:2])
     except (tk.TclError, ValueError):
         ln0, off0 = 1, 0
+
+    def _advance(chunk: str) -> None:
+        nonlocal ln0, off0
+        nl = chunk.count("\n")
+        if nl:
+            ln0 += nl
+            off0 = len(chunk) - chunk.rfind("\n") - 1
+        else:
+            off0 += len(chunk)
+
     pos = 0
     for m in URL_RE.finditer(seg):
         if m.start() > pos:
             widget.insert("end", seg[pos:m.start()], tags)
-            off0 += m.start() - pos
-        url = m.group(0).rstrip(r".,;:!?)\]]")
+            _advance(seg[pos:m.start()])
+        raw = m.group(0)
+        url = raw.rstrip(r".,;:!?)\]]")
         if "://" in url and len(url.split("://", 1)[1]) > 0:
             if app is not None:
                 try:
@@ -1698,13 +1712,18 @@ def _apply_urls(widget: tk.Text, seg: str, tags: List[str], app) -> None:
                 except Exception:
                     pass
             widget.insert("end", url, list(tags) + ["link"])
-            off0 += len(url)
+            _advance(url)
+            # Punctuation stripped from the link target is still part of the text.
+            if len(raw) > len(url):
+                widget.insert("end", raw[len(url):], tags)
+                _advance(raw[len(url):])
         else:
-            widget.insert("end", m.group(0), tags)            # degenerate (scheme only) - plain text
-            off0 += len(m.group(0))
+            widget.insert("end", raw, tags)            # degenerate (scheme only) - plain text
+            _advance(raw)
         pos = m.end()
     if pos < len(seg):
         widget.insert("end", seg[pos:], tags)
+        _advance(seg[pos:])
 
 
 def render_inline(widget: tk.Text, text: str, tags: List[str]) -> None:
@@ -2281,7 +2300,13 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
     """
     now = datetime.now().astimezone()
     off = now.utcoffset()
-    off_s = f"UTC{off.total_seconds() // 3600:+.0f}" if off is not None else "unknown offset"
+    if off is not None:
+        total_min = int(off.total_seconds()) // 60   # whole minutes (fractional seconds irrelevant)
+        sign = "+" if total_min >= 0 else "-"
+        h, m = divmod(abs(total_min), 60)
+        off_s = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")   # e.g. UTC+5:30, UTC-4
+    else:
+        off_s = "unknown offset"
     content = (
         f"You are Deskpilot, a helpful local AI desktop assistant running on the user's computer. "
         f"Current date and time on the user's machine: "
@@ -4072,7 +4097,7 @@ class DeskpilotApp:
             # leaving it set makes every render guard return False instead.
             was_current = (cid == self.current_chat_id)
             self._refresh_chat_list()
-            if was_current or cid == self.current_chat_id:
+            if was_current:
                 self.load_chat(self.chats["order"][0], force=True)
 
     # ── sidebar drag-and-drop reordering ─────────────────────────────
@@ -6251,7 +6276,9 @@ class DeskpilotApp:
                 img = ImageGrab.grab(all_screens=True)
             except TypeError:
                 img = ImageGrab.grab()
-            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            # uuid suffix: two captures in the same second must not overwrite each other
+            # (an earlier chat message's image_ref would then point at the newer shot).
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:8]
             # Downscale + JPEG-compress before saving: a full-res multi-monitor
             # PNG can be several MB, and the payload rides along with every
             # request while it is the active screenshot. ~1280px JPEG q75 keeps
@@ -7706,7 +7733,7 @@ class DeskpilotApp:
             return
         if getattr(self, "_verify_running", False):
             self._verify_report(out_box, ["(verification already running - please wait)"],
-                               "Sampling verification in progress&")
+                               "Sampling verification in progress")
             return
         model = (self.settings.get("model_name") or "").strip()
         if self._busy:
@@ -7732,7 +7759,7 @@ class DeskpilotApp:
     def _verify_worker(self, btn, out_box, model: str) -> None:
         """Daemon thread: run the bounded probe sequence. All UI via _verify_report/_post."""
         try:
-            self._verify_report(out_box, [], "Verifying sampling parameters&", clear=True)
+            self._verify_report(out_box, [], "Verifying sampling parameters", clear=True)
             client = self._verify_client()
             if client is None:
                 self._verify_report(out_box, ["REFUSED: could not create an API client "
@@ -7746,8 +7773,7 @@ class DeskpilotApp:
             lines = run_sampling_verify(client, model, _sw["top"], _sw["flat"], info,
                                         timeout=VERIFY_TIMEOUT,
                                         report=lambda group: self._verify_report(out_box, group))
-            self._verify_report(out_box, [" evidence only: a server can accept a key and ignore "
-                                          "it "])
+            self._verify_report(out_box, ["(evidence only: a server can accept a key and ignore it)"])
             self._verify_report(out_box, [], "Sampling verification finished")
         except Exception as e:
             traceback.print_exc()
