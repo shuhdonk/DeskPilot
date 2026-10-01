@@ -22,8 +22,10 @@
      fetch_url             – retrieves + cleans raw text from a webpage
      run_javascript        – Node.js via hidden subprocess, 60 s timeout
      list_directory        – folder contents (folders first, size + modified time)
-     read_local_file       – text & PDF (pypdf), max FILE_READ_LIMIT chars
+     search_files          – bounded grep over files/dirs (locate before reading)
+     read_local_file       – text & PDF (pypdf); offset/limit chunked reads
      write_local_file      – creates / overwrites local text files
+     edit_local_file       – transactional in-place replacements (surgical edits)
      generate_local_image  – local FLUX/SDXL CLI (ai-imagegen/generate.py)
      capture_screen        – PIL ImageGrab, queued for vision analysis
      get_clipboard_text    – thread-safe system clipboard read
@@ -58,6 +60,7 @@ import atexit
 import base64
 import ctypes
 import ctypes.wintypes
+import fnmatch
 import gzip
 import io
 import html as html_mod
@@ -175,7 +178,7 @@ def _kokoro_model():
             _os.makedirs(cache, exist_ok=True)
         except OSError:
             pass
-        model_f = next((f for f in ("kokoro-v0_19.onnx", "kokoro-v1.0.int8.onnx", "kokoro-v1.0.onnx")
+        model_f = next((f for f in (KOKORO_MODEL_NAME, "kokoro-v1.0.int8.onnx", "kokoro-v1.0.onnx")
                         if (cache / f).is_file()), None)
         voices_f = next((f for f in ("voices-v1.0.bin", "af_heart.json") if (cache / f).is_file()), None)
         if model_f is None or voices_f is None:
@@ -600,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.12"
+VERSION    = "1.1.19"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -631,6 +634,15 @@ STOP_POLL_S      = 0.25       # max latency of the Stop button while a tool is b
 IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
 PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
 TOOL_OUTPUT_LIMIT = 96000   # max chars of ANY tool result sent back to the model (hard cap)
+JS_STDOUT_CAP    = 48_000   # chars of run_javascript stdout returned to the model (schema text shares this)
+EDIT_FILE_MAX    = 2_000_000  # max bytes of a file edit_local_file will load and patch
+SEARCH_PER_FILE_CAP        = 20    # search_files: max matches reported per file
+SEARCH_DEFAULT_MAX_MATCHES = 200   # search_files: default global match cap
+SEARCH_MAX_MATCHES_CAP     = 500   # search_files: hard upper bound for max_matches
+SEARCH_CONTEXT_MAX         = 5     # search_files: max context lines per match
+SEARCH_SKIP_DIRS = frozenset({     # search_files: noise dirs never descended into
+    "__pycache__", ".git", "node_modules", ".venv", "venv",
+    "site-packages", "dist", "build", ".cache"})
 MODEL_HISTORY_MAX = 20      # previously-used model names kept for the Model Name dropdown
 TEMP_VALUES       = tuple(f"{v / 10:.1f}" for v in range(21))  # per-chat temperature choices: 0.0 .. 2.0 in 0.1 steps (21 values)
 TEMP_DEFAULT      = "0.7"                                    # default temperature (sent when a chat has no explicit value)
@@ -745,6 +757,19 @@ def _traversal_component(raw: str) -> Optional[str]:
             return part
     return None
 
+
+def _as_bool(value) -> bool:
+    """Coerce a tool argument to a real bool.
+
+    LLMs frequently send booleans as strings ("false", "0", "true"); plain
+    bool("false") is True, which would silently invert the intent. Only
+    explicit truthy spellings count as True; anything else is False.
+    """
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "y", "on")
+    return bool(value)
+
+
 # ── Dark modern palette ──────────────────────────────────────────────────────
 COL = {
     "bg_deep":   "#171717",   # deepest surface (sidebar, code blocks)
@@ -785,8 +810,10 @@ TOOLS: List[tuple] = [
     ("firecrawl_scrape",     "🔥 Firecrawl Scrape"),    ("fetch_url",            "🌐 Fetch URL"),
     ("run_javascript",       "⚡ Run JS (Node)"),
     ("list_directory",       "📁 List Directory"),
+    ("search_files",         "🔎 Search Files"),
     ("read_local_file",      "📄 Read File"),
     ("write_local_file",     "✍️ Write File"),
+    ("edit_local_file",      "✂️ Edit File"),
     ("generate_local_image", "🎨 Generate Image"),
     ("capture_screen",       "📸 Capture Screen"),
     ("get_clipboard_text",   "📋 Clipboard"),
@@ -871,8 +898,10 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "name": "run_javascript",
             "description": ("Execute JavaScript code locally using Node.js in a hidden subprocess. "
                             f"Hard {JS_TIMEOUT} second timeout. Use console.log() to produce output. "
-                            "stdout is capped at 8000 chars (a truncation marker is appended) - "
-                            "for larger results write them to a file and read it back in chunks."),
+                            f"stdout is capped at {JS_STDOUT_CAP} chars (a truncation marker is appended) - "
+                            f"for larger results write them to a file and read it back in chunks. The "
+                            "process runs in the current working directory - prefer paths "
+                            "relative to it over long absolute path literals."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -887,11 +916,17 @@ TOOL_SCHEMAS: Dict[str, dict] = {
         "function": {
             "name": "read_local_file",
             "description": (f"Read a local file and return its text content (max {FILE_READ_LIMIT} characters). "
-                            "Supports plain-text files and PDF documents."),
+                            "Supports plain-text files and PDF documents. For files longer than the "
+                            "limit, read again with offset set to the previous end position; the "
+                            "footer always reports the total length."),
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Filesystem path of the file to read."}
+                    "path": {"type": "string", "description": "Filesystem path of the file to read (absolute, or relative to the current working directory)."},
+                    "offset": {"type": "integer",
+                               "description": "0-based character index to start reading from. Default 0."},
+                    "limit": {"type": "integer",
+                               "description": f"Max characters to return (1-{FILE_READ_LIMIT}). Default {FILE_READ_LIMIT}."}
                 },
                 "required": ["path"]
             }
@@ -906,10 +941,34 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path":        {"type": "string",  "description": "Directory path to list."},
+                    "path":        {"type": "string",  "description": "Directory path to list (absolute, or relative to the current working directory)."},
                     "max_entries": {"type": "integer", "description": "Maximum entries to show (1-1000). Default 200."}
                 },
                 "required": ["path"]
+            }
+        }
+    },
+    "search_files": {
+        "type": "function",
+        "function": {
+            "name": "search_files",
+            "description": ("Search the local filesystem for a text pattern and return matching "
+                            "file:line locations with trimmed line text. Use this to LOCATE code "
+                            "before reading it - far cheaper than reading whole files. Binary "
+                            "files and noise dirs (__pycache__, .git, node_modules, ...) are "
+                            "skipped."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":        {"type": "string",  "description": "File or directory to search. Default = current working directory; prefer paths relative to it."},
+                    "pattern":     {"type": "string",  "description": "Text to find."},
+                    "regex":       {"type": "boolean", "description": "Treat pattern as a Python regex. Default false (literal)."},
+                    "ignore_case": {"type": "boolean", "description": "Case-insensitive matching. Default false."},
+                    "glob":        {"type": "string",  "description": "Filename filter, e.g. \"*.py\". Default: all text files."},
+                    "context":     {"type": "integer", "description": f"Lines of context per match (0-{SEARCH_CONTEXT_MAX}). Default 0."},
+                    "max_matches": {"type": "integer", "description": f"Stop after N matches (1-{SEARCH_MAX_MATCHES_CAP}). Default {SEARCH_DEFAULT_MAX_MATCHES}."}
+                },
+                "required": ["pattern"]
             }
         }
     },
@@ -922,10 +981,50 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "path":    {"type": "string", "description": "Filesystem path to write."},
+                    "path":    {"type": "string", "description": "Filesystem path to write (absolute, or relative to the current working directory)."},
                     "content": {"type": "string", "description": "Full text content to save."}
                 },
                 "required": ["path", "content"]
+            }
+        }
+    },
+    "edit_local_file": {
+        "type": "function",
+        "function": {
+            "name": "edit_local_file",
+            "description": ("Perform surgical in-place text replacements in an existing file. "
+                            "Each edit's old_text must match EXACTLY once in the file (whitespace- "
+                            "and newline-exact). All edits are applied as ONE transaction: if any "
+                            "old_text is not found exactly once, NOTHING is written and every "
+                            "mismatch is reported. Strongly preferred over write_local_file for "
+                            "changing existing files - only the changed regions are sent. Edits "
+                            "are applied sequentially in listed order: later edits see the output "
+                            "of earlier ones (dependent edits are allowed)."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path":  {"type": "string",
+                              "description": "File to edit (must exist; absolute, or relative to the current working directory)."},
+                    "edits": {
+                        "type": "array",
+                        "description": "One or more replacements, applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_text": {"type": "string",
+                                             "description": "Exact text to find (whitespace/newline-exact)."},
+                                "new_text": {"type": "string",
+                                             "description": "Replacement text."},
+                                "allow_multiple": {"type": "boolean",
+                                                   "description": "Replace every occurrence instead of requiring exactly one. Default false."}
+                            },
+                            "required": ["old_text", "new_text"]
+                        }
+                    },
+                    "dry_run": {"type": "boolean",
+                                "description": "Validate and report counts without writing. Default false."}
+                },
+                "required": ["path", "edits"]
             }
         }
     },
@@ -980,10 +1079,12 @@ DEFAULT_PERMS = {
     "firecrawl_scrape":      "always",
     "fetch_url":             "always",
     "list_directory":        "always",
+    "search_files":          "always",
     "read_local_file":       "always",
     "get_clipboard_text":    "always",
     "run_javascript":        "ask",
     "write_local_file":      "ask",
+    "edit_local_file":       "ask",
     "generate_local_image": "ask",
     "capture_screen":        "ask",
 }
@@ -1349,7 +1450,7 @@ def _atomic_write(path: Path, text: str) -> None:
     If the target exists, the immediately-previous version is kept as
     <name>.bak first - exactly one rolling backup, overwritten on every save."""
     tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(text, encoding="utf-8")
+    tmp.write_bytes(text.encode("utf-8"))   # binary: no newline translation; keeps CRLF exact
     if path.exists():
         try:
             shutil.copy2(path, path.with_name(path.name + ".bak"))
@@ -6049,8 +6150,10 @@ class DeskpilotApp:
                 return f"ERROR: JavaScript execution timed out after {JS_TIMEOUT} seconds."
             out = (p.stdout or "")
             # Mark the cap so a cut-off result is never mistaken for "no output".
-            if len(out) > 8000:
-                out = out[:8000] + "\n[... stdout truncated at 8000 chars - print less per call or write to a file and read it back]"
+            if len(out) > JS_STDOUT_CAP:
+                out = (out[:JS_STDOUT_CAP] + f"\n[... stdout truncated at {JS_STDOUT_CAP} chars - "
+                       "print less per call, or write to a file and read it back with "
+                       "read_local_file offset/limit]")
             if p.stderr:
                 out += ("\n[stderr]\n" + p.stderr) if out else ("[stderr]\n" + p.stderr)
             return (out or "(no output)")
@@ -6147,35 +6250,296 @@ class DeskpilotApp:
             out += f"\n[... {len(entries) - n} more entries not shown]"
         return out[:TOOL_OUTPUT_LIMIT]
 
-    def _tool_read_local_file(self, path: str = "") -> str:
+    def _tool_search_files(self, path: str = "", pattern: str = "", regex: bool = False,
+                           ignore_case: bool = False, glob: str = "",
+                           context: int = 0, max_matches: int = 0) -> str:
+        """Bounded grep over a file / directory tree (SOW 2026-09-30, P3).
+
+        Literal matching by default (regex opt-in); binary files and noise dirs
+        are skipped. Output is relpath:lineno: trimmed-line grouped by file,
+        with '-'-separated context lines when requested; per-file and global
+        match caps plus the shared TOOL_OUTPUT_LIMIT backstop keep it bounded.
+        Every candidate file is re-checked against the File Workspace jail so a
+        symlink cannot widen scope (mirrors _safe_path / _tool_list_directory).
+        """
+        if not str(pattern or "").strip():
+            return "ERROR: No search pattern provided."
+        try:
+            rx = re.compile(str(pattern) if _as_bool(regex) else re.escape(str(pattern)),
+                            re.IGNORECASE if _as_bool(ignore_case) else 0)
+        except re.error as e:
+            return f"ERROR: Invalid regex pattern {pattern!r}: {e}"
+        try:
+            root = self._safe_path(path or ".")
+        except PermissionError as e:
+            return f"ERROR: Access denied (blocked path): {e}"
+        if not root.exists():
+            return f"ERROR: Path not found: {root}"
+        try:
+            ctx = max(0, min(int(context or 0), SEARCH_CONTEXT_MAX))
+        except (TypeError, ValueError):
+            ctx = 0
+        try:
+            cap = int(max_matches) if max_matches else SEARCH_DEFAULT_MAX_MATCHES
+            cap = max(1, min(cap, SEARCH_MAX_MATCHES_CAP))
+        except (TypeError, ValueError):
+            cap = SEARCH_DEFAULT_MAX_MATCHES
+
+        # Workspace jail re-check for every CANDIDATE file: a symlink inside an
+        # allowed directory must not widen the search scope.
+        ws_raw = str((getattr(self, "settings", None) or {})
+                     .get("file_workspace") or "").strip()
+        ws_str = ""
+        if ws_raw:
+            try:
+                ws_str = str(Path(os.path.expanduser(ws_raw)).resolve()).lower()
+            except Exception as e:
+                return f"ERROR: Invalid file workspace configured ({ws_raw!r}): {e}"
+
+        def in_scope(f: Path) -> bool:
+            if not ws_str:
+                return True
+            try:
+                fs = str(f.resolve()).lower()
+            except OSError:
+                return False
+            return fs == ws_str or fs.startswith(_dir_prefix(ws_str))
+
+        files: List[Path] = []
+        if root.is_file():
+            files.append(root)
+        else:
+            for f in root.rglob("*"):
+                try:
+                    if not f.is_file():
+                        continue
+                except OSError:
+                    continue
+                if any(part.lower() in SEARCH_SKIP_DIRS
+                       for part in f.relative_to(root).parts[:-1]):
+                    continue
+                files.append(f)
+            files.sort(key=lambda f: str(f).lower())
+
+        groups: List[str] = []
+        total = 0
+        n_files = scanned = skipped_big = 0
+        any_cut = False
+        glob_pat = (glob or "").strip()
+        for f in files:
+            if total >= cap:
+                break
+            if glob_pat and not fnmatch.fnmatch(f.name, glob_pat):
+                continue
+            if not in_scope(f):
+                continue
+            try:
+                if f.stat().st_size > EDIT_FILE_MAX:
+                    skipped_big += 1
+                    continue
+                data = f.read_bytes()
+            except OSError:
+                continue
+            scanned += 1
+            if b"\x00" in data[:1024]:
+                continue                      # binary: not searchable text
+            flines = data.decode("utf-8", "replace").splitlines()
+            hits = [i for i, ln in enumerate(flines, 1) if rx.search(ln)]
+            if not hits:
+                continue
+            n_files += 1
+            take = hits[:min(SEARCH_PER_FILE_CAP, cap - total)]
+            if len(hits) > len(take):
+                any_cut = True      # more matches existed than were reported
+            total += len(take)
+            rel = str(f) if root.is_file() else f.relative_to(root).as_posix()
+            hitset = set(take)
+            emit: Dict[int, bool] = {}
+            for ln in take:
+                lo, hi = ((ln, ln) if ctx == 0 else
+                          (max(1, ln - ctx), min(len(flines), ln + ctx)))
+                for j in range(lo, hi + 1):
+                    emit[j] = j in hitset
+            chunk: List[str] = []
+            prev = 0
+            for j in sorted(emit):
+                if ctx and j != prev + 1 and chunk:
+                    chunk.append("--")        # grep-style gap separator
+                sep = ":" if emit[j] else "-"
+                chunk.append(f"{rel}{sep}{j}{sep} {flines[j - 1].strip()[:200]}")
+                prev = j
+            groups.append("\n".join(chunk))
+
+        head = (f"{total} matches in {n_files} files "
+                f"({scanned} scanned) in {root}:")
+        notes: List[str] = []
+        if total >= cap:
+            notes.append(f"stopped at max_matches={cap}")
+        elif any_cut:
+            notes.append(f"per-file cap of {SEARCH_PER_FILE_CAP} matches/file reached")
+        if skipped_big:
+            notes.append(f"{skipped_big} file(s) over the {EDIT_FILE_MAX}-byte limit skipped")
+        body = "\n\n".join(groups)
+        out = head + ("\n\n" + body if body else "")
+        if notes:
+            out += "\n[... " + "; ".join(notes) + "]"
+        return out[:TOOL_OUTPUT_LIMIT]
+
+    def _tool_read_local_file(self, path: str = "", offset: int = 0,
+                              limit: int = 0) -> str:
+        """Read a file with optional chunked windowing (SOW 2026-09-30, P2).
+
+        offset/limit slice the decoded text by character index; PDF pages are
+        joined then windowed the same way. The header always reports the
+        returned range and total length so a follow-up read can resume at
+        `end`; a PDF whose pages ran out before the window was filled reports
+        its total with a '+' suffix (it is a lower bound)."""
         try:
             p = self._safe_path(path)
             if not p.is_file():
                 return f"ERROR: File not found: {p}"
+            start = max(0, int(offset))
+            n = int(limit) if limit else FILE_READ_LIMIT
+            n = min(max(n, 1), FILE_READ_LIMIT)
+            plus = ""                       # '+' when a PDF total is a lower bound
             if p.suffix.lower() == ".pdf":
                 if PdfReader is None:
                     return "ERROR: 'pypdf' is not installed. Run:  pip install pypdf"
                 reader = PdfReader(str(p))
-                parts, total = [], 0
+                parts, acc = [], 0
                 for page in reader.pages:
                     t = page.extract_text() or ""
                     parts.append(t)
-                    total += len(t)
-                    if total >= FILE_READ_LIMIT:
+                    acc += len(t) + (1 if len(parts) > 1 else 0)   # '\n' joiners count
+                    if acc >= start + n:    # window covered; stop decoding pages
+                        plus = "+"          # more pages exist: total is a lower bound
                         break
-                text = "\n".join(parts)[:FILE_READ_LIMIT]
+                full = "\n".join(parts)
+                total_n = len(full)
+                body = full[start:start + n]
             else:
                 data = p.read_bytes()
                 if b"\x00" in data[:1024]:
                     return (f"ERROR: {p.name} appears to be a binary file. "
                             f"Only text files and PDFs are supported.")
-                text = data.decode("utf-8", "replace")[:FILE_READ_LIMIT]
+                full = data.decode("utf-8", "replace")
+                total_n = len(full)
+                body = full[start:start + n]
         except PermissionError as e:
             return f"ERROR: Access denied (blocked path): {e}"
         except Exception as e:
             return f"ERROR: Failed to read file: {e}"
-        note = f"\n[... truncated at {FILE_READ_LIMIT} chars]" if len(text) >= FILE_READ_LIMIT else ""
-        return f"Contents of {p.name}:\n\n{text}{note}"
+        if start and start >= total_n:      # explicit, self-correcting past-EOF
+            return (f"ERROR: offset {start} past end of file; "
+                    f"file has {total_n}{plus} chars")
+        end = start + len(body)
+        footer = (f"\n[... more content follows at offset {end}]"
+                  if end < total_n else "")
+        return (f"Contents of {p.name} (chars {start}\u2013{end} of "
+                f"{total_n}{plus}):\n\n{body}{footer}")
+
+    def _tool_edit_local_file(self, path: str = "", edits=None,
+                               dry_run: bool = False) -> str:
+        """All-or-nothing in-place text replacements (see SOW 2026-09-30, P1).
+
+        Validates EVERY edit against the current text before mutating anything;
+        on any mismatch writes nothing and reports all failures together.
+        Dominant line ending (CRLF) is preserved; non-UTF-8/binary files are
+        refused outright - never lossily round-tripped."""
+        if not (path or "").strip():
+            return "ERROR: No target path provided."
+        if not isinstance(edits, list) or not edits:
+            return "ERROR: 'edits' must be a non-empty list of {old_text, new_text} objects."
+        try:
+            p = self._safe_path(path)
+            if not p.is_file():
+                return (f"ERROR: File not found: {p} - edit_local_file never creates "
+                        f"files; use write_local_file for that.")
+            data = p.read_bytes()
+            if len(data) > EDIT_FILE_MAX:
+                return (f"ERROR: {p.name} is {len(data)} bytes, over the "
+                        f"{EDIT_FILE_MAX}-byte edit limit; split the work into smaller edits "
+                        f"via run_javascript.")
+            if b"\x00" in data[:1024]:
+                return (f"ERROR: {p.name} appears to be a binary file. "
+                        f"Only text files are supported.")
+            try:
+                raw_text = data.decode("utf-8")   # strict: no silent replacement chars
+            except UnicodeDecodeError:
+                return (f"ERROR: {p.name} is not valid UTF-8 text; refusing to edit it "
+                        f"(use write_local_file to rewrite the whole file).")
+        except PermissionError as e:
+            return f"ERROR: Access denied (blocked path): {e}"
+        except Exception as e:
+            return f"ERROR: Failed to read file for editing: {e}"
+
+        crlf = "\r\n" in raw_text
+        text = raw_text.replace("\r\n", "\n") if crlf else raw_text
+
+        # ── validate ALL edits first, sequentially against a simulation
+        # copy so dependent edits (later edits matching earlier edits' output)
+        # validate correctly; collect every failure, write nothing ──
+        failures: List[str] = []
+        plan: List[tuple] = []          # (index, old, new, count)
+        work = text                     # simulation copy: validation == application
+        for i, ed in enumerate(edits):
+            if not isinstance(ed, dict):
+                failures.append(f"edit #{i}: not an object")
+                continue
+            old = ed.get("old_text")
+            new = ed.get("new_text")
+            if not isinstance(old, str) or not isinstance(new, str):
+                failures.append(f"edit #{i}: old_text/new_text must be strings")
+                continue
+            if old == "":
+                failures.append(f"edit #{i}: old_text is empty (would match everywhere)")
+                continue
+            allow = _as_bool(ed.get("allow_multiple", False))
+            count = work.count(old)
+            if not ((count >= 1) if allow else (count == 1)):
+                failures.append(f"edit #{i}: old_text found {count} time(s), needs "
+                                f"{'>=1' if allow else 'exactly 1'}: {old[:80]!r}")
+                continue
+            plan.append((i, old, new, count))
+            work = work.replace(old, new)
+        if failures:
+            return (f"ERROR: no changes written ({len(failures)} problem(s), all-or-nothing):\n"
+                    + "\n".join(failures))
+
+        # ── dry run: report validation counts without touching disk ──
+        if _as_bool(dry_run):
+            report = "; ".join(f"edit #{i}: {c} match(es)" for (i, _o, _n, c) in plan)
+            return (f"DRY RUN OK: {p.name} - all {len(plan)} edit(s) validate; "
+                    f"nothing written. {report}")
+
+        # ── apply sequentially (later edits see earlier edits' output) ──
+        counts: List[str] = []
+        for (i, old, new, n) in plan:
+            text = text.replace(old, new)
+            counts.append(f"edit #{i}: {n}")
+        out = text.replace("\n", "\r\n") if crlf else text
+
+        try:
+            _atomic_write(p, out)
+        except PermissionError as e:
+            return f"ERROR: Access denied (blocked path): {e}"
+        except Exception as e:
+            return f"ERROR: Failed to write file: {e}"
+
+        # compact receipt: first changed line lets the model self-verify cheaply
+        old_lines, new_lines = raw_text.splitlines(), out.splitlines()
+        first_change = ""
+        for a, b in zip(old_lines, new_lines):
+            if a != b:
+                first_change = b.strip()[:100]
+                break
+        if not first_change and len(new_lines) > len(old_lines):
+            first_change = new_lines[len(old_lines)].strip()[:100]
+        delta = len(out.encode("utf-8")) - len(raw_text.encode("utf-8"))
+        eol = ", CRLF preserved" if crlf else ""
+        ctx = f"; first change: {first_change!r}" if first_change else ""
+        return (f"OK: edited {p.name} - {len(plan)} edit(s) applied{eol}; "
+                + "; ".join(counts) + f"; net {delta:+d} bytes{ctx}")
 
     def _tool_write_local_file(self, path: str = "", content: str = "") -> str:
         if not (path or "").strip():
@@ -6575,33 +6939,33 @@ class DeskpilotApp:
                     self._post(lambda: self._set_status(
                         "\U0001F3A4 Listening via local Whisper\u2026 speak freely; hit Send (or click the mic) to stop"))
             try:
-                    while not self._mic_stop.is_set():
-                        try:
-                            audio = rec.listen(src, timeout=5, phrase_time_limit=30)
-                        except Exception as e:
-                            if "WaitTimeout" in type(e).__name__:
-                                continue        # silence — keep listening until stopped
-                            raise
-                        if self._mic_stop.is_set():
-                            break
-                        try:
-                            if WhisperModel is not None:
-                                text = whisper_transcribe_local(audio.get_wav_data())
-                                if not text:
-                                    continue    # silence / unintelligible - keep listening
-                            else:
-                                text = rec.recognize_google(audio)
-                        except sr.UnknownValueError:
-                            continue            # couldn't understand it — keep listening
-                        except sr.RequestError as e:
-                            self._post(lambda m=str(e): self._set_status(f"🎤 Dictation error (network?): {m}"))
-                            return              # Google unreachable — no point continuing
-                        except Exception as e:   # local engine failure (model download/load/decode)
-                            self._post(lambda m=str(e): self._set_status(f"Dictation error: {m}"))
-                            return              # retrying won't help; user can restart the mic
-                        if not self._mic_active:
-                            break               # stopped while transcribing; discard tail
-                        self._post(lambda t=text: self._stt_insert(t))
+                while not self._mic_stop.is_set():
+                    try:
+                        audio = rec.listen(src, timeout=5, phrase_time_limit=30)
+                    except Exception as e:
+                        if "WaitTimeout" in type(e).__name__:
+                            continue        # silence — keep listening until stopped
+                        raise
+                    if self._mic_stop.is_set():
+                        break
+                    try:
+                        if WhisperModel is not None:
+                            text = whisper_transcribe_local(audio.get_wav_data())
+                            if not text:
+                                continue    # silence / unintelligible - keep listening
+                        else:
+                            text = rec.recognize_google(audio)
+                    except sr.UnknownValueError:
+                        continue            # couldn't understand it — keep listening
+                    except sr.RequestError as e:
+                        self._post(lambda m=str(e): self._set_status(f"🎤 Dictation error (network?): {m}"))
+                        return              # Google unreachable — no point continuing
+                    except Exception as e:   # local engine failure (model download/load/decode)
+                        self._post(lambda m=str(e): self._set_status(f"Dictation error: {m}"))
+                        return              # retrying won't help; user can restart the mic
+                    if not self._mic_active:
+                        break               # stopped while transcribing; discard tail
+                    self._post(lambda t=text: self._stt_insert(t))
             finally:
                 try:
                     mic.__exit__(None, None, None)
@@ -6714,6 +7078,9 @@ class DeskpilotApp:
         canvas.pack(side="left", fill="both", expand=True)
         inner = tk.Frame(canvas, bg=COL["bg_main"])
         _inner_win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        # P7b: col-0 row labels collected so the resize handler can re-wrap them
+        # (labels built later in this method are appended to this same list).
+        row_labels: List[tk.Label] = []
 
         def _sync_scrollregion(*_a) -> None:
             # The scroll region must be the inner frame's NATURAL size: left free,
@@ -6730,6 +7097,21 @@ class DeskpilotApp:
                 canvas.itemconfigure(_inner_win, width=max(e.width, 1))
             except tk.TclError:
                 pass
+            # P7b: the label column must shrink like the field column does.
+            # Unwrapped col-0 labels pin the grid's minimum width (the longest is
+            # ~90 chars), so the window can never get narrower than their natural
+            # width. Re-wrap them against the current viewport (~42% share, floor
+            # 180px): wide window -> one line each (unchanged look); narrow window
+            # -> labels reflow to 2-3 lines and the label column collapses.
+            try:
+                wl = max(180, int(e.width * 0.42))
+            except (AttributeError, TypeError, ValueError):
+                wl = 180
+            for _lbl in row_labels:
+                try:
+                    _lbl.configure(wraplength=wl)
+                except tk.TclError:
+                    pass
 
         def _wheel(e):
             # Widget-local (add="+") binds on the body widgets only - no root-level
@@ -6812,14 +7194,18 @@ class DeskpilotApp:
             if key == "mcp_servers":
                 # Managed list of stdio MCP servers (Add/Remove); connecting is
                 # live - discovered tools appear in the permission bar.
-                tk.Label(inner, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
-                         font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+                _lbl0 = tk.Label(inner, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
+                                 font=F(11))
+                _lbl0.grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+                row_labels.append(_lbl0)   # P7b: shrinkable label column
                 mcp_frame = tk.Frame(inner, bg=COL["bg_main"])
                 mcp_frame.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
                 self._draw_mcp_server_rows(mcp_frame, top)
                 continue
-            tk.Label(inner, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
-                     font=F(11)).grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+            _lbl0 = tk.Label(inner, text=label, bg=COL["bg_main"], fg=COL["text_dim"],
+                             font=F(11))
+            _lbl0.grid(row=i, column=0, sticky="w", padx=(16, 8), pady=6)
+            row_labels.append(_lbl0)   # P7b: shrinkable label column
             if key == "sampling_defaults":
                 # Sampler parameters (Top P / Top K / Min P / Repetition / Presence / Frequency),
                 # GLOBAL for every chat session by design - the chat UI stays uncluttered.
@@ -6828,6 +7214,10 @@ class DeskpilotApp:
                 # Label row: the generic tk.Label(inner, ...) above this branch already placed it.
                 samp_frame = tk.Frame(inner, bg=COL["bg_main"])
                 samp_frame.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
+                # P7: weight the entry column so the verify-results box (sticky ew)
+                # stretches to the SAME right edge as every other field (its fixed
+                # width=58 chars used to leave a black void beside it).
+                samp_frame.columnconfigure(1, weight=1)
                 for _r, (_sk, _slabel, _lo, _hi, _si, _st, _so) in enumerate(SAMPLING_SCHEMA):
                     tk.Label(samp_frame, text=_slabel, bg=COL["bg_main"], fg=COL["text_dim"],
                              font=F(10)).grid(row=_r, column=0, sticky="w", padx=(0, 8))
@@ -6859,10 +7249,16 @@ class DeskpilotApp:
                 # Editable combobox: dropdown of live server models + previously
                 # used names, but free typing still works (exact IDs matter for
                 # strict servers like Unsloth Desktop).
-                model_combo = ttk.Combobox(inner, values=[], width=44,
+                # P7: the combo shares its cell (col 1, spanning to the old col 2
+                # edge) with the Refresh / Use-loaded buttons built below, so the
+                # buttons sit adjacent to the field and follow it on resize.
+                model_row = tk.Frame(inner, bg=COL["bg_main"])
+                model_row.grid(row=i, column=1, columnspan=2, sticky="ew",
+                               pady=6, padx=(0, 8))
+                model_combo = ttk.Combobox(model_row, values=[], width=44,
                                            style="Tool.TCombobox", font=F(11))
                 model_combo.set(self.settings.get("model_name", ""))
-                model_combo.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
+                model_combo.pack(side="left", fill="x", expand=True)
                 continue
             if key == "custom_system_prompt":
                 # Multi-line: persona/style instructions can run to several lines.
@@ -6871,7 +7267,7 @@ class DeskpilotApp:
                                              insertbackground=COL["text"], relief="flat",
                                              font=F(10))
                 custom_prompt_text.insert("1.0", self.settings.get("custom_system_prompt", ""))
-                custom_prompt_text.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 16))
+                custom_prompt_text.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
                 continue
             if key == "allow_local_network":
                 local_net_var = tk.BooleanVar(value=bool(self.settings.get("allow_local_network", False)))
@@ -6882,16 +7278,32 @@ class DeskpilotApp:
                                selectcolor=COL["bg_deep"], font=F(11)) \
                     .grid(row=i, column=1, sticky="w", pady=6, padx=(0, 8))
                 continue
-            e = tk.Entry(inner, width=44, bg=COL["bg_deep"], fg=COL["text"],
+            # P7: the two folder-picker rows get their sub-frame HERE (at their row
+            # position in the loop) so the dialog's child order stays exactly the row
+            # order - the smoke suite walks winfo_children() and counts plain Entries
+            # positionally; frames appended after the loop would reorder the census.
+            _rowf: Optional[tk.Frame] = None
+            if key == "file_workspace":
+                ws_rowf = tk.Frame(inner, bg=COL["bg_main"])
+                ws_rowf.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
+                _rowf = ws_rowf
+            elif key == "handoff_notes_dir":
+                nd_rowf = tk.Frame(inner, bg=COL["bg_main"])
+                nd_rowf.grid(row=i, column=1, columnspan=2, sticky="ew", pady=6, padx=(0, 8))
+                _rowf = nd_rowf
+            e = tk.Entry(_rowf or inner, width=44, bg=COL["bg_deep"], fg=COL["text"],
                          insertbackground=COL["text"], relief="flat",
                          show="*" if key in ("api_key", "exa_api_key", "firecrawl_api_key") else "")
             e.insert(0, self.settings.get(key, ""))
-            e.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 16))
+            if _rowf is None:
+                e.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
             entries[key] = e
 
-        # File Workspace row gets a folder picker next to its entry.
-        ws_row = next(i for i, (_, k) in enumerate(rows) if k == "file_workspace")
-
+        # File Workspace row: folder picker ADJACENT to its entry (P7). Entry and
+        # button share the ws_rowf sub-frame (built at this row's position in the
+        # loop above), so the button sits right of the field and moves with it on
+        # resize (was a col-2 grid child pinned to the far edge - it drifted away
+        # from the entry when widened).
         def _browse_ws() -> None:
             cur = entries["file_workspace"].get().strip()
             d = filedialog.askdirectory(parent=top, title="Choose the File Workspace folder",
@@ -6900,14 +7312,13 @@ class DeskpilotApp:
                 entries["file_workspace"].delete(0, "end")
                 entries["file_workspace"].insert(0, d)
 
-        tk.Button(inner, text="Browse...", command=_browse_ws, bg=COL["bg_raised"], fg=COL["text"],
+        entries["file_workspace"].pack(in_=ws_rowf, side="left", fill="x", expand=True)
+        tk.Button(ws_rowf, text="Browse...", command=_browse_ws, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
-                  cursor="hand2", font=F(10)).grid(row=ws_row, column=2, sticky="e", padx=(0, 16), pady=6)
+                  cursor="hand2", font=F(10)).pack(side="left", padx=(8, 0))
 
         # Handoff notes folder row: picker + the EFFECTIVE folder shown live, so it is always
         # obvious where notes are being written (blank field = the app default working folder).
-        nd_row = next(i for i, (_, k) in enumerate(rows) if k == "handoff_notes_dir")
-
         def _browse_notes() -> None:
             cur = entries["handoff_notes_dir"].get().strip()
             d = filedialog.askdirectory(parent=top, title="Choose the handoff notes folder",
@@ -6931,21 +7342,26 @@ class DeskpilotApp:
             except tk.TclError:
                 pass
 
-        nd_btns = tk.Frame(inner, bg=COL["bg_main"])
-        nd_btns.grid(row=nd_row, column=2, sticky="e", padx=(0, 16), pady=6)
+        # P7: same treatment as File Workspace - entry, picker and the live
+        # "Notes will be written to" note share one sub-frame in col 1; the note
+        # gets its own line below the field (was packed BESIDE the Browse button,
+        # whose 260px wrap warped the row width on every resize).
+        entries["handoff_notes_dir"].pack(in_=nd_rowf, side="top", fill="x")
+        nd_btns = tk.Frame(nd_rowf, bg=COL["bg_main"])
+        nd_btns.pack(side="top", anchor="w", pady=(2, 0))
         tk.Button(nd_btns, text="Browse...", command=_browse_notes, bg=COL["bg_raised"], fg=COL["text"],
                   activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
                   cursor="hand2", font=F(10)).pack(side="left")
-        notes_dir_lbl = tk.Label(nd_btns, text="", bg=COL["bg_main"], fg=COL["text_dim"],
+        notes_dir_lbl = tk.Label(nd_rowf, text="", bg=COL["bg_main"], fg=COL["text_dim"],
                                  font=F(9), justify="left", wraplength=260)
-        notes_dir_lbl.pack(side="left", padx=(8, 0))
+        notes_dir_lbl.pack(side="top", anchor="w", padx=(8, 0))
         _update_notes_note()
         entries["handoff_notes_dir"].bind("<KeyRelease>", lambda _e: _update_notes_note())
 
         # Model Name row: Refresh button re-fetches {server_url}/models in a
         # background thread (same pattern as Test Connection). The request carries
         # no model name, so it works even with a stale/wrong saved model_name.
-        m_row = next(i for i, (_, k) in enumerate(rows) if k == "model_name")
+        # (P7: the buttons live in model_row next to the combobox - no grid anchor needed.)
         latest_entries: List[dict] = []      # last /models reply (used by Save to normalize)
         loaded_ids: List[str] = []           # models the server reports as loaded right now
 
@@ -7014,18 +7430,21 @@ class DeskpilotApp:
 
             threading.Thread(target=_worker, daemon=True).start()
 
-        refresh_btn = tk.Button(inner, text="Refresh models",
+        # P7: both buttons pack into model_row (built with the combobox above),
+        # adjacent to the field - no longer col-2/col-3 grid children adrift in
+        # the far-right dead space of the stretched row.
+        refresh_btn = tk.Button(model_row, text="Refresh models",
                                 command=lambda: _refresh_models(False, auto_fix=False),
                                 bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                                 relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
-        refresh_btn.grid(row=m_row, column=2, sticky="e", padx=(0, 16), pady=6)
+        refresh_btn.pack(side="left", padx=(8, 0))
 
         # "Use loaded model": copies the single loaded model's exact server ID into
         # Model Name - the reliable fix when you do not know the name yourself.
-        use_btn = tk.Button(inner, text="Use loaded model", state="disabled",
+        use_btn = tk.Button(model_row, text="Use loaded model", state="disabled",
                             bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                             relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
-        use_btn.grid(row=m_row, column=3, sticky="e", padx=(0, 16), pady=6)
+        use_btn.pack(side="left", padx=(8, 0))
 
         def _use_loaded() -> None:
             try:
