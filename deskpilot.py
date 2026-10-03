@@ -603,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.31"
+VERSION    = "1.1.32"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -3806,6 +3806,10 @@ class DeskpilotApp:
             keep_recent = int(float(self.settings.get("compaction_keep_recent", COMPACTION_KEEP_RECENT_DEFAULT)))
         except (TypeError, ValueError):
             keep_recent = COMPACTION_KEEP_RECENT_DEFAULT
+        # Clamp here too, not just on Settings-save (line ~8070): a hand-edited or
+        # corrupted settings file with keep_recent <= 0 would make _compaction_split_index
+        # index messages[n] (out of range -> IndexError). Same 2..50 bounds as the save path.
+        keep_recent = max(2, min(50, keep_recent))
         split = _compaction_split_index(messages, keep_recent)
         if split < COMPACTION_MIN_OLD:
             return False                       # not enough old messages to be worth compacting
@@ -4546,30 +4550,43 @@ class DeskpilotApp:
             return
         self._drag_state = {"cid": self._chat_visible[idx], "y0": event.y, "active": False}
 
-    def _chat_list_drag(self, event) -> None:
-        """While dragging, move the grabbed chat to the row under the pointer."""
+    def _chat_list_drag(self, event) -> Optional[str]:
+        """While dragging, move the grabbed chat to the row under the pointer.
+
+        Once a reorder drag is active this returns "break" so the Listbox CLASS
+        <B1-Motion> binding does not also run. That built-in handler does
+        drag-select and, when the pointer nears the top/bottom edge, auto-scrolls
+        the listbox rapidly while keeping a stale selection anchor. Left running
+        alongside our reorder it fights the drag: on a long list (one with a
+        scrollbar) the list jumps and scrolls really fast and the item can't be
+        placed. Suppressing it here is the fix. A plain click (not yet a drag)
+        still returns None so the class binding can do normal click-selection.
+        """
         st = self._drag_state
         if not st:
             return
         if not st["active"]:
             if abs(event.y - st["y0"]) < 6:
-                return                      # still a plain click
+                return                      # still a plain click (let the class binding select)
             st["active"] = True
             try:
                 self.chat_list.configure(cursor="fleur")
             except tk.TclError:
                 pass
+        # Drag is active: suppress the built-in drag-select / edge auto-scroll for
+        # the remainder of this motion event by returning "break" on every path.
         try:
             idx = self.chat_list.nearest(event.y)
         except tk.TclError:
-            return
+            return "break"
         if not (0 <= idx < len(self._chat_visible)):
-            return
+            return "break"
         order = self.chats["order"]
         cur = order.index(st["cid"])
         if idx != cur:
             order.insert(idx, order.pop(cur))
             self._refresh_chat_list(select_cid=st["cid"])   # keep the dragged row selected
+        return "break"
 
     def _chat_list_release(self, event) -> None:
         """End of press/drag: persist the new order if a drag actually happened."""
