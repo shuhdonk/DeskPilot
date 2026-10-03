@@ -603,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.29"
+VERSION    = "1.1.31"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -1614,6 +1614,49 @@ def fetch_model_ids(server_url: str, api_key: str = "", timeout: int = 8) -> Lis
             if m.get("id")]
 
 
+def _entry_context_length(entry) -> int:
+    """Context-window size from a /models entry, across server dialects.
+
+    Unsloth Desktop sends a top-level context_length; Strata nests it as
+    meta.n_ctx. Returns 0 when the server reports no window (LM Studio, Ollama)."""
+    if not isinstance(entry, dict):
+        return 0
+    for key in ("context_length", "max_context_length", "native_context_length"):
+        v = entry.get(key)
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    meta = entry.get("meta")
+    if isinstance(meta, dict):
+        v = meta.get("n_ctx") or meta.get("context_length")
+        if v:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+    return 0
+
+
+def _entry_is_loaded(entry) -> bool:
+    """Whether a /models entry is a model currently resident on the server.
+
+    Unsloth Desktop sends a top-level loaded=True boolean; Strata instead nests
+    the state as status.value == "loaded". Servers that report neither return
+    False, so callers treat the loaded model as unknown rather than guessing."""
+    if not isinstance(entry, dict):
+        return False
+    if entry.get("loaded"):
+        return True
+    status = entry.get("status")
+    if isinstance(status, dict):
+        return str(status.get("value", "")).strip().lower() == "loaded"
+    if isinstance(status, str):
+        return status.strip().lower() == "loaded"
+    return False
+
+
 def loaded_model_ids(entries: List[dict]) -> List[str]:
     """IDs of the entries a server reports as currently loaded (loaded=True).
 
@@ -1621,7 +1664,7 @@ def loaded_model_ids(entries: List[dict]) -> List[str]:
     the loaded model as unknown rather than guessing."""
     out: List[str] = []
     for m in entries or []:
-        if isinstance(m, dict) and m.get("loaded") and m.get("id"):
+        if isinstance(m, dict) and _entry_is_loaded(m) and m.get("id"):
             mid = str(m["id"]).strip()
             if mid and mid not in out:
                 out.append(mid)
@@ -2331,13 +2374,10 @@ def _probe_context(models_info, model: str) -> list:
             entry = m
             break
     if entry is None:
-        loaded = [m for m in info if m.get("loaded")]
+        loaded = [m for m in info if _entry_is_loaded(m)]
         if len(loaded) == 1:
             entry = loaded[0]
-    try:
-        ctx = int((entry or {}).get("context_length") or 0)
-    except (TypeError, ValueError):
-        ctx = 0
+    ctx = _entry_context_length(entry)
     if ctx > 0:
         return ["SERVER: context_length " + format(ctx, ",") + " (" +
                 str((entry or {}).get("id") or model) + ") - the context gauge and the handoff "
@@ -3600,14 +3640,10 @@ class DeskpilotApp:
                     entry = m
                     break
             if entry is None:
-                loaded = [m for m in entries if m.get("loaded")]
+                loaded = [m for m in entries if _entry_is_loaded(m)]
                 if len(loaded) == 1:
                     entry = loaded[0]
-            raw_total = entry.get("context_length") if entry else ""
-            try:
-                self._ctx_total = int(raw_total) if raw_total else 0
-            except (TypeError, ValueError):
-                self._ctx_total = 0
+            self._ctx_total = _entry_context_length(entry)
             self._update_ctx_usage_label()
         except tk.TclError:
             pass
@@ -5937,6 +5973,18 @@ class DeskpilotApp:
                 self._post(lambda m=str(e): self.render_error(f"Stream interrupted:\n{m}"))
             finally:
                 flush(force=True)
+                # Always close the SSE stream when this step's loop exits (Stop, app
+                # close, normal end, or exception). A bare `break` on Stop left the
+                # connection half-consumed in the keep-alive pool: a single-slot server
+                # like Strata never learns the client left, keeps generating into an
+                # unread socket, and the NEXT request queues behind that orphaned
+                # generation. The worker then blocks inside create() before it can
+                # honour Stop, so _busy stays True and the app looks dead until restart.
+                # Closing the stream aborts the in-flight generation and frees the slot.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
             if self._stop_event.is_set():
                 # Stopped mid-stream: keep whatever was generated so far (the
