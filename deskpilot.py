@@ -603,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.19"
+VERSION    = "1.1.29"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -630,6 +630,10 @@ TURN_TIME_LIMIT_DEFAULT = 0   # default wall-clock cap per user prompt (seconds;
                               # boundaries only and now defaults to unlimited: long turns are the
                               # point of the app, and an unwanted cap kept cutting sessions short.
 TURN_TIME_LIMIT_MAX   = 86400 # upper bound for the setting (24 h); 0 always means "no limit".
+COMPACTION_THRESHOLD_DEFAULT = 70   # % of the context window; 0 disables auto-compaction (C1).
+                                    # Kept BELOW the default handoff threshold (75) so an in-place
+                                    # compaction fires before a fork would - see SOW C5 note.
+COMPACTION_KEEP_RECENT_DEFAULT = 10 # most-recent message entries kept verbatim when compacting (C1)
 STOP_POLL_S      = 0.25       # max latency of the Stop button while a tool is blocking
 IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
 PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
@@ -1107,6 +1111,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "handoff_threshold_pct": 75,  # auto-handoff when context usage hits this % (0 = off)
     "handoff_rearm_pct": 10,      # how much further the gauge must grow before a chat may summarize again
     "handoff_notes_dir": "",      # folder for handoff notes; blank = <this folder>/deskpilot_data/handoff_notes
+    "compaction_threshold": COMPACTION_THRESHOLD_DEFAULT,   # auto-compact context at this % usage (0 = off); C1
+    "compaction_keep_recent": COMPACTION_KEEP_RECENT_DEFAULT,  # most-recent message entries kept verbatim; C1
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "sampling_defaults": dict(SAMPLING_DEFAULTS),  # sampler params applied to EVERY chat (Settings -> Sampling)
     "show_sampling_note": True,   # render one "what was actually sent" note per user prompt
@@ -1414,6 +1420,8 @@ def _prepare_request_messages(messages: List[dict]) -> List[dict]:
         has_ref = isinstance(c, list) and any(
             isinstance(p, dict) and p.get("type") == "image_ref" for p in (c or []))
         if not is_shot and not has_ref:
+            if "ts" in m:
+                m = {k: v for k, v in m.items() if k != "ts"}
             out.append(m)
             continue
         parts: List[dict] = []
@@ -2676,6 +2684,11 @@ HANDOFF_FALLBACK_MAX_CHARS = 20000  # hard cap on the model-free transcript fall
 HANDOFF_RETRY_OVERFLOW   = 3        # halve the history budget this many times when the
                                     # summary request itself is refused as too long
 
+# ── Context compaction (C2/C3): in-place summarization so a turn keeps going ─────
+COMPACTION_MAX_PER_CHAT = 2         # after this many in-place compactions, fall through to the handoff gate
+COMPACTION_MIN_OLD      = 4         # fewer old messages than this -> not worth compacting (split too small)
+COMPACTION_SUMMARY_MAX_TOKENS = 1024   # bound on the compaction summary itself (some servers reject it -> retried without)
+
 
 def _handoff_budget_chars(total_ctx: int) -> int:
     """Char budget for the history included in a handoff request.
@@ -2834,6 +2847,98 @@ def _deterministic_handoff(chat: dict, max_chars: int = HANDOFF_FALLBACK_MAX_CHA
     return "\n".join(parts)
 
 
+# ── Context compaction helpers (C2/C3) ─────────────────────────────────────────
+# A compacted message's content starts with this marker. It is the single source of
+# truth for counting prior compactions (the re-compaction cap) and for the UI to find
+# where to draw the "📦 Context compacted" accordion.
+COMPACTION_MARKER = "[COMPACTED"
+
+
+def _count_compactions(messages: List[dict]) -> int:
+    """How many in-place compactions this chat has already had (C2).
+
+    Counts messages whose content starts with the COMPACTION_MARKER. A re-compaction
+    folds an earlier summary into a newer one, so at most one marker survives per
+    compaction event - counting markers therefore counts events."""
+    n = 0
+    for m in (messages or []):
+        if isinstance(m, dict) and str(m.get("content") or "").startswith(COMPACTION_MARKER):
+            n += 1
+    return n
+
+
+def _compaction_split_index(messages: List[dict], keep_recent: int) -> int:
+    """Index at which to split messages into [old | recent] for compaction (C2).
+
+    We want to keep the last `keep_recent` entries verbatim, but the split must NOT
+    land in the middle of a tool phase: an assistant message carrying tool_calls has
+    to stay together with the tool-result messages that follow it, or the next request
+    would present orphaned tool calls and the server would reject it. So we start at
+    len - keep_recent and walk BACKWARD past any assistant-with-tool_calls (and the
+    results that belong to it) until the message just before the split is clean.
+
+    A second, subtler case: an assistant message may fire SEVERAL tool calls in one
+    parallel phase, producing a run of consecutive `tool` results. If the boundary
+    lands in the middle of that run, the first recent message is a tool result whose
+    owning assistant sits in the OLD half - the next request then presents an orphaned
+    tool_call_id and strict servers reject it. So we also step back over any leading
+    `tool` result (its owner always precedes it, index < idx, so this never drops a
+    still-recent message). The recent tail may therefore keep slightly more than
+    `keep_recent` entries when the trailing tool phase is large - that is deliberate:
+    a valid request beats an exact count.
+    Returns 0 when no safe boundary exists (caller then declines to compact)."""
+    n = len(messages or [])
+    idx = max(0, n - int(keep_recent or 0))
+    while idx > 0:
+        cur = messages[idx]
+        prev = messages[idx - 1]
+        if (isinstance(cur, dict) and cur.get("role") == "tool") or \
+                (isinstance(prev, dict) and prev.get("role") == "assistant"
+                 and prev.get("tool_calls")):
+            idx -= 1
+        else:
+            break
+    return idx
+
+
+def _format_messages_for_compaction(messages: List[dict]) -> str:
+    """Render a slice of chat history as a compact transcript for the summary prompt (C3).
+
+    Tool calls are folded into their assistant line and tool results capped, so a long
+    agentic phase does not blow the summary request's own context. Images become a
+    placeholder (the summary model may be non-vision)."""
+    def _clip(s: str, n: int) -> str:
+        s = str(s or "")
+        return s if len(s) <= n else s[:n] + "…"
+
+    out: List[str] = []
+    for m in (messages or []):
+        if not isinstance(m, dict):
+            continue
+        role = m.get("role", "?")
+        content = str(m.get("content") or "")
+        if role == "assistant":
+            tcs = m.get("tool_calls") or []
+            calls = "; ".join(
+                f"{((tc.get('function') or {}) if isinstance(tc, dict) else {}).get('name', '?')}"
+                f"({_clip(str(((tc.get('function') or {}) if isinstance(tc, dict) else {}).get('arguments', '')), 120)})"
+                for tc in tcs)
+            line = _clip(content.strip(), 400)
+            if calls:
+                line = (line + " ") if line else ""
+                out.append(f"[assistant] {line}\u2192 ran: {calls}")
+            elif line:
+                out.append(f"[assistant] {line}")
+        elif role == "tool":
+            name = str(m.get("name") or "")
+            out.append(f"[tool:{name}] {_clip(content.strip(), 400)}")
+        else:  # user (and anything unexpected)
+            line = _clip(content.strip(), 600)
+            if line:
+                out.append(f"[user] {line}")
+    return "\n".join(out)
+
+
 def is_context_overflow_error(msg: str) -> bool:
     """True when a server error means "the context window is full".
 
@@ -2941,6 +3046,20 @@ def fmt_ctx_used(used: Optional[int], total: Optional[int]) -> str:
     if not t:
         return f"\U0001F4CF {us}"
     return f"\U0001F4CF {us}/{t}"
+
+
+def fmt_msg_time(ts: Optional[str]) -> str:
+    """Format a message timestamp for display in the chat pane.
+
+    Always shows 'Mon DD, YYYY - HH:MM:SS' (e.g. 'Oct 03, 2026 - 00:19:42').
+    Returns '' when ts is missing or unparseable (legacy chats)."""
+    if not ts:
+        return ""
+    try:
+        dt = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return ""
+    return dt.strftime("%b %d, %Y - %H:%M:%S")
 
 
 def session_total_tokens(usage: Optional[dict], full_content: str, full_reasoning: str,
@@ -3578,6 +3697,177 @@ class DeskpilotApp:
         except (TypeError, ValueError):
             return 0
 
+    def _ctx_used_last(self) -> int:
+        """Last server-reported session tokens as seen from a worker thread.
+
+        _ctx_used is main-thread state (set per completed step via _set_ctx_used and reset to
+        0 on a chat switch); read through getattr so half-built instances (tests that skip
+        __init__) never raise AttributeError inside the agentic loop. At turn start this is the
+        PREVIOUS turn's real server figure - the accurate one, unlike estimate_prompt_tokens()
+        which omits the system prompt and tool schemas."""
+        try:
+            return int(getattr(self, "_ctx_used", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    # ── Context compaction (C2/C3): in-place summarization ───────────────────────
+    def _maybe_compact_context(self, chat_id: str, used: int, total: int,
+                               messages: Optional[List[dict]] = None) -> bool:
+        """Summarize the older part of this chat IN PLACE so the turn can keep going.
+
+        Called from the worker at a step boundary, BEFORE the mid-turn handoff gate. When
+        the context gauge crosses `compaction_threshold` and there is enough old history to
+        fold up, the oldest messages are replaced by a single summary message (the recent
+        tail stays verbatim) and the turn continues - no fork, no button, no user action.
+        The original messages are preserved in chat["compaction_archive"] so the user can
+        still read every word in-app (C4).
+
+        `messages` is the worker's LOCAL message list - the very list the agentic loop builds
+        its next request from. Compacting it IN PLACE (`messages[:] = ...`) is what actually
+        frees context for the NEXT request: the persisted chat["messages"] record alone is a
+        copy that the running loop never re-reads, so updating only that (the pre-v1.1.25
+        bug) left the worker sending all the old tokens again and firing a 2nd compaction.
+
+        Returns True when compaction was performed (the caller should continue the turn);
+        False when it declined and the existing handoff gate should run instead. Deliberately
+        inert - no mutation, no summary call - when the feature is off, the gauge is below
+        threshold, the window is unknown, too few messages exist to split, or the per-chat
+        compaction cap has been reached (the 3rd trigger falls through to the handoff gate).
+
+        Runs on the worker thread. It rebinds the caller's LOCAL list in place (a plain local,
+        safe here) and posts ONE callback that mutates chat["compaction_archive"] +
+        chat["messages"] and calls save_chats() on the main thread - the worker never touches
+        self.chats directly (invariant #4). The persist callback reads chat["messages"] LIVE at
+        drain time, so it saves the full local list including any tool results appended after
+        compaction; the queued note is posted AFTER it and renders once the record is current."""
+        if self._closed or self._stop_event.is_set():
+            return False
+        try:
+            threshold = int(float(self.settings.get("compaction_threshold", COMPACTION_THRESHOLD_DEFAULT)))
+        except (TypeError, ValueError):
+            threshold = COMPACTION_THRESHOLD_DEFAULT
+        if threshold <= 0:
+            return False                       # feature explicitly off (Settings -> Compaction threshold % = 0)
+        if total <= 0 or used <= 0:
+            return False                       # no measurable window to gate on (budget ladder owns that path)
+        if (used / total) * 100.0 < float(threshold):
+            return False                       # not yet at the compaction threshold
+        chat = self.chats["chats"].get(chat_id)
+        if not chat:
+            return False
+        if messages is None:                     # defensive default; the agentic loop always passes its local list
+            messages = chat.get("messages") or []
+        # The archive list is the authoritative record of how many times this chat has been
+        # compacted. Counting [COMPACTED markers in live messages would NOT work: each
+        # re-compaction folds the previous summary (and its marker) into the new one, so at
+        # most ONE marker survives no matter how many compactions have already happened.
+        archive = chat.get("compaction_archive")
+        if not isinstance(archive, list):
+            archive = []
+        if len(archive) >= COMPACTION_MAX_PER_CHAT:
+            return False                       # cap reached -> handoff gate (fork) takes over
+        try:
+            keep_recent = int(float(self.settings.get("compaction_keep_recent", COMPACTION_KEEP_RECENT_DEFAULT)))
+        except (TypeError, ValueError):
+            keep_recent = COMPACTION_KEEP_RECENT_DEFAULT
+        split = _compaction_split_index(messages, keep_recent)
+        if split < COMPACTION_MIN_OLD:
+            return False                       # not enough old messages to be worth compacting
+        old_msgs = list(messages[:split])
+        recent_msgs = list(messages[split:])
+        summary_text = self._generate_compaction_summary(old_msgs, chat)
+        if not summary_text:
+            return False                       # nothing usable produced -> let the handoff gate handle it
+        compaction_number = len(archive) + 1
+        marker = f"{COMPACTION_MARKER} \u2014 summary of {len(old_msgs)} earlier messages]"
+        summary_msg = {"role": "user", "content": marker + "\n" + summary_text}
+        # Archive is a LIST (one entry per compaction event, up to COMPACTION_MAX_PER_CHAT):
+        # the user can re-open every original message from in-app (C4), so an earlier
+        # compaction's originals must survive a later one - a single dict would be clobbered.
+        archive.append({
+            "messages": old_msgs,
+            "timestamp": datetime.now().isoformat(),
+            "summary_text": summary_text,
+            "compaction_number": compaction_number,
+        })
+        # Rebind the worker's LOCAL list IN PLACE so the NEXT request in this same loop
+        # carries [summary] + recent instead of the full old history. This is the fix for
+        # the stale-local-list bug: without it the loop kept sending every old token and a
+        # 2nd compaction fired immediately (the gauge never dropped).
+        compacted = [summary_msg] + recent_msgs
+        messages[:] = compacted
+        # Persist on the MAIN thread only (invariant #4: the worker never mutates self.chats,
+        # and the main thread must not read the worker's live list either). Capture a snapshot
+        # of the compacted list HERE on the worker thread; the callback assigns it. The next
+        # _ui_sync_messages() (posted after this) overwrites chat["messages"] with the fuller
+        # post-compaction list, so this save only needs to persist the archive + a consistent
+        # messages snapshot atomically. The note is posted AFTER the persist callback (FIFO
+        # queue) so it renders once the record is current.
+        def _persist_compaction(chat=chat, archive=archive, snap=list(compacted)):
+            chat["compaction_archive"] = archive
+            chat["messages"] = list(snap)
+            save_chats(self.chats)
+        self._post(_persist_compaction)
+        self._post(lambda n=len(old_msgs), k=compaction_number:
+                   self.render_note(f"\U0001F4E6 Context compacted - {n} earlier messages summarized "
+                                    f"(compaction {k}/{COMPACTION_MAX_PER_CHAT}); continuing…"))
+        return True
+
+    def _generate_compaction_summary(self, old_messages: List[dict], chat: dict) -> str:
+        """Produce the summary text for a compaction (C3).
+
+        One non-streaming model call over the transcript of the old messages. On any failure
+        (auth, connection, overflow, empty reply) it falls back to _deterministic_handoff -
+        the existing model-free digest - so a compaction always yields something usable and
+        never strands the turn. A re-compaction (the old slice already holds a summary)
+        tells the model earlier detail may already be folded up."""
+        client = self._get_client()
+        transcript = _format_messages_for_compaction(old_messages)
+        if not transcript.strip():
+            return ""
+        is_recompaction = any(
+            isinstance(m, dict) and str(m.get("content") or "").startswith(COMPACTION_MARKER)
+            for m in old_messages)
+        system = ("You are summarizing a conversation for continuity. Produce a concise summary "
+                  "preserving: key decisions, facts established, file paths mentioned, code changes "
+                  "made, and any open questions. Be specific. No preamble. If tool calls were made, "
+                  "note what was fetched or changed and the key findings - do not include raw output.")
+        if is_recompaction:
+            system += (" Note: this conversation was previously compacted; earlier details may already "
+                       "be summarized. Preserve what you can.")
+        model = (self.settings.get("model_name") or "gpt-4o-mini").strip()
+        kwargs: Dict[str, Any] = dict(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": transcript},
+            ],
+            stream=False,
+            temperature=0.3,      # factual summary - low sampling noise
+            max_tokens=COMPACTION_SUMMARY_MAX_TOKENS,
+        )
+        if client is not None:
+            try:
+                try:
+                    resp = client.chat.completions.create(**kwargs)
+                except Exception as e:
+                    emsg = str(e).lower()
+                    if "max_tokens" in emsg or "max_completion_tokens" in emsg:
+                        kwargs.pop("max_tokens", None)
+                        resp = client.chat.completions.create(**kwargs)
+                    else:
+                        raise
+                summary = (resp.choices[0].message.content or "").strip()
+                if summary:
+                    return summary
+            except Exception as e:
+                self._post(lambda m=str(e)[:200]: self.render_note(
+                    f"\U0001F4E6 Compaction summary unavailable ({m}) - using a deterministic digest…"))
+        # Fallback: model-free digest of the old slice (never blocks, never needs the server).
+        return _deterministic_handoff({"messages": old_messages},
+                                      max(HANDOFF_FALLBACK_MIN_CHARS,
+                                          min(8000, HANDOFF_FALLBACK_MAX_CHARS)))
+
     def _begin_midturn_handoff(self, chat_id: str, used: int, total: int, why: str,
                                force: bool = False) -> bool:
         """Called from the worker at a step boundary: cut this turn short and write
@@ -3969,12 +4259,13 @@ class DeskpilotApp:
                       " the newest note file named above" +
                       ("" if note_paths else " (create one in that folder if none exists)") +
                       " if that folder is writable.")
-        fresh["messages"].append({"role": "user", "content": intro})
+        _intro_ts = datetime.now().isoformat(timespec="seconds")
+        fresh["messages"].append({"role": "user", "content": intro, "ts": _intro_ts})
         base = (src.get("title") or "Session").strip()[:24]
         fresh["title"] = f"Continued: {base}"
         save_chats(self.chats)
         self._refresh_chat_list()
-        self.render_user_message(intro)
+        self.render_user_message(intro, _intro_ts)
         # Files that travel with the handoff are counted; the folder is named in EVERY seeded intro
         # (a chat with no note file yet still needs its destination spelled out), so say "folder only".
         self._set_status("\u2795 New session started from handoff summary - notes " + (
@@ -4289,17 +4580,22 @@ class DeskpilotApp:
         if not msgs:
             self._render_welcome()
         else:
+            _compaction_seq = 0   # 1-based index of the [COMPACTED marker being rendered (C4)
             for m in msgs:
                 if not isinstance(m, dict):
                     continue      # corrupt entry - skip (rendering never raises)
                 role = m.get("role")
+                if role == "user" and str(m.get("content") or "").startswith(COMPACTION_MARKER):
+                    _compaction_seq += 1
+                    self._render_compaction_accordion(chat, _compaction_seq)
+                    continue
                 if role == "user":
-                    self.render_user_message(m.get("content"))
+                    self.render_user_message(m.get("content"), m.get("ts"))
                 elif role == "assistant":
                     content = m.get("content")
                     tcs = m.get("tool_calls") or []
                     if content:
-                        self.render_markdown_full(content)
+                        self.render_markdown_full(content, m.get("ts"))
                     for tc in tcs:
                         try:
                             a = json.loads(tc["function"].get("arguments", "{}") or "{}")
@@ -4494,9 +4790,13 @@ class DeskpilotApp:
     #  RENDERING (main thread only)
     # ════════════════════════════════════════════════════════════════════
 
-    def render_user_message(self, content: Any) -> None:
+    def render_user_message(self, content: Any, ts: Optional[str] = None) -> None:
         self.chat_text.insert("end", "\n")
-        self.chat_text.insert("end", "You\n", ["user_hdr"])
+        self.chat_text.insert("end", "You", ["user_hdr"])
+        t = fmt_msg_time(ts)
+        if t:
+            self.chat_text.insert("end", f"  {t}", ["dim"])
+        self.chat_text.insert("end", "\n")
         if isinstance(content, str):
             render_inline(self.chat_text, content, ["body"])
             self.chat_text.insert("end", "\n")
@@ -4525,10 +4825,14 @@ class DeskpilotApp:
 
         self._autoscroll()
 
-    def render_markdown_full(self, text: str) -> None:
+    def render_markdown_full(self, text: str, ts: Optional[str] = None) -> None:
         """Render a complete markdown document (used when replaying history)."""
         self.chat_text.insert("end", "\n")
-        self.chat_text.insert("end", f"{APP_NAME}\n", ["asst_hdr"])
+        self.chat_text.insert("end", APP_NAME, ["asst_hdr"])
+        t = fmt_msg_time(ts)
+        if t:
+            self.chat_text.insert("end", f"  {t}", ["dim"])
+        self.chat_text.insert("end", "\n")
         md = MarkdownStream(self)
         md.body_tag = "asst_body"                # history replay matches live rendering
         md.feed(text)
@@ -4540,7 +4844,10 @@ class DeskpilotApp:
         self._collapse_reasoning_sections()
         self._reasoning_sid = None
         self.chat_text.insert("end", "\n")
-        self.chat_text.insert("end", f"{APP_NAME}\n", ["asst_hdr"])
+        self.chat_text.insert("end", APP_NAME, ["asst_hdr"])
+        _now_s = datetime.now().strftime("%b %d, %Y - %H:%M:%S")
+        self.chat_text.insert("end", f"  {_now_s}", ["dim"])
+        self.chat_text.insert("end", "\n")
         self._active_md = MarkdownStream(self)
         self._active_md.body_tag = "asst_body"   # responses render bold (LM Studio style)
 
@@ -4700,6 +5007,45 @@ class DeskpilotApp:
         except tk.TclError:
             pass
         self._toggle_accordion(sid)       # collapse (it was expanded while running)
+        self._autoscroll()
+
+    def _render_compaction_accordion(self, chat: dict, compaction_number: int) -> None:
+        """Render a '📦 Context compacted' accordion for one in-place compaction (C4).
+
+        The archived original messages are shown verbatim (role-labelled plain text) inside an
+        elidable body so the user can read every word of what was summarized - the same access
+        they have to any other chat. Collapsed by default. No tag here sets a background (that
+        would hide text selection - see invariants). Plain text rather than nested accordions:
+        nesting live code-copy buttons / tool accordions inside an elided region would shift the
+        stored Tk indices those widgets rely on."""
+        archive = chat.get("compaction_archive") or []
+        entry = next((a for a in archive if isinstance(a, dict)
+                      and int(a.get("compaction_number") or 0) == int(compaction_number)), None)
+        if not entry:
+            return
+        old_msgs = entry.get("messages") or []
+        ts = str(entry.get("timestamp") or "")[:16].replace("T", " ")
+        title = f"\U0001F4E6 Context compacted \u00b7 {len(old_msgs)} messages summarized" + (f" ({ts})" if ts else "")
+        sid = self._add_accordion(title, COL["text_dim"], expanded=False, font=F(11))
+        body_tag = sid + "_body"
+        for m in old_msgs:
+            if not isinstance(m, dict):
+                continue
+            role = m.get("role", "?")
+            content = str(m.get("content") or "")
+            if role == "assistant":
+                tcs = m.get("tool_calls") or []
+                calls = "; ".join(
+                    f"{((tc.get('function') or {}) if isinstance(tc, dict) else {}).get('name', '?')}(...)"
+                    for tc in tcs)
+                label = "[assistant]" + (f" \u2192 ran: {calls}" if calls else "")
+            elif role == "tool":
+                label = f"[tool:{m.get('name') or 'tool'}]"
+            else:
+                label = "[user]"
+            self.chat_text.insert("end", label + "\n", [body_tag, "dim"])
+            if content.strip():
+                self.chat_text.insert("end", content.rstrip() + "\n", [body_tag])
         self._autoscroll()
 
     def _viewing_run_chat(self) -> bool:
@@ -5184,7 +5530,8 @@ class DeskpilotApp:
         if chat is None:                        # fresh launch state: no thread selected yet
             self.new_chat()                    # start a brand-new conversation for this message
             chat = self.current_chat()
-        chat["messages"].append({"role": "user", "content": content})
+        _ts = datetime.now().isoformat(timespec="seconds")
+        chat["messages"].append({"role": "user", "content": content, "ts": _ts})
 
         # auto-title from the first user message
         if chat.get("title") in (None, "", "New Chat"):
@@ -5199,7 +5546,7 @@ class DeskpilotApp:
 
         save_chats(self.chats)
         self._stick_bottom = True   # sending re-engages follow-to-bottom first
-        self.render_user_message(content)
+        self.render_user_message(content, _ts)
 
         self._busy = True
         self._stop_event.clear()
@@ -5309,6 +5656,22 @@ class DeskpilotApp:
 
         while (MAX_TOOL_STEPS == 0 or step < MAX_TOOL_STEPS) and not self._closed \
                 and not self._stop_event.is_set():
+            # ── context compaction (C8 / Option A): pre-request check at turn start ──
+            # The end-of-iteration gate below only fires AFTER a tool phase, so a purely
+            # conversational turn (no tools) never reaches it - and yet the context still
+            # grows across turns. Check here, BEFORE the first request of this prompt: if the
+            # outgoing history already crosses the compaction threshold, summarize it in place
+            # now so the request goes out smaller. Gate on the LARGER of the previous turn's
+            # real server figure (_ctx_used_last) and a char estimate of this outgoing list -
+            # the estimate alone omits the system prompt + tool schemas, so it understates a long
+            # conversational session and the gate would never trip (C10). _ctx_window() is 0 until
+            # /models reports context_length, in which case _maybe_compact_context declines
+            # (total <= 0) and we proceed exactly as before. Only at step == 0: mid-turn growth is
+            # already handled by the end-of-iteration gate, so this must not double-fire within a turn.
+            if step == 0:
+                self._maybe_compact_context(
+                    chat_id, max(estimate_prompt_tokens(messages), self._ctx_used_last()),
+                    self._ctx_window(), messages)
             # ── build request (only tools whose permission ≠ Off) ─────────
             enabled_tools = [s for n, s in TOOL_SCHEMAS.items()
                              if self.settings.get("tool_permissions", {}).get(n, "ask") != "off"]
@@ -5580,7 +5943,8 @@ class DeskpilotApp:
                 # partial reply is persisted as a normal assistant message, so
                 # the next turn can continue from it), skip tool execution.
                 if full_content.strip():
-                    messages.append({"role": "assistant", "content": full_content})
+                    messages.append({"role": "assistant", "content": full_content,
+                                     "ts": datetime.now().isoformat(timespec="seconds")})
                 self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
                 self._post(self._ui_turn_stopped)
                 return
@@ -5623,7 +5987,8 @@ class DeskpilotApp:
 
             if not tool_calls:
                 # ── final answer → persist + finish ───────────────────────
-                messages.append({"role": "assistant", "content": full_content})
+                messages.append({"role": "assistant", "content": full_content,
+                                 "ts": datetime.now().isoformat(timespec="seconds")})
                 self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
                 if not full_content.strip():
                     self._post(lambda: self.render_note("(model returned an empty response)"))
@@ -5633,7 +5998,8 @@ class DeskpilotApp:
             # ── tool phase: record assistant msg, execute each call ───────
             tool_phase_start = len(messages)   # rollback point if the user stops mid-phase
             messages.append({"role": "assistant", "content": full_content or None,
-                             "tool_calls": tool_calls})
+                             "tool_calls": tool_calls,
+                             "ts": datetime.now().isoformat(timespec="seconds")})
 
             for tc in tool_calls:
                 if self._closed or self._stop_event.is_set():
@@ -5706,9 +6072,16 @@ class DeskpilotApp:
             # only ever a lower bound here, and _begin_midturn_handoff() still refuses to act
             # when the server reports no context size (no guessing).
             _gate_used = max(int(tot or 0), estimate_prompt_tokens(messages))
-            if self._begin_midturn_handoff(chat_id, _gate_used, self._ctx_window(),
-                                           "the agentic loop is still running"):
-                return
+            # ── context compaction (C5): try to free space IN PLACE before forking ──
+            # If the gauge crossed the compaction threshold and there is enough old history,
+            # summarize it in place and CONTINUE the turn - no fork, no button, no user
+            # action. When _maybe_compact_context() declines (feature off / below threshold /
+            # no measurable window / too few messages / per-chat cap reached) it returns False
+            # with NO mutation, so the existing handoff gate below runs exactly as before.
+            if not self._maybe_compact_context(chat_id, _gate_used, self._ctx_window(), messages):
+                if self._begin_midturn_handoff(chat_id, _gate_used, self._ctx_window(),
+                                               "the agentic loop is still running"):
+                    return
 
             step += 1
 
@@ -7179,6 +7552,8 @@ class DeskpilotApp:
             ("Handoff threshold % (auto-summary at this context usage; 0 = off)", "handoff_threshold_pct"),
             ("Handoff re-arm % (grow this much more before summarizing again; 0 = every step)", "handoff_rearm_pct"),
             ("Handoff notes folder (blank = app working folder; one file per handoff)", "handoff_notes_dir"),
+            ("Compaction threshold % (summarize old messages in-place at this usage; keep <= Handoff threshold so it fires first; 0 = off)", "compaction_threshold"),
+            ("Compaction keep-recent (most recent messages kept verbatim when compacting)", "compaction_keep_recent"),
             ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (metered; blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
@@ -7632,6 +8007,19 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 hr = HANDOFF_REARM_PCT_DEFAULT
             self.settings["handoff_rearm_pct"] = max(0, min(100, hr))
+            # Compaction threshold: numeric percent, clamped to 0..95 (invalid -> default).
+            # Capped at 95 so the summary call itself always fits in the remaining window.
+            try:
+                ct = int(float(self.settings.get("compaction_threshold", COMPACTION_THRESHOLD_DEFAULT)))
+            except (TypeError, ValueError):
+                ct = COMPACTION_THRESHOLD_DEFAULT
+            self.settings["compaction_threshold"] = max(0, min(95, ct))
+            # Compaction keep-recent: message count, clamped to 2..50 (invalid -> default).
+            try:
+                ck = int(float(self.settings.get("compaction_keep_recent", COMPACTION_KEEP_RECENT_DEFAULT)))
+            except (TypeError, ValueError):
+                ck = COMPACTION_KEEP_RECENT_DEFAULT
+            self.settings["compaction_keep_recent"] = max(2, min(50, ck))
             # Sampling: coerce + clamp each field; blank/garbage -> "" (key omitted from requests).
             _samp: Dict[str, Any] = {}
             for _sk, _sl, _lo, _hi, _si, _st, _so in SAMPLING_SCHEMA:
