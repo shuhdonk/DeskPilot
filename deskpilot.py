@@ -5116,6 +5116,18 @@ class DeskpilotApp:
             return
         expanded = not info["expanded"]
         info["expanded"] = expanded
+        # An archive drawer's open/closed state also lives in _archive_expanded
+        # (which decides whether the body is RENDERED on the next load). Collapsing
+        # here is elide-only, so the tracker must be updated too - otherwise the
+        # drawer would "forget" it was collapsed and re-render expanded on return.
+        arch = info.get("archive")
+        if arch:
+            _ac, _an = arch
+            _opened = self._archive_expanded.setdefault(_ac, set())
+            if expanded:
+                _opened.add(_an)
+            else:
+                _opened.discard(_an)
         # elide=True hides the body text while keeping the layout stable
         self.chat_text.tag_configure(info["body_tag"], elide=not expanded)
         # swap ▶ / ▼ (both exactly 2 chars → no index shift anywhere)
@@ -5253,6 +5265,10 @@ class DeskpilotApp:
         title = f"\U0001F4E6 Context compacted \u00b7 {len(old_msgs)} messages summarized" + (f" ({ts})" if ts else "")
         expanded = compaction_number in self._archive_expanded.get(cid or "", set())
         sid = self._add_accordion(title, COL["text_dim"], expanded=expanded, font=F(11))
+        if cid:
+            # Marks this drawer as archive-backed so _toggle_accordion keeps
+            # _archive_expanded in sync when the body is collapsed by elide.
+            self._accordions[sid]["archive"] = (cid, compaction_number)
         if not expanded:
             # Body not rendered: clicking re-renders the view WITH the body.
             try:
