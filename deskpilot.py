@@ -49,6 +49,8 @@
             Pillow              → screen-capture tool
             kokoro-onnx         → text-to-speech (+ sounddevice, numpy)
             SpeechRecognition   → microphone dictation (+ PyAudio)
+            faster-whisper      → local (on-machine) dictation; uses the GPU
+                                  when nvidia-cublas-cu12 is present, else CPU
 
  RUN
  ───
@@ -137,24 +139,33 @@ WHISPER_CPU_MODEL_NAME = "base.en"      # CPU model: large-v3-turbo is far too h
 _WHISPER_DEVICE_LABEL = "local"         # set once loaded: "GPU" / "CPU" (shown in the mic status)
 
 def _ensure_cublas_on_path() -> bool:
-    """Make cuBLAS DLLs findable by ctranslate2; True only if they were located.
+    """Make cuBLAS findable by ctranslate2; True only if it was located.
 
-    ctranslate2 imports cublas64_12.dll (which in turn needs cublasLt64_12.dll),
-    but does not know that `pip install nvidia-cublas-cu12` put them under
-    site-packages/nvidia/cublas/bin. Without this the model loads on "cuda" and
-    then fails on the first phrase.
+    ctranslate2 needs cublas (cublas64_12.dll on Windows, libcublas.so.12 on
+    Linux; cublas also needs cublasLt) at model-creation time, but does not know
+    that `pip install nvidia-cublas-cu12` put them under
+    site-packages/nvidia/cublas/{bin,lib}. Without this the model loads on
+    "cuda" and then fails on the first phrase.
 
     Probe order (first hit wins):
       1. site-packages            - running from Python, or a build that collected them
       2. sys._MEIPASS / BASE_DIR  - DLLs bundled inside a onefile exe
       3. next to the exe          - DLLs copied into <exe dir>/nvidia/cublas/bin
                                     (keeps the onefile exe small: cuBLAS is ~736 MB)
-      4. the system Python's site-packages, discovered via
+      4. (Windows) the system Python's site-packages, discovered via
          %LOCALAPPDATA%/Programs/Python/* - lets a frozen exe reuse a
          machine-wide cuBLAS install
+      5. (Linux) the system loader - a CUDA toolkit installed distro-wide is
+         already resolvable by dlopen, so no path fix is needed
+
+    Windows and Linux resolve libraries differently, so the mechanism differs:
+    Windows uses add_dll_directory + PATH; Linux ignores both for dlopen and
+    needs LD_LIBRARY_PATH plus an explicit pre-load (setting the env var alone
+    is too late for an already-running process, hence the CDLL call).
     """
     import os as _os
     import glob as _glob
+    is_win = sys.platform == "win32"
     try:
         import site
         roots = list(site.getsitepackages()) + [site.getusersitepackages()]
@@ -164,23 +175,52 @@ def _ensure_cublas_on_path() -> bool:
         if extra:
             roots.append(extra)
     # frozen builds have no site-packages of their own; fall back to a system install
-    try:
-        roots += _glob.glob(str(Path(_os.environ.get("LOCALAPPDATA", "")) /
-                              "Programs" / "Python" / "*" / "Lib" / "site-packages"))
-    except Exception:
-        pass
+    if is_win:
+        try:
+            roots += _glob.glob(str(Path(_os.environ.get("LOCALAPPDATA", "")) /
+                                  "Programs" / "Python" / "*" / "Lib" / "site-packages"))
+        except Exception:
+            pass
+    # the nvidia wheels ship DLLs under .../bin on Windows and .so files under .../lib
+    sub = "bin" if is_win else "lib"
     found = False
     for r in roots:
-        for sub in ("nvidia/cublas/bin", "nvidia/cudnn/bin", "nvidia/cuda_nvrtc/bin"):
-            d = _os.path.join(r, *sub.split("/"))
-            if _os.path.isdir(d):
+        for pkg in ("cublas", "cudnn", "cuda_nvrtc"):
+            d = _os.path.join(r, "nvidia", pkg, sub)
+            if not _os.path.isdir(d):
+                continue
+            if is_win:
                 try:
-                    _os.add_dll_directory(d)          # Windows 3.8+; ignored elsewhere
+                    _os.add_dll_directory(d)          # Windows 3.8+
                 except (AttributeError, OSError):
                     pass
                 _os.environ["PATH"] = d + _os.pathsep + _os.environ.get("PATH", "")
-                if sub.endswith("cublas/bin"):
-                    found = True
+            else:
+                lp = [p for p in _os.environ.get("LD_LIBRARY_PATH", "").split(_os.pathsep) if p]
+                if d not in lp:
+                    _os.environ["LD_LIBRARY_PATH"] = _os.pathsep.join([d] + lp)
+                # glibc snapshots LD_LIBRARY_PATH at process start, so changing it
+                # here does NOT affect later dlopen() calls. Pre-loading by full
+                # path is what actually makes the libs resolvable; cublasLt must
+                # go first because libcublas.so.12 depends on it, and cuDNN is
+                # needed by Whisper's convolutional layers.
+                for so in ("libcublasLt.so.12", "libcublas.so.12",
+                           "libcudnn.so.9", "libcudnn_cnn.so.9", "libcudnn_ops.so.9"):
+                    p = _os.path.join(d, so)
+                    if _os.path.exists(p):
+                        try:
+                            ctypes.CDLL(p, mode=ctypes.RTLD_GLOBAL)
+                        except OSError:
+                            pass        # missing/partial dir: the probe below decides
+            if pkg == "cublas":
+                found = True
+    if not found and not is_win:
+        # CUDA installed via the distro package manager: already dlopen-able.
+        try:
+            ctypes.CDLL("libcublas.so.12", mode=ctypes.RTLD_GLOBAL)
+            found = True
+        except OSError:
+            pass
     return found
 
 def _whisper_device():
@@ -682,7 +722,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.38"
+VERSION    = "1.1.39"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
