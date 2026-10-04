@@ -603,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.32"
+VERSION    = "1.1.33"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -2724,8 +2724,12 @@ HANDOFF_FALLBACK_MAX_CHARS = 20000  # hard cap on the model-free transcript fall
 HANDOFF_RETRY_OVERFLOW   = 3        # halve the history budget this many times when the
                                     # summary request itself is refused as too long
 
+HANDOFF_RECENT_PROMPTS   = 10       # last N REAL user prompts copied VERBATIM into every note
+HANDOFF_PROMPT_MAX_CHARS = 700      # per-prompt cap there (a pasted file must not flood the note)
+
 # ── Context compaction (C2/C3): in-place summarization so a turn keeps going ─────
-COMPACTION_MAX_PER_CHAT = 2         # after this many in-place compactions, fall through to the handoff gate
+# v1.1.33: the old COMPACTION_MAX_PER_CHAT cap is GONE. Compaction re-arms as many times as
+# the gauge demands; chat["compaction_archive"] stays the authoritative record of every event.
 COMPACTION_MIN_OLD      = 4         # fewer old messages than this -> not worth compacting (split too small)
 COMPACTION_SUMMARY_MAX_TOKENS = 1024   # bound on the compaction summary itself (some servers reject it -> retried without)
 
@@ -2769,6 +2773,43 @@ def _flatten_handoff_content(m: dict) -> Optional[str]:
                 parts.append(HANDOFF_IMAGE_PLACEHOLDER)
         return "\n".join(x for x in parts if x) or None
     return c
+
+
+def _is_synthetic_prompt(text: str) -> bool:
+    """A "user" message the user never typed: a compaction marker/summary, or the intro a
+    handoff seeds into a continued session. Neither is a real prompt, so neither belongs in
+    the note's prompt log."""
+    t = (text or "").lstrip()
+    return t.startswith(COMPACTION_MARKER) or t.startswith(SESSION_HANDOFF_MARKER)
+
+
+
+def _recent_prompts_section(messages: List[dict],
+                            limit: int = HANDOFF_RECENT_PROMPTS) -> str:
+    """Markdown section with the chat's most recent REAL user prompts, VERBATIM.
+
+    A summary is what the model chose to remember; the prompts are what the user actually
+    asked, in their own words - the most reliable record of intent for the session that
+    continues this chat. Chronological (oldest first), newest prompts always kept, each one
+    length-capped so a pasted file cannot flood the note. "" when there is nothing to say."""
+    prompts: List[str] = []
+    for m in messages or []:
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = (_flatten_handoff_content(m) or "").strip()
+        if not c or _is_synthetic_prompt(c):
+            continue
+        if len(c) > HANDOFF_PROMPT_MAX_CHARS:
+            c = c[:HANDOFF_PROMPT_MAX_CHARS].rstrip() + " [\u2026truncated]"
+        prompts.append(c)
+    if not prompts:
+        return ""
+    picked = prompts[-max(1, int(limit)):] if limit else prompts
+    out = ("\n\n## Recent prompts (verbatim, oldest first - last "
+           f"{len(picked)} of {len(prompts)})\n")
+    for i, p in enumerate(picked, 1):
+        out += f"{i}. {p}\n"
+    return out
 
 
 def _sanitize_for_handoff(messages: List[dict]) -> List[dict]:
@@ -2891,7 +2932,8 @@ def _deterministic_handoff(chat: dict, max_chars: int = HANDOFF_FALLBACK_MAX_CHA
 # A compacted message's content starts with this marker. It is the single source of
 # truth for counting prior compactions (the re-compaction cap) and for the UI to find
 # where to draw the "📦 Context compacted" accordion.
-COMPACTION_MARKER = "[COMPACTED"
+COMPACTION_MARKER = "[COMPACTED"
+SESSION_HANDOFF_MARKER = "[Session Handoff]"   # intro a handoff seeds into a continued session
 
 
 def _count_compactions(messages: List[dict]) -> int:
@@ -3768,7 +3810,7 @@ class DeskpilotApp:
         False when it declined and the existing handoff gate should run instead. Deliberately
         inert - no mutation, no summary call - when the feature is off, the gauge is below
         threshold, the window is unknown, too few messages exist to split, or the per-chat
-        compaction cap has been reached (the 3rd trigger falls through to the handoff gate).
+        there is no per-chat compaction cap any more (removed in v1.1.33).
 
         Runs on the worker thread. It rebinds the caller's LOCAL list in place (a plain local,
         safe here) and posts ONE callback that mutates chat["compaction_archive"] +
@@ -3800,8 +3842,8 @@ class DeskpilotApp:
         archive = chat.get("compaction_archive")
         if not isinstance(archive, list):
             archive = []
-        if len(archive) >= COMPACTION_MAX_PER_CHAT:
-            return False                       # cap reached -> handoff gate (fork) takes over
+        # v1.1.33: no cap. A chat may be compacted as many times as its gauge fills; the
+        # handoff gate (fork) still runs downstream, but only when compaction declines.
         try:
             keep_recent = int(float(self.settings.get("compaction_keep_recent", COMPACTION_KEEP_RECENT_DEFAULT)))
         except (TypeError, ValueError):
@@ -3821,7 +3863,7 @@ class DeskpilotApp:
         compaction_number = len(archive) + 1
         marker = f"{COMPACTION_MARKER} \u2014 summary of {len(old_msgs)} earlier messages]"
         summary_msg = {"role": "user", "content": marker + "\n" + summary_text}
-        # Archive is a LIST (one entry per compaction event, up to COMPACTION_MAX_PER_CHAT):
+        # Archive is a LIST (one entry per compaction event - unlimited since v1.1.33):
         # the user can re-open every original message from in-app (C4), so an earlier
         # compaction's originals must survive a later one - a single dict would be clobbered.
         archive.append({
@@ -3850,7 +3892,7 @@ class DeskpilotApp:
         self._post(_persist_compaction)
         self._post(lambda n=len(old_msgs), k=compaction_number:
                    self.render_note(f"\U0001F4E6 Context compacted - {n} earlier messages summarized "
-                                    f"(compaction {k}/{COMPACTION_MAX_PER_CHAT}); continuing…"))
+                                    f"(compaction {k}); continuing…"))
         return True
 
     def _generate_compaction_summary(self, old_messages: List[dict], chat: dict) -> str:
@@ -4129,7 +4171,8 @@ class DeskpilotApp:
                 fp = _handoff_note_path(notes_dir, chat_id, title)
                 header = _handoff_header(title, used_at, total_at,
                                          _handoff_threshold_pct(self.settings), chat_id, prev)
-                _atomic_write(fp, header + summary + "\n")
+                _atomic_write(fp, header + summary
+                                + _recent_prompts_section(sanitized) + "\n")
                 file_path = str(fp)
         except Exception:
             pass
@@ -4268,14 +4311,27 @@ class DeskpilotApp:
         fresh = self.current_chat()
         if fresh is None:
             return
+
+        # v1.1.33: sampling carries over with the handoff. A continued session is the SAME
+        # work in a new chat, so it must not silently drop back to TEMP_DEFAULT and the
+        # default thinking level mid-task. new_chat() already consumed any welcome-state
+        # _pending_* values and synced the combos from the blank chat, so re-sync after
+        # the copy (the half-built test app has no combos - guard on the widget).
+        for _k in ("temperature", "thinking"):
+            if src.get(_k) not in (None, ""):
+                fresh[_k] = src[_k]
+        if getattr(self, "temp_combo", None) is not None:
+            self._sync_temp_combo(fresh)
+            self._sync_thinking_combo(fresh)
+            self._update_temp_topbar()
         if summary:
-            intro = ("[Session Handoff] The previous session reached its context limit. "
+            intro = (SESSION_HANDOFF_MARKER + " The previous session reached its context limit. "
                      "Here is a summary of the work so far - continue from here:\n\n" + summary)
         else:
             # Notes-only handoff (the condensed summary is gone, e.g. a chat record written before
             # summaries were persisted): announce that plainly instead of promising a summary that is
             # not there, and point at the notes as the only record.
-            intro = ("[Session Handoff] The previous session reached its context limit. Its condensed"
+            intro = (SESSION_HANDOFF_MARKER + " The previous session reached its context limit. Its condensed"
                      " summary is unavailable, so the handoff notes below are the ONLY record of the"
                      " work done so far - read them before continuing.")
         # v1.1.10: the notes FOLDER and this chat's newest note files travel WITH the summary, so
