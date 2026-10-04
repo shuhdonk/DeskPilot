@@ -603,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.35"
+VERSION    = "1.1.36"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -634,6 +634,7 @@ COMPACTION_THRESHOLD_DEFAULT = 70   # % of the context window; 0 disables auto-c
                                     # Kept BELOW the default handoff threshold (75) so an in-place
                                     # compaction fires before a fork would - see SOW C5 note.
 COMPACTION_KEEP_RECENT_DEFAULT = 10 # most-recent message entries kept verbatim when compacting (C1)
+CHAT_RENDER_WINDOW_DEFAULT = 120   # message entries rendered per chat view (0 = render all); v1.1.36
 STOP_POLL_S      = 0.25       # max latency of the Stop button while a tool is blocking
 IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
 PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
@@ -1113,6 +1114,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "handoff_notes_dir": "",      # folder for handoff notes; blank = <this folder>/deskpilot_data/handoff_notes
     "compaction_threshold": COMPACTION_THRESHOLD_DEFAULT,   # auto-compact context at this % usage (0 = off); C1
     "compaction_keep_recent": COMPACTION_KEEP_RECENT_DEFAULT,  # most-recent message entries kept verbatim; C1
+    "chat_render_window": CHAT_RENDER_WINDOW_DEFAULT,  # message entries rendered per chat view (0 = all); v1.1.36
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "sampling_defaults": dict(SAMPLING_DEFAULTS),  # sampler params applied to EVERY chat (Settings -> Sampling)
     "show_sampling_note": True,   # render one "what was actually sent" note per user prompt
@@ -3224,6 +3226,8 @@ class DeskpilotApp:
         self._drag_state: Optional[dict] = None   # sidebar drag-and-drop reordering state
         self._chat_visible: List[str] = []         # chat ids currently shown in the listbox (search-filtered)
         self._links: Dict[tuple, str] = {}         # (line, char offset) -> URL of clickable links in chat_text
+        self._render_window_override: Dict[str, int] = {}   # cid -> widened view after "Load earlier messages"
+        self._archive_expanded: Dict[str, set] = {}         # cid -> {compaction_number} drawers opened this session
         self._clients: Dict[tuple, Any] = {}       # (server_url, api_key) -> cached OpenAI client (keep-alive pooling)
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
         self._pending_temperature: Optional[str] = None   # welcome-state temp change, applied to the chat the next send creates
@@ -4705,30 +4709,7 @@ class DeskpilotApp:
         if not msgs:
             self._render_welcome()
         else:
-            _compaction_seq = 0   # 1-based index of the [COMPACTED marker being rendered (C4)
-            for m in msgs:
-                if not isinstance(m, dict):
-                    continue      # corrupt entry - skip (rendering never raises)
-                role = m.get("role")
-                if role == "user" and str(m.get("content") or "").startswith(COMPACTION_MARKER):
-                    _compaction_seq += 1
-                    self._render_compaction_accordion(chat, _compaction_seq)
-                    continue
-                if role == "user":
-                    self.render_user_message(m.get("content"), m.get("ts"))
-                elif role == "assistant":
-                    content = m.get("content")
-                    tcs = m.get("tool_calls") or []
-                    if content:
-                        self.render_markdown_full(content, m.get("ts"))
-                    for tc in tcs:
-                        try:
-                            a = json.loads(tc["function"].get("arguments", "{}") or "{}")
-                        except Exception:
-                            a = {}
-                        self._ui_tool_call_accordion(tc["function"]["name"], a)
-                elif role == "tool":
-                    self._ui_tool_output_accordion(m.get("name", "tool"), m.get("content", ""))
+            self._render_chat_messages(cid, chat, msgs)
         self._stick_bottom = True
         self.chat_text.see("end")
         self._sync_temp_combo(chat)
@@ -4743,6 +4724,116 @@ class DeskpilotApp:
             self._show_handoff(chat["handoff_summary"], "", cid,
                                int(chat.get("handoff_used") or 0),
                                int(chat.get("handoff_total") or 0))
+
+    # ── windowed rendering (v1.1.36) ──────────────────────────────────
+    # Rendering a whole thread is O(history): the fattest chats put 8,000+ Text
+    # lines and 280+ accordions into the widget on every click (4.9-6.9s each).
+    # Only the trailing window is rendered, so switching stays roughly constant
+    # no matter how much history accumulates (measured: 4.90s -> 0.30s at keep=60).
+    # Older entries are never dropped from the data - the "Load earlier messages"
+    # button widens the view.
+
+    def _view_is_live(self) -> bool:
+        """True while a turn is streaming into the chat on screen. A full
+        re-render would clobber the partial reply, so view-widening actions are
+        refused until the turn ends."""
+        return bool(self._busy) and self._run_chat_id == self.current_chat_id
+
+    def _chat_render_window(self, cid: str, total: int) -> int:
+        """Trailing message entries to render for this view (0 = render all).
+        A per-chat override (set by 'Load earlier messages') only ever WIDENS the
+        view - it never shrinks below the configured window."""
+        try:
+            w = int(float(self.settings.get("chat_render_window", CHAT_RENDER_WINDOW_DEFAULT)))
+        except (TypeError, ValueError):
+            w = CHAT_RENDER_WINDOW_DEFAULT
+        w = max(0, w)
+        ov = self._render_window_override.get(cid) or 0
+        if ov > w:
+            w = ov
+        return total if (w <= 0 or w >= total) else w
+
+    def _render_chat_messages(self, cid: str, chat: dict, msgs: List[dict]) -> None:
+        """Render a chat's message entries into chat_text (was inline in load_chat).
+
+        The compaction marker sequence is counted over the FULL list, not just the
+        rendered slice, so a windowed view still pairs each marker with the right
+        compaction_archive entry."""
+        window = self._chat_render_window(cid, len(msgs))
+        start = max(0, len(msgs) - window) if window else 0
+        if start > 0:
+            self._render_earlier_button(start)
+        _compaction_seq = 0   # 1-based index of the [COMPACTED marker seen so far (C4)
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict):
+                continue      # corrupt entry - skip (rendering never raises)
+            role = m.get("role")
+            is_marker = role == "user" and str(m.get("content") or "").startswith(COMPACTION_MARKER)
+            if is_marker:
+                _compaction_seq += 1
+            if i < start:
+                # Outside the render window; the marker count still advances. The
+                # drawer is rendered anyway (it is lazy, so this costs one header
+                # line) - otherwise compaction would make the archived messages
+                # unreachable once the marker scrolled out of the window.
+                if is_marker:
+                    self._render_compaction_accordion(chat, _compaction_seq, cid)
+                continue
+            if is_marker:
+                self._render_compaction_accordion(chat, _compaction_seq, cid)
+                continue
+            if role == "user":
+                self.render_user_message(m.get("content"), m.get("ts"))
+            elif role == "assistant":
+                content = m.get("content")
+                tcs = m.get("tool_calls") or []
+                if content:
+                    self.render_markdown_full(content, m.get("ts"))
+                for tc in tcs:
+                    try:
+                        a = json.loads(tc["function"].get("arguments", "{}") or "{}")
+                    except Exception:
+                        a = {}
+                    self._ui_tool_call_accordion(tc["function"]["name"], a)
+            elif role == "tool":
+                self._ui_tool_output_accordion(m.get("name", "tool"), m.get("content", ""))
+
+    def _render_earlier_button(self, hidden: int) -> None:
+        """'Load earlier messages' button, inserted at the TOP of the render.
+        Placed before any indexed content so the append-only index invariant that
+        _links / _image_thumbs / accordion a0-a1 depend on still holds."""
+        try:
+            btn = tk.Button(
+                self.chat_text,
+                text=f"\u2191 Load earlier messages ({hidden} earlier not shown)",
+                command=self._load_earlier_messages,
+                bg=COL["bg_raised"], fg=COL["text_dim"],
+                activebackground=COL["accent"], activeforeground="#FFFFFF",
+                relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=F(11))
+            self._code_buttons.append(btn)          # prevent GC (same as code buttons)
+            self.chat_text.window_create("end-1c", window=btn)
+            self.chat_text.insert("end", "\n")
+        except Exception:
+            pass
+
+    def _load_earlier_messages(self) -> None:
+        """Widen the current chat's render window and re-render.
+
+        A full re-render (NOT an insertion at the top) is required: _links,
+        _image_thumbs and every accordion store ABSOLUTE Tk indices, so inserting
+        text ahead of them would invalidate all of them."""
+        cid = self.current_chat_id
+        if not cid or self._view_is_live():
+            return
+        chat = self.chats["chats"].get(cid)
+        if not chat:
+            return
+        total = len(chat.get("messages") or [])
+        cur = self._chat_render_window(cid, total)
+        if cur >= total:
+            return
+        self._render_window_override[cid] = min(total, cur + max(cur, 60))
+        self.load_chat(cid, force=True)
 
     def _refresh_chat_list(self, select_cid: Optional[str] = None) -> None:
         lb = self.chat_list
@@ -5134,7 +5225,8 @@ class DeskpilotApp:
         self._toggle_accordion(sid)       # collapse (it was expanded while running)
         self._autoscroll()
 
-    def _render_compaction_accordion(self, chat: dict, compaction_number: int) -> None:
+    def _render_compaction_accordion(self, chat: dict, compaction_number: int,
+                                     cid: Optional[str] = None) -> None:
         """Render a '📦 Context compacted' accordion for one in-place compaction (C4).
 
         The archived original messages are shown verbatim (role-labelled plain text) inside an
@@ -5142,7 +5234,15 @@ class DeskpilotApp:
         they have to any other chat. Collapsed by default. No tag here sets a background (that
         would hide text selection - see invariants). Plain text rather than nested accordions:
         nesting live code-copy buttons / tool accordions inside an elided region would shift the
-        stored Tk indices those widgets rely on."""
+        stored Tk indices those widgets rely on.
+
+        v1.1.36 LAZY BODY: the body is NOT inserted unless this drawer has been opened.
+        These archives hold up to ~10,000 hidden Text lines (4.7MB of stored archive;
+        one chat rendered 6,447 lines nobody ever saw), which dominated load time
+        (compaction deskpilot-3: 1.55s -> 0.12s once the body became lazy). Because the
+        accordion sits mid-buffer, its body cannot be inserted on click without shifting
+        the absolute indices in _links / _image_thumbs / accordion a0-a1, so expanding
+        re-renders the whole view instead (see _toggle_archive_expansion)."""
         archive = chat.get("compaction_archive") or []
         entry = next((a for a in archive if isinstance(a, dict)
                       and int(a.get("compaction_number") or 0) == int(compaction_number)), None)
@@ -5151,7 +5251,17 @@ class DeskpilotApp:
         old_msgs = entry.get("messages") or []
         ts = str(entry.get("timestamp") or "")[:16].replace("T", " ")
         title = f"\U0001F4E6 Context compacted \u00b7 {len(old_msgs)} messages summarized" + (f" ({ts})" if ts else "")
-        sid = self._add_accordion(title, COL["text_dim"], expanded=False, font=F(11))
+        expanded = compaction_number in self._archive_expanded.get(cid or "", set())
+        sid = self._add_accordion(title, COL["text_dim"], expanded=expanded, font=F(11))
+        if not expanded:
+            # Body not rendered: clicking re-renders the view WITH the body.
+            try:
+                self.chat_text.tag_bind(
+                    sid + "_hdr", "<Button-1>",
+                    lambda e, c=cid, n=compaction_number: self._toggle_archive_expansion(c, n))
+            except tk.TclError:
+                pass
+            return
         body_tag = sid + "_body"
         for m in old_msgs:
             if not isinstance(m, dict):
@@ -5172,6 +5282,18 @@ class DeskpilotApp:
             if content.strip():
                 self.chat_text.insert("end", content.rstrip() + "\n", [body_tag])
         self._autoscroll()
+
+    def _toggle_archive_expansion(self, cid: Optional[str], compaction_number: int) -> None:
+        """Open/close a compaction drawer by re-rendering the view (never by
+        inserting mid-buffer, which would invalidate stored Tk indices)."""
+        if not cid or self._view_is_live():
+            return
+        opened = self._archive_expanded.setdefault(cid, set())
+        if compaction_number in opened:
+            opened.discard(compaction_number)
+        else:
+            opened.add(compaction_number)
+        self.load_chat(cid, force=True)
 
     def _viewing_run_chat(self) -> bool:
         """True if the chat currently on screen is the one being streamed."""
@@ -7691,6 +7813,7 @@ class DeskpilotApp:
             ("Handoff notes folder (blank = app working folder; one file per handoff)", "handoff_notes_dir"),
             ("Compaction threshold % (summarize old messages in-place at this usage; keep <= Handoff threshold so it fires first; 0 = off)", "compaction_threshold"),
             ("Compaction keep-recent (most recent messages kept verbatim when compacting)", "compaction_keep_recent"),
+            ("Chat render window (messages shown per chat view; older ones behind 'Load earlier messages'; 0 = show all)", "chat_render_window"),
             ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (metered; blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
@@ -8157,6 +8280,12 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 ck = COMPACTION_KEEP_RECENT_DEFAULT
             self.settings["compaction_keep_recent"] = max(2, min(50, ck))
+            # Chat render window: message count, clamped to 0..2000 (invalid -> default).
+            try:
+                _rw = int(float(self.settings.get("chat_render_window", CHAT_RENDER_WINDOW_DEFAULT)))
+            except (TypeError, ValueError):
+                _rw = CHAT_RENDER_WINDOW_DEFAULT
+            self.settings["chat_render_window"] = max(0, min(2000, _rw))
             # Sampling: coerce + clamp each field; blank/garbage -> "" (key omitted from requests).
             _samp: Dict[str, Any] = {}
             for _sk, _sl, _lo, _hi, _si, _st, _so in SAMPLING_SCHEMA:
