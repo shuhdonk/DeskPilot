@@ -20,6 +20,7 @@
       exa_search            – Exa neural web search (api.exa.ai; key in Settings)
       firecrawl_scrape      – Firecrawl scrape to markdown (metered; key in Settings)
      fetch_url             – retrieves + cleans raw text from a webpage
+                         (Reddit URLs are read via Reddit's public Atom feed)
      run_javascript        – Node.js via hidden subprocess, 60 s timeout
      list_directory        – folder contents (folders first, size + modified time)
      search_files          – bounded grep over files/dirs (locate before reading)
@@ -82,6 +83,7 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -130,14 +132,80 @@ except Exception:            # pragma: no cover
 # ---------------------------------------------------------------------------
 _WHISPER_MODEL = None           # loaded singleton (preloaded at mic start, or lazily on first phrase)
 _WHISPER_LOCK = threading.Lock()   # guards the load so preload + first phrase can't double-load
-WHISPER_MODEL_NAME = "base.en"  # small + fast on CPU int8; tiny.en / small.en also work
+WHISPER_MODEL_NAME = "large-v3-turbo"   # GPU model: ~3x more accurate than base.en AND faster on a GPU
+WHISPER_CPU_MODEL_NAME = "base.en"      # CPU model: large-v3-turbo is far too heavy to load/run on CPU
+_WHISPER_DEVICE_LABEL = "local"         # set once loaded: "GPU" / "CPU" (shown in the mic status)
+
+def _ensure_cublas_on_path() -> bool:
+    """Make cuBLAS DLLs findable by ctranslate2; True only if they were located.
+
+    ctranslate2 imports cublas64_12.dll (which in turn needs cublasLt64_12.dll),
+    but does not know that `pip install nvidia-cublas-cu12` put them under
+    site-packages/nvidia/cublas/bin. Without this the model loads on "cuda" and
+    then fails on the first phrase.
+
+    Probe order (first hit wins):
+      1. site-packages            - running from Python, or a build that collected them
+      2. sys._MEIPASS / BASE_DIR  - DLLs bundled inside a onefile exe
+      3. next to the exe          - DLLs copied into <exe dir>/nvidia/cublas/bin
+                                    (keeps the onefile exe small: cuBLAS is ~736 MB)
+      4. the system Python's site-packages, discovered via
+         %LOCALAPPDATA%/Programs/Python/* - lets a frozen exe reuse a
+         machine-wide cuBLAS install
+    """
+    import os as _os
+    import glob as _glob
+    try:
+        import site
+        roots = list(site.getsitepackages()) + [site.getusersitepackages()]
+    except Exception:
+        roots = []
+    for extra in (getattr(sys, "_MEIPASS", None), str(BASE_DIR), str(Path(sys.executable).resolve().parent)):
+        if extra:
+            roots.append(extra)
+    # frozen builds have no site-packages of their own; fall back to a system install
+    try:
+        roots += _glob.glob(str(Path(_os.environ.get("LOCALAPPDATA", "")) /
+                              "Programs" / "Python" / "*" / "Lib" / "site-packages"))
+    except Exception:
+        pass
+    found = False
+    for r in roots:
+        for sub in ("nvidia/cublas/bin", "nvidia/cudnn/bin", "nvidia/cuda_nvrtc/bin"):
+            d = _os.path.join(r, *sub.split("/"))
+            if _os.path.isdir(d):
+                try:
+                    _os.add_dll_directory(d)          # Windows 3.8+; ignored elsewhere
+                except (AttributeError, OSError):
+                    pass
+                _os.environ["PATH"] = d + _os.pathsep + _os.environ.get("PATH", "")
+                if sub.endswith("cublas/bin"):
+                    found = True
+    return found
+
+def _whisper_device():
+    """Pick (device, compute_type): CUDA float16 only when a GPU AND its cuBLAS are usable.
+
+    A GPU is not enough: ctranslate2 needs cublas64_12.dll at model-creation time.
+    Picking CUDA without it makes the load throw, so we check for the DLLs first
+    and fall back to CPU int8 (which also selects the smaller CPU model).
+    """
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() < 1:
+            return "cpu", "int8"
+    except Exception:
+        return "cpu", "int8"
+    if not _ensure_cublas_on_path():
+        return "cpu", "int8"
+    return "cuda", "float16"
 
 def _whisper_model():
-    """Load the local Whisper model once (CPU, int8). Cached under the data dir.
+    """Load the local Whisper model once (GPU float16 when possible, else CPU int8).
 
     Thread-safe: a background preload and the first phrase can race; the lock
     makes the losing caller wait for the winning load instead of loading twice."""
-    global _WHISPER_MODEL
+    global _WHISPER_MODEL, _WHISPER_DEVICE_LABEL
     if _WHISPER_MODEL is None:
         with _WHISPER_LOCK:
             if _WHISPER_MODEL is None:
@@ -147,8 +215,19 @@ def _whisper_model():
                     _os.makedirs(cache, exist_ok=True)
                 except OSError:
                     pass
-                _WHISPER_MODEL = WhisperModel(WHISPER_MODEL_NAME, device="cpu", compute_type="int8",
-                                              download_root=str(cache))
+                device, compute = _whisper_device()
+                name = WHISPER_MODEL_NAME if device == "cuda" else WHISPER_CPU_MODEL_NAME
+                try:
+                    _WHISPER_MODEL = WhisperModel(name, device=device, compute_type=compute,
+                                                  download_root=str(cache))
+                except Exception:
+                    if device == "cpu":
+                        raise
+                    # GPU unusable (missing cuDNN/cuBLAS, unsupported arch) - keep dictation working
+                    _WHISPER_MODEL = WhisperModel(WHISPER_CPU_MODEL_NAME, device="cpu", compute_type="int8",
+                                                  download_root=str(cache))
+                    device = "cpu"
+                _WHISPER_DEVICE_LABEL = "GPU" if device == "cuda" else "CPU"
     return _WHISPER_MODEL
 
 def _whisper_preload() -> None:
@@ -603,7 +682,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.36"
+VERSION    = "1.1.38"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -871,7 +950,9 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                             "pages and anti-bot/JS-challenge walls that plain fetch_url cannot get past. "
                             "METERED: each scrape consumes one of the user's limited monthly credits - use ONLY "
                             "when fetch_url fails or returns a bot wall, or the page is known to be "
-                            "JavaScript-rendered. Never for simple static pages (fetch_url is free)."),
+                            "JavaScript-rendered. Never for simple static pages (fetch_url is "
+                            "free). Firecrawl REFUSES reddit.com outright - never spend a credit "
+                            "on a Reddit URL; fetch_url handles Reddit natively."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -887,7 +968,11 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "name": "fetch_url",
             "description": ("Fetch a webpage and return its cleaned raw text content "
                             "(HTML tags, scripts and styles stripped). Local/private network "
-                            "addresses (localhost, LAN, cloud metadata) are blocked by default."),
+                            "addresses (localhost, LAN, cloud metadata) are blocked by default. "
+                            "Reddit works: pass the normal reddit.com thread / subreddit / search "
+                            "URL and Deskpilot reads it through Reddit's public Atom feed, "
+                            "returning the post plus its comments (no vote counts, roughly a "
+                            "100-comment cap)."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1152,6 +1237,164 @@ def _bot_wall_note(text: str) -> Optional[str]:
 
 
 # ── fetch_url safety: body cap + SSRF guard ──
+# ── Reddit: read threads through their public Atom (.rss) endpoints ──────────
+# Reddit's HTML pages are a JavaScript app, so fetch_url (no JS engine) gets an
+# almost empty document once tags are stripped; the .json endpoints 403 plain
+# HTTP clients; old.reddit.com bounces to a login wall; and Firecrawl refuses
+# reddit.com outright ("we do not support this site", measured 2026-10-04). The
+# Atom feeds at <path>.rss are still served publicly and carry the post plus its
+# comments, so Reddit URLs are rewritten onto the feed and parsed here.
+REDDIT_FEED_HOSTS = ("reddit.com", "redditmedia.com")
+REDDIT_ATOM_ACCEPT = "application/atom+xml,application/xml;q=0.9,*/*;q=0.5"
+REDDIT_MIN_INTERVAL = 2.5     # seconds between Reddit hits (they 429 aggressively)
+REDDIT_MAX_ENTRIES = 60       # feed entries rendered per fetch
+REDDIT_ENTRY_CHARS = 1200     # per-entry text cap
+REDDIT_OUTPUT_CHARS = 14000   # total cap for a rendered thread (vs 6000 for pages)
+_reddit_last_hit = 0.0
+_reddit_lock = threading.Lock()
+_ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def _is_reddit_url(url: str) -> bool:
+    """True for reddit.com / redditmedia.com under any subdomain."""
+    try:
+        host = (urllib.parse.urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return any(host == h or host.endswith("." + h) for h in REDDIT_FEED_HOSTS)
+
+
+def _reddit_atom_url(url: str) -> Optional[str]:
+    """Rewrite a Reddit page URL onto its public Atom feed; None if unsupported.
+
+    Subdomains are normalised to www: old./np./api. either 403 the request or
+    bounce it to a login wall. Query strings are dropped (a ?context=N fragment
+    link makes Reddit serve a partial page) except on search feeds, where the
+    query IS the search.
+    """
+    try:
+        parts = urllib.parse.urlparse(url)
+    except ValueError:
+        return None
+    path = (parts.path or "").rstrip("/")
+    if path in ("", "/"):
+        return None                        # reddit.com front page: no Atom feed
+    if path.endswith(".rss"):
+        feed_path, keep_query = path, True
+    elif re.search(r"\.(json|xml|html?|txt|compact|mobile)$", path, re.I):
+        # Reddit's format suffix attaches to the last segment (/…/slug.json).
+        # Strip it and re-attach the canonical "/.rss" form, which is what was
+        # verified to return a full thread (…/slug.rss is not equivalent).
+        path = re.sub(r"\.(json|xml|html?|txt|compact|mobile)$", "", path, flags=re.I)
+        feed_path, keep_query = path + "/.rss", False
+    elif path.endswith("/search"):
+        feed_path, keep_query = path + ".rss", True
+    else:
+        feed_path, keep_query = path + "/.rss", False
+    out = "https://www.reddit.com" + feed_path
+    if keep_query and parts.query:
+        out += "?" + parts.query
+    return out
+
+
+def _reddit_throttle(abort=None) -> bool:
+    """Space Reddit requests (anonymous traffic is throttled hard). Returns
+    False if the wait was interrupted by Stop, so the caller can bail out."""
+    global _reddit_last_hit
+    with _reddit_lock:
+        now = time.time()
+        wait = REDDIT_MIN_INTERVAL - (now - _reddit_last_hit)
+        if wait < 0:
+            wait = 0.0
+        _reddit_last_hit = now + wait      # reserve the slot for this caller
+    deadline = time.time() + wait
+    while time.time() < deadline:
+        if abort is not None and abort():
+            return False
+        time.sleep(min(0.25, max(0.0, deadline - time.time())))
+    return True
+
+
+def _reddit_strip_html(fragment: str) -> str:
+    """Feed content fragment (already XML-unescaped by ElementTree, still HTML)
+    into plain text. Tags are stripped BEFORE unescaping so that escaped markup
+    in the original post text is never mistaken for feed markup."""
+    txt = re.sub(r"(?is)<!--.*?-->", " ", fragment or "")
+    txt = re.sub(r"(?is)<br\s*/?>", "\n", txt)
+    txt = re.sub(r"(?is)</(p|div|li|tr|blockquote|table)>", "\n\n", txt)
+    txt = re.sub(r"(?is)<li[^>]*>", "\n- ", txt)
+    txt = re.sub(r"(?s)<[^>]+>", " ", txt)
+    txt = html_mod.unescape(txt)
+    txt = txt.replace("\u00a0", " ")      # &nbsp; is common in Reddit text
+    txt = re.sub(r"[ \t]+", " ", txt)
+    txt = re.sub(r" *\n *", "\n", txt)
+    txt = re.sub(r"\n{3,}", "\n\n", txt)
+    return txt.strip()
+
+
+def _reddit_external_link(fragment: str) -> str:
+    """The submitted URL of a link post: the '[link]' anchor that is NOT reddit.com."""
+    for href in re.findall(r'<a href="([^"]+)"\s*>\s*\[link\]\s*</a>', fragment or ""):
+        h = html_mod.unescape(href)
+        if not _is_reddit_url(h):
+            return h
+    return ""
+
+
+# The 'submitted by /u/x [link] [comments]' boilerplate Reddit appends to every
+# post entry. Anchored on the reddit.com/user/ anchor so a post whose own text
+# happens to contain the words 'submitted by' is not truncated.
+_REDDIT_BOILERPLATE = re.compile(
+    r'(?is)\s*(?:&#\d+;\s*)?submitted by\s*(?:&#\d+;\s*)?<a href="https?://[^"]*reddit\.com/user/.*$')
+
+
+def _parse_reddit_atom(raw: str) -> str:
+    """Render a Reddit Atom feed as readable text. '' if this is not one."""
+    try:
+        root = ET.fromstring(raw)
+    except ET.ParseError:
+        return ""
+    entries = root.findall(_ATOM + "entry")
+    if not entries:
+        return ""
+    lines: List[str] = []
+    feed_title = (root.findtext(_ATOM + "title") or "").strip()
+    if feed_title:
+        lines.append(feed_title)
+    shown, skipped = 0, 0
+    for e in entries:
+        if shown >= REDDIT_MAX_ENTRIES:
+            skipped += 1
+            continue
+        eid = e.findtext(_ATOM + "id") or ""
+        is_post = eid.startswith("t3_")
+        au = e.find(_ATOM + "author")
+        author = ((au.findtext(_ATOM + "name") or "") if au is not None else "").strip() or "(unknown)"
+        when = (e.findtext(_ATOM + "published") or e.findtext(_ATOM + "updated") or "")[:10]
+        c = e.find(_ATOM + "content")
+        frag = (c.text or "") if c is not None else ""
+        body = _reddit_strip_html(_REDDIT_BOILERPLATE.sub("", frag) if is_post else frag)
+        head = ("POST" if is_post else "COMMENT") + f" · {author}" + (f" · {when}" if when else "")
+        if is_post:
+            title = (e.findtext(_ATOM + "title") or "").strip()
+            if title:
+                head = f"POST: {title}\n{head}"
+            link = _reddit_external_link(frag)
+            if link:
+                body = (body + "\n" if body else "") + f"link: {link}"
+        if len(body) > REDDIT_ENTRY_CHARS:
+            body = body[:REDDIT_ENTRY_CHARS] + " [...]"
+        lines.append("")
+        lines.append(head)
+        lines.append(body or "(no text)")
+        shown += 1
+    if skipped:
+        lines.append("")
+        lines.append(f"[... {skipped} more entries not shown: Reddit caps the public feed at "
+                     f"roughly 100 comments and Deskpilot renders {REDDIT_MAX_ENTRIES}]")
+    return "\n".join(lines).strip()
+
+
 FETCH_BODY_LIMIT = 2 * 1024 * 1024   # max bytes downloaded from a single page (read in chunks)
 
 
@@ -3217,6 +3460,7 @@ class DeskpilotApp:
         self._attachments: List[Path] = []
         self._perm_combos: Dict[str, tuple] = {}
         self._mic_active = False
+        self._mic_phrases = 0          # phrases transcribed this session (shown in the status line)
         self._mic_stop = threading.Event()   # set => stop continuous dictation
         self._stop_event = threading.Event()  # set => user pressed Stop; abort the in-flight turn
         self._tts_stop = threading.Event()   # set => halt TTS playback (send/close/toggle off)
@@ -6698,9 +6942,20 @@ class DeskpilotApp:
             return (f"ERROR: Refusing to fetch {url}: {blocked}. "
                     "If this is a machine on your own network that the app genuinely "
                     "needs, the user can enable 'Allow Local Network' in Settings.")
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0 (Deskpilot)"})
+        # Reddit: rewrite onto the public Atom feed (see the REDDIT_* helpers).
+        # The guard above ran on the ORIGINAL url; the rewritten one stays on the
+        # same host, so it needs no separate SSRF check.
+        reddit_url = _reddit_atom_url(url) if _is_reddit_url(url) else None
+        fetch_target = reddit_url or url
+        req = urllib.request.Request(
+            fetch_target,
+            headers={"User-Agent": "Mozilla/5.0 (Deskpilot)",
+                     "Accept": (REDDIT_ATOM_ACCEPT if reddit_url else "text/html,application/xhtml+xml,*/*;q=0.8")})
         capped = False
         _FETCH_REDIRECT_HANDLER._allow_local = bool(self.settings.get("allow_local_network"))
+        if reddit_url and not _reddit_throttle(abort=self._abort_requested):
+            return (f"ERROR: Fetch was stopped by the user before it finished "
+                    f"(Reddit request for {url} was still waiting its turn).")
         try:
             with _FETCH_OPENER.open(req, timeout=20) as resp:
                 chunks: List[bytes] = []
@@ -6724,6 +6979,10 @@ class DeskpilotApp:
                     "If this is a machine on your own network that the app genuinely "
                     "needs, the user can enable 'Allow Local Network' in Settings.")
         except urllib.error.HTTPError as e:
+            if e.code == 429 and reddit_url:
+                return ("ERROR: Reddit is rate-limiting this IP (HTTP 429). Wait about a "
+                        "minute before retrying - repeated requests extend the block. "
+                        f"(feed URL tried: {fetch_target})")
             return f"ERROR: Failed to fetch {url}: HTTP {e.code} {e.reason}"
         except Exception as e:
             return f"ERROR: Failed to fetch {url}: {e}"
@@ -6736,6 +6995,19 @@ class DeskpilotApp:
                 data = data[:FETCH_BODY_LIMIT]
                 capped = True
         raw = data.decode("utf-8", "replace")
+        if reddit_url:
+            text = _parse_reddit_atom(raw)
+            if not text:
+                return (f"ERROR: Reddit returned a response Deskpilot could not parse as an "
+                        f"Atom feed for {url}. It may have changed its feed format, or the "
+                        "request was intercepted (a login or bot-check page).")
+            out = f"Reddit thread {url} (via its Atom feed; {REDDIT_MAX_ENTRIES}-entry cap, no vote counts):\n\n"
+            out += text[:REDDIT_OUTPUT_CHARS]
+            if len(text) > REDDIT_OUTPUT_CHARS:
+                out += f"\n[... truncated, {len(text)} chars total]"
+            if capped:
+                out += f"\n[... download stopped at {FETCH_BODY_LIMIT // (1024 * 1024)} MB]"
+            return out
         text = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", raw)
         text = re.sub(r"(?s)<[^>]+>", " ", text)
         text = html_mod.unescape(text)
@@ -7508,6 +7780,28 @@ class DeskpilotApp:
             except Exception:
                 break  # playback failed or was interrupted - stop quietly
 
+    def _mic_status(self) -> str:
+        """Status-line text while dictation is active.
+
+        Always names the engine AND the device (GPU/CPU) so the device is
+        verifiable at a glance. Dictated text is deliberately NOT echoed here -
+        it already lands in the input box, and echoing it hid the device label.
+        A phrase count gives per-phrase feedback without stealing the label.
+        """
+        if WhisperModel is not None:
+            # The device label is only known once the model has actually loaded;
+            # before that it is the placeholder "local", which would read as the
+            # redundant "local Whisper (local)" - omit it until it is GPU/CPU.
+            dev = _WHISPER_DEVICE_LABEL if _WHISPER_DEVICE_LABEL in ("GPU", "CPU") else None
+            eng = "local Whisper" + (f" ({dev})" if dev else "")
+        else:
+            eng = "Google (cloud)"
+        n = ""
+        if self._mic_phrases:
+            n = f" \u00b7 {self._mic_phrases} phrase{'' if self._mic_phrases == 1 else 's'}"
+        return (f"\U0001F3A4 Listening via {eng}{n}\u2026 speak freely; "
+                f"hit Send (or click the mic) to stop")
+
     def toggle_mic(self) -> None:
         """Toggle continuous dictation.
 
@@ -7524,12 +7818,12 @@ class DeskpilotApp:
             return
         self._mic_stop.clear()
         self._mic_active = True
+        self._mic_phrases = 0
         try:
             self.mic_btn.configure(bg=COL["accent"], fg="#FFFFFF")
         except tk.TclError:
             pass
-        engine = "local Whisper" if WhisperModel is not None else "Google (cloud)"
-        self._set_status(f"🎤 Listening via {engine}… speak freely; hit Send (or click the mic) to stop")
+        self._set_status(self._mic_status())
         if WhisperModel is not None and _WHISPER_MODEL is None:
             # Preload the local model in the background so the first phrase isn't
             # delayed by the one-time load; the worker waits for it to finish.
@@ -7555,7 +7849,8 @@ class DeskpilotApp:
             prefix = "" if not existing else (" " if not existing.endswith((" ", "\n")) else "")
             self.input_text.insert("end-1c", prefix + text)
             self._see_input("end")      # keep the newest dictated phrase visible
-            self._set_status(f"🎤 Heard: {text[:60]}")
+            self._mic_phrases += 1
+            self._set_status(self._mic_status())
         except tk.TclError:
             pass
 
@@ -7583,9 +7878,9 @@ class DeskpilotApp:
                 _whisper_model()
                 if self._mic_active:
                     # Preload done - restore the listening status (the bar showed
-                    # "Loading local Whisper model…" while we waited).
-                    self._post(lambda: self._set_status(
-                        "\U0001F3A4 Listening via local Whisper\u2026 speak freely; hit Send (or click the mic) to stop"))
+                    # "Loading local Whisper model…" while we waited). This is the
+                    # first point at which the GPU/CPU label is known.
+                    self._post(lambda: self._set_status(self._mic_status()))
             try:
                 while not self._mic_stop.is_set():
                     try:
