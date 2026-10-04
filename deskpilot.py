@@ -603,7 +603,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.33"
+VERSION    = "1.1.35"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -2929,24 +2929,13 @@ def _deterministic_handoff(chat: dict, max_chars: int = HANDOFF_FALLBACK_MAX_CHA
 
 
 # ── Context compaction helpers (C2/C3) ─────────────────────────────────────────
-# A compacted message's content starts with this marker. It is the single source of
-# truth for counting prior compactions (the re-compaction cap) and for the UI to find
-# where to draw the "📦 Context compacted" accordion.
+# A compacted message's content starts with this marker. It is what the UI finds to draw
+# the "📦 Context compacted" accordion, what _is_synthetic_prompt skips in handoff prompt
+# logs, and what the re-compaction detector in _generate_compaction_summary looks for.
+# (The EVENT count lives in chat["compaction_archive"] - never in marker counts: a
+# re-compaction folds the previous summary, and its marker, into the new one.)
 COMPACTION_MARKER = "[COMPACTED"
 SESSION_HANDOFF_MARKER = "[Session Handoff]"   # intro a handoff seeds into a continued session
-
-
-def _count_compactions(messages: List[dict]) -> int:
-    """How many in-place compactions this chat has already had (C2).
-
-    Counts messages whose content starts with the COMPACTION_MARKER. A re-compaction
-    folds an earlier summary into a newer one, so at most one marker survives per
-    compaction event - counting markers therefore counts events."""
-    n = 0
-    for m in (messages or []):
-        if isinstance(m, dict) and str(m.get("content") or "").startswith(COMPACTION_MARKER):
-            n += 1
-    return n
 
 
 def _compaction_split_index(messages: List[dict], keep_recent: int) -> int:
@@ -3839,9 +3828,11 @@ class DeskpilotApp:
         # compacted. Counting [COMPACTED markers in live messages would NOT work: each
         # re-compaction folds the previous summary (and its marker) into the new one, so at
         # most ONE marker survives no matter how many compactions have already happened.
-        archive = chat.get("compaction_archive")
-        if not isinstance(archive, list):
-            archive = []
+        # Read the CURRENT length on the worker only for the numbering; the list itself is
+        # never mutated here - the entry is appended inside _persist_compaction on the MAIN
+        # thread (invariant #4: the worker never mutates self.chats).
+        archive_now = chat.get("compaction_archive")
+        archive_len = len(archive_now) if isinstance(archive_now, list) else 0
         # v1.1.33: no cap. A chat may be compacted as many times as its gauge fills; the
         # handoff gate (fork) still runs downstream, but only when compaction declines.
         try:
@@ -3860,18 +3851,19 @@ class DeskpilotApp:
         summary_text = self._generate_compaction_summary(old_msgs, chat)
         if not summary_text:
             return False                       # nothing usable produced -> let the handoff gate handle it
-        compaction_number = len(archive) + 1
+        compaction_number = archive_len + 1
         marker = f"{COMPACTION_MARKER} \u2014 summary of {len(old_msgs)} earlier messages]"
         summary_msg = {"role": "user", "content": marker + "\n" + summary_text}
         # Archive is a LIST (one entry per compaction event - unlimited since v1.1.33):
         # the user can re-open every original message from in-app (C4), so an earlier
         # compaction's originals must survive a later one - a single dict would be clobbered.
-        archive.append({
+        # Build the entry on the worker; the APPEND happens in _persist_compaction below.
+        archive_entry = {
             "messages": old_msgs,
             "timestamp": datetime.now().isoformat(),
             "summary_text": summary_text,
             "compaction_number": compaction_number,
-        })
+        }
         # Rebind the worker's LOCAL list IN PLACE so the NEXT request in this same loop
         # carries [summary] + recent instead of the full old history. This is the fix for
         # the stale-local-list bug: without it the loop kept sending every old token and a
@@ -3880,12 +3872,18 @@ class DeskpilotApp:
         messages[:] = compacted
         # Persist on the MAIN thread only (invariant #4: the worker never mutates self.chats,
         # and the main thread must not read the worker's live list either). Capture a snapshot
-        # of the compacted list HERE on the worker thread; the callback assigns it. The next
-        # _ui_sync_messages() (posted after this) overwrites chat["messages"] with the fuller
-        # post-compaction list, so this save only needs to persist the archive + a consistent
-        # messages snapshot atomically. The note is posted AFTER the persist callback (FIFO
-        # queue) so it renders once the record is current.
-        def _persist_compaction(chat=chat, archive=archive, snap=list(compacted)):
+        # of the compacted list HERE on the worker thread; the callback assigns it. The archive
+        # entry is APPENDED inside the callback (at drain time, on the main thread) so the
+        # worker touches no shared chat state at all. The next _ui_sync_messages() (posted
+        # after this) overwrites chat["messages"] with the fuller post-compaction list, so this
+        # save only needs to persist the archive + a consistent messages snapshot atomically.
+        # The note is posted AFTER the persist callback (FIFO queue) so it renders once the
+        # record is current.
+        def _persist_compaction(chat=chat, entry=archive_entry, snap=list(compacted)):
+            archive = chat.get("compaction_archive")
+            if not isinstance(archive, list):
+                archive = []
+            archive.append(entry)
             chat["compaction_archive"] = archive
             chat["messages"] = list(snap)
             save_chats(self.chats)
@@ -4673,6 +4671,24 @@ class DeskpilotApp:
         # clear display + embedded widgets
         try:
             self.chat_text.delete("1.0", "end")
+        except tk.TclError:
+            pass
+        # v1.1.35 PERFORMANCE FIX - leaked Tk tags.
+        # Every accordion creates two tags named acc_<id>_hdr / acc_<id>_body
+        # (_add_accordion). delete("1.0","end") removes the TEXT but NOT the tags,
+        # so they accumulated for the lifetime of the process. Tk's Text renderer
+        # walks the tag list per character, so cost grew with every chat switch:
+        # measured on the real 13.6MB data file, loading the same 1MB chat went
+        # 5.4s -> 20.5s -> 36.7s -> 47.2s after 1/2/3/4 switches, and the tag
+        # count climbed 590 -> 4378. That is the 10-20s freeze on chat clicks.
+        # tag_delete() also drops the tag's <Button-1> binding, so the accordion
+        # handler lambdas (which close over the Text widget) are released too.
+        # Only the acc_* tags are dynamic; the style tags configured in
+        # _configure_text_tags() are static and must survive.
+        try:
+            leaked = [t for t in self.chat_text.tag_names() if t.startswith("acc_")]
+            if leaked:
+                self.chat_text.tag_delete(*leaked)
         except tk.TclError:
             pass
         self._code_buttons.clear()
