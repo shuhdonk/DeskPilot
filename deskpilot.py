@@ -736,11 +736,11 @@ except Exception:
     pass
 
 MAX_TOOL_STEPS   = 0        # safety cap for agentic tool loops (0 = unlimited)
-FILE_READ_LIMIT  = 250000    # chars returned by read_local_file
+FILE_READ_LIMIT  = 500000    # chars returned by read_local_file
 CLIPBOARD_LIMIT  = 65536     # chars returned by get_clipboard_text (schema + code share this; user-sized for local models)
 CHATS_SAVE_MIN_INTERVAL = 5.0   # min seconds between mid-turn chats.json writes (turn end always saves)
-CUSTOM_PROMPT_MAX = 4000        # char cap for the custom system prompt (Settings -> Custom System Prompt)
-JS_TIMEOUT       = 900        # seconds, run_javascript subprocess timeout
+CUSTOM_PROMPT_MAX = 4000        # char cap for the custom system prompt (Settings -> Custom System Prompt)0000000
+JS_TIMEOUT       = 1800        # seconds, run_javascript subprocess timeout
 TURN_TIME_LIMIT_DEFAULT = 0   # default wall-clock cap per user prompt (seconds; 0 = NO LIMIT).
                               # The real value is the "Turn time limit" SETTING (Settings dialog,
                               # clamped 0..86400) - see _turn_time_limit(). It stays a backstop for
@@ -757,7 +757,7 @@ CHAT_RENDER_WINDOW_DEFAULT = 120   # message entries rendered per chat view (0 =
 STOP_POLL_S      = 0.25       # max latency of the Stop button while a tool is blocking
 IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
 PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
-TOOL_OUTPUT_LIMIT = 96000   # max chars of ANY tool result sent back to the model (hard cap)
+TOOL_OUTPUT_LIMIT = 192000   # max chars of ANY tool result sent back to the model (hard cap)
 JS_STDOUT_CAP    = 48_000   # chars of run_javascript stdout returned to the model (schema text shares this)
 EDIT_FILE_MAX    = 2_000_000  # max bytes of a file edit_local_file will load and patch
 SEARCH_PER_FILE_CAP        = 20    # search_files: max matches reported per file
