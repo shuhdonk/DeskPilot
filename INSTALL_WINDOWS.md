@@ -22,11 +22,12 @@ Studio, Ollama, or a hosted API key. Deskpilot is the client; it does not ship a
 
 ## A1 — Download the installer
 
-Grab the newest **`DeskPilot-Setup-<version>.exe`** from the **`installer/`** folder in
-the repository: <https://github.com/shuhdonk/DeskPilot/tree/main/installer>. Direct
-download for the current build:
-<https://github.com/shuhdonk/DeskPilot/raw/main/installer/DeskPilot-Setup-1.1.70.exe>.
-It is a normal Windows installer
+Grab the newest **`DeskPilot-Setup-<version>.exe`** from the project's GitHub
+**Releases** page — <https://github.com/shuhdonk/DeskPilot/releases/latest> — and
+pick the `.exe` under **Assets**. (The installer is a release asset, not a file in
+the source tree: a 128 MB binary in the repo would have to ride on Git LFS, whose
+free tier caps out at ~10 GiB of download bandwidth a month. Release assets carry
+no such limit.) It is a normal Windows installer
 
 ## A2 — Run it
 

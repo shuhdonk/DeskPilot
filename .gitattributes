@@ -1,2 +1,0 @@
-# Large binaries tracked with Git LFS (GitHub rejects files over 100 MB in plain git)
-installer/*.exe filter=lfs diff=lfs merge=lfs -text
