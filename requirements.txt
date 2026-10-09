@@ -1,9 +1,18 @@
-openai
-pypdf
-Pillow
-kokoro-onnx
-sounddevice
-SpeechRecognition
-pyaudio
-faster-whisper
-numpy
+# ── Required ────────────────────────────────────────────────
+openai>=1.40.0
+
+# ── Optional (extend tool suite / audio features) ───────────
+pypdf>=4.0.0            # read_local_file: PDF support + PDF attachments
+Pillow>=10.0.0          # capture_screen tool (ImageGrab)
+kokoro-onnx>=0.6.1     # Text-to-Speech (🔊 button, local; model files in <data_dir>/kokoro_models)
+                       # NOTE: there is no 1.x release - latest is 0.6.1. A `>=1.0`
+                       # pin here made the whole file uninstallable.
+sounddevice>=0.4        # TTS playback (+ optional mic capture)
+SpeechRecognition>=3.10 # Speech-to-Text dictation (🎤 button, needs PyAudio; cloud fallback only)
+PyAudio>=0.2.14         # the microphone itself: deskpilot.py imports pyaudio directly and
+                        # SpeechRecognition does NOT declare it (it is only the "audio" extra)
+faster-whisper>=1.0     # local dictation (🎤 button) - preferred over the cloud path
+av<19                   # faster-whisper needs av.open(metadata_errors=...); av 19 removed it
+nvidia-cublas-cu12      # GPU dictation: ctranslate2 needs cuBLAS (deskpilot.py adds it to the library path)
+                        # Windows: that is all - ctranslate2 bundles cudnn64_9.dll itself.
+                        # Linux: also install nvidia-cudnn-cu12 (cuDNN 9) - see INSTALL_LINUX.md.
