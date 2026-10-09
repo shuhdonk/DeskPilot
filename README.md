@@ -8,7 +8,7 @@
 
 Deskpilot is a standalone, AI desktop assistant built with Python and Tkinter. Designed for power users, it acts as a fully agentic copilot on your local machine.
 
-It integrates seamlessly with any OpenAI-compatible server (LM Studio, Ollama, vLLM, llama.cpp, Unsloth Studio/Desktop, or the official OpenAI API) and features an extensive suite of **27 built-in tools**, **full Model Context Protocol (MCP) extensibility**, durable agent memory, and robust security guardrails. Everything runs on your machine — the UI, the tools, the speech models. Only the chat itself leaves for your LLM server. Current release: **v1.1.70**.
+It integrates seamlessly with any OpenAI-compatible server (LM Studio, Ollama, vLLM, llama.cpp, Unsloth Studio/Desktop, or the official OpenAI API) and features an extensive suite of **27 built-in tools**, **full Model Context Protocol (MCP) extensibility**, durable agent memory, and robust security guardrails. Everything runs on your machine — the UI, the tools, the speech models. Only the chat itself leaves for your LLM server.
 
 ## ✨ Key Features
 
@@ -41,9 +41,9 @@ Deskpilot is built to run unattended AI agents safely on your hardware. It imple
 
 **Windows — easiest, one file.** Download the installer from the project's **Releases** page and double-click it. It bundles Python, all dependencies and Node.js, needs no admin rights, and leaves your settings and chat history untouched when uninstalled:
 
-* ⬇️ **[Latest release — `DeskPilot-Setup-1.1.70.exe`](https://github.com/shuhdonk/DeskPilot/releases/latest)** (128 MB)
+* ⬇️ **[Download the latest `DeskPilot-Setup-<version>.exe` installer](https://github.com/shuhdonk/DeskPilot/releases/latest)** (~128 MB)
 
-Pick the `.exe` under **Assets** on that page. Release assets are hosted outside the source tree, so downloads are unlimited and cost no LFS quota. The version number always matches the `VERSION` at the top of [`deskpilot.py`](deskpilot.py).
+That link always resolves to the newest release — pick the `.exe` under **Assets** on the page it opens. Release assets are hosted outside the source tree, so downloads are unlimited and cost no LFS quota. The current version is the `VERSION` line near the top of [`deskpilot.py`](deskpilot.py).
 
 **Windows / Linux from source:** follow [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) or [INSTALL_LINUX.md](INSTALL_LINUX.md) — step-by-step, copy-paste ready.
 
