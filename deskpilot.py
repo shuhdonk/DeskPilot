@@ -18,7 +18,7 @@
  • Agentic tool suite with per-tool permission dropdowns:
      searxng_search        – queries a local SearXNG instance (JSON API)
       exa_search            – Exa neural web search (api.exa.ai; key in Settings)
-      firecrawl_scrape      – Firecrawl scrape to markdown (metered; key in Settings)
+      firecrawl_scrape      – Firecrawl scrape to markdown (key in Settings)
      fetch_url             – retrieves + cleans raw text from a webpage
                          (Reddit URLs are read via Reddit's public Atom feed)
      run_javascript        – Node.js via hidden subprocess, 1800 s timeout
@@ -234,6 +234,33 @@ def _ensure_cublas_on_path() -> bool:
         except OSError:
             pass
     return found
+
+def _ensure_bundled_node_on_path() -> bool:
+    """Put an app-bundled Node.js on PATH so MCP `npx` servers work out of the box.
+
+    The installer ships a private Node under <install>\\node\\ next to the exe.
+    MCPClient resolves commands with shutil.which against PATH (shell=False does
+    not append .CMD, which is why `npx` must be resolved, not passed through), so
+    making it findable is the whole integration - no MCP code has to know about it.
+
+    Probe order mirrors _ensure_cublas_on_path: a Node already on PATH (the user
+    installed it themselves) always wins, and we only append ours as a fallback.
+    Prepending instead would shadow the system install and surprise people who
+    manage Node with nvm. Returns True if node is resolvable either way.
+    """
+    if shutil.which("node"):
+        return True
+    exe_dir = Path(sys.executable).resolve().parent if getattr(sys, "frozen", False) \
+        else Path(__file__).resolve().parent
+    for cand in (exe_dir / "node", BASE_DIR / "node"):
+        if (cand / "node.exe").is_file() or (cand / "node").is_file():
+            d = str(cand)
+            if d not in os.environ.get("PATH", "").split(os.pathsep):
+                # Append, never prepend: see the docstring.
+                os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + d
+            return True
+    return False
+
 
 def _whisper_device():
     """Pick (device, compute_type): CUDA float16 only when a GPU AND its cuBLAS are usable.
@@ -1221,7 +1248,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.61"
+VERSION    = "1.1.70"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -1240,7 +1267,7 @@ MAX_STEER_QUEUE  = 8        # v1.1.52 #10: mid-run steering messages held for th
 FILE_READ_LIMIT  = 500000    # chars returned by read_local_file
 CLIPBOARD_LIMIT  = 65536     # chars for get_clipboard_text / set_clipboard (schema + code share this; user-sized for local models)
 CHATS_SAVE_MIN_INTERVAL = 5.0   # min seconds between mid-turn chats.json writes (turn end always saves)
-CUSTOM_PROMPT_MAX = 4000        # char cap for the custom system prompt (Settings -> Custom System Prompt)0000000
+CUSTOM_PROMPT_MAX = 4000        # char cap for the custom system prompt (Settings -> Custom System Prompt)
 JS_TIMEOUT       = 1800        # seconds, run_javascript subprocess timeout
 TURN_TIME_LIMIT_DEFAULT = 0   # default wall-clock cap per user prompt (seconds; 0 = NO LIMIT).
                               # The real value is the "Turn time limit" SETTING (Settings dialog,
@@ -1279,6 +1306,28 @@ SEARCH_SKIP_DIRS = frozenset({     # search_files: noise dirs never descended in
     "__pycache__", ".git", "node_modules", ".venv", "venv",
     "site-packages", "dist", "build", ".cache"})
 MODEL_HISTORY_MAX = 20      # previously-used model names kept for the Model Name dropdown
+
+# ── ask_expert (v1.1.63): a frontier model as a CONSULTANT, not the agent ────
+# The primary model stays local and stays in charge; it may ask one outside
+# model for a narrow opinion. The whole point of these constants is the user's
+# constraint: "I only ever want it to see what it is being explicitly asked
+# about." So the payload is built from scratch (never build_system_message, and
+# never the chat history) and the file reads are jailed to the workspace even
+# when the optional File Workspace setting is blank.
+EXPERT_MAX_CALLS_PER_TURN = 5     # a small model will over-delegate; this is a
+                                  # sanity/latency guard, not a budget (the user's
+                                  # plan is a fixed monthly allowance that degrades
+                                  # to flash-lite when spent, so cost is not the reason)
+EXPERT_MAX_TOKENS = 32768         # generous on purpose. Gemini 3 CANNOT disable
+                                  # thinking, and a thinking model spends the whole
+                                  # cap on reasoning_content and returns content=''
+                                  # (reproduced in v1.1.58 at max_tokens=1024). A
+                                  # tight cap here would silently blank the answer
+                                  # to exactly the hard questions worth asking.
+EXPERT_TIMEOUT_S = 300            # one call; a thinking model can take a while
+EXPERT_FILE_CHARS = 60000         # per file handed to the expert
+EXPERT_TOTAL_CHARS = 200000       # all files + context combined
+EXPERT_MIN_CAP = 4096             # below this, retrying without a cap is pointless
 
 # ── Full-text chat search (v1.1.42) ───────────────────────────────────────────
 # The sidebar search box only ever matched chat TITLES, so a 20 MB history was
@@ -1328,6 +1377,20 @@ LEDGER_INJECT_DEFAULT   = 4000    # chars of ledger tail in the system prompt (0
 LEDGER_INJECT_MAX       = 20000   # ceiling on that setting
 LEDGER_INJECT_ENTRIES   = 60      # never inject more than this many entries
 LEDGER_SCAN_MAX_BYTES   = 4_000_000  # a runaway ledger is read up to this far
+
+# ── v1.1.66: project memory index ────────────────────────────────────────────
+# The workspace-root MEMORY.md is an INDEX (what projects exist, where each
+# project's own MEMORY.md is), not an archive. Injecting it is what makes the
+# "read the project's memory file first" convention automatic: a session cannot
+# miss a file it has never been shown. Same shape as the ledger block - bounded
+# VIEW, unbounded store on disk, and the text names the tool that reaches the
+# rest. Kept small by convention (~6 KB); PROJECT_MEMORY_MAX is the hard ceiling
+# so a bloated index cannot silently inflate every request.
+PROJECT_MEMORY_NAME     = "MEMORY.md"
+PROJECT_MEMORY_SUBDIR   = "projects"      # where per-project memory files live
+PROJECT_MEMORY_DEFAULT  = 8000            # chars injected (0 = off)
+PROJECT_MEMORY_MAX      = 24000           # ceiling on that setting
+PROJECT_MEMORY_READ_MAX = 64000           # bytes read from disk before capping
 _LEDGER_LOCK = threading.Lock()   # serialises appends (worker + main thread)
 # Serialises index rebuilds: _ensure_search_index() is called from the main thread
 # (sidebar search) and the chat worker (search_chats tool), and the rebuild does
@@ -1564,6 +1627,9 @@ TOOLS: List[tuple] = [
     ("read_ledger",          "📓 Ledger"),
     ("set_clipboard",        "📋 Set"),
     ("transcribe_audio",     "🎧 Audio"),
+    # Consultant. Must be listed here too or it gets no permission chip, and the
+    # bar is the only place the user can see it is set to Ask or switch it Off.
+    ("ask_expert",           "🧠 Expert"),
     ("list_mcp_resources",   "🔌 Res"),
     ("read_mcp_resource",    "📥 Res"),
     ("list_mcp_prompts",     "📝 Prompts"),
@@ -1615,11 +1681,11 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "name": "firecrawl_scrape",
             "description": ("Scrape a webpage into clean markdown using Firecrawl. Handles JavaScript-rendered "
                             "pages and anti-bot/JS-challenge walls that plain fetch_url cannot get past. "
-                            "METERED: each scrape consumes one of the user's limited monthly credits - use ONLY "
-                            "when fetch_url fails or returns a bot wall, or the page is known to be "
-                            "JavaScript-rendered. Never for simple static pages (fetch_url is "
-                            "free). Firecrawl REFUSES reddit.com outright - never spend a credit "
-                            "on a Reddit URL; fetch_url handles Reddit natively."),
+                            "Use it whenever a page needs a browser engine or resists plain HTTP fetching - "
+                            "the user's plan carries a generous monthly allowance, so there is no need to "
+                            "hoard calls. fetch_url is still the faster first choice for simple static "
+                            "pages. Firecrawl REFUSES reddit.com outright - do not call it on a Reddit "
+                            "URL; fetch_url handles Reddit natively."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2141,6 +2207,53 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             }
         }
     },
+    "ask_expert": {
+        "type": "function",
+        "function": {
+            "name": "ask_expert",
+            "description": (
+                "Ask a second, stronger AI model for a narrow second opinion. Use it where a "
+                "fresh pair of eyes genuinely helps: reviewing a diff before you ship it, an API "
+                "you are unsure exists, a design trade-off, a bug you cannot explain. "
+                "The expert CANNOT see this conversation, your files, your settings or your "
+                "history - it receives ONLY the question, the files you name, and any context "
+                "text you supply. So the question must be fully self-contained: state the "
+                "language, the framework, what you expect, and what specifically worries you. "
+                "Files must live inside the workspace. Max 5 calls per turn. "
+                "The answer is ADVISORY, not authoritative: an expert can invent APIs too, so "
+                "verify any method or signature it names before you use it."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string",
+                                 "description": "The specific question. Self-contained - the expert sees nothing else."},
+                    "files": {
+                        "type": "array",
+                        "description": ("Files the expert should read. Paths MUST be inside the workspace. "
+                                        "Prefer this over pasting code: the expert then sees the real "
+                                        "current bytes instead of whatever you retyped."),
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "path":   {"type": "string",  "description": "Path inside the workspace."},
+                                "offset": {"type": "integer", "description": "0-based char index to start at. Default 0."},
+                                "limit":  {"type": "integer", "description": "Max chars to send. Default 60000."}
+                            },
+                            "required": ["path"]
+                        }
+                    },
+                    "context": {"type": "string",
+                                "description": ("Short excerpt that exists only in your head - a proposed "
+                                                "change not yet written to disk, or an error message. "
+                                                "Keep it to what the question is actually about.")},
+                    "focus": {"type": "string",
+                              "enum": ["review", "debug", "design", "second_opinion"],
+                              "description": "What kind of answer you want. Default review."}
+                },
+                "required": ["question"]
+            }
+        }
+    },
 }
 
 # ── Permission options ───────────────────────────────────────────────────────
@@ -2186,6 +2299,10 @@ DEFAULT_PERMS = {
     "read_ledger":           "always",
     "set_clipboard":         "ask",
     "transcribe_audio":      "ask",
+    # ask_expert sends the material you name to a THIRD PARTY over the network.
+    # Never default this to "always": the permission modal is also the only
+    # place the user can see the exact payload before it leaves the machine.
+    "ask_expert":            "ask",
     # MCP resources/prompts are read-only views of a server's own data, but the
     # server is an arbitrary local program, so they stay "ask" like MCP tools.
     "list_mcp_resources":    "ask",
@@ -2204,7 +2321,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "model_history":     [],   # previously used model names, newest first (Model Name dropdown)
     "searxng_url":       "",    # blank = auto-derive from server_url host, port 8080
     "exa_api_key":       "",    # Exa API key for the exa_search tool; blank = tool disabled
-    "firecrawl_api_key": "",    # Firecrawl API key for firecrawl_scrape (metered); blank = tool disabled
+    "firecrawl_api_key": "",    # Firecrawl API key for firecrawl_scrape; blank = tool disabled
     "ui_font_size":    12,    # base UI font size (Settings -> UI Font Size)
     "max_tokens":      0,    # per-reply token cap; 0 = server default (Settings -> Max Tokens)
     "turn_time_limit": TURN_TIME_LIMIT_DEFAULT,  # seconds per user prompt; 0 = no limit
@@ -2215,8 +2332,11 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "compaction_threshold": COMPACTION_THRESHOLD_DEFAULT,   # auto-compact context at this % usage (0 = off); C1
     "compaction_keep_recent": COMPACTION_KEEP_RECENT_DEFAULT,  # most-recent message entries kept verbatim; C1
     "chat_render_window": CHAT_RENDER_WINDOW_DEFAULT,  # message entries rendered per chat view (0 = all); v1.1.36
+    "project_memory_chars": PROJECT_MEMORY_DEFAULT,  # chars of the workspace MEMORY.md index injected each request (0 = off); v1.1.66
+    "project_memory_file": "",    # explicit index file; blank = <workspace>/MEMORY.md
     "ledger_inject_chars": LEDGER_INJECT_DEFAULT,  # chars of ledger tail in the system prompt (0 = off); Tier 3
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
+    "custom_system_prompt_enabled": True,  # gate the prompt above WITHOUT discarding it; False = kept but not sent
     "sampling_defaults": dict(SAMPLING_DEFAULTS),  # sampler params applied to EVERY chat (Settings -> Sampling)
     "show_sampling_note": True,   # render one "what was actually sent" note per user prompt
     "allow_local_network": False,  # fetch_url may reach LAN/localhost/cloud-metadata addresses
@@ -2226,6 +2346,13 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # View state only - permissions are stored and enforced either way.
     "mcp_bar_expanded":  [],
     "skills_dir":        "",   # extra folder scanned for Agent Skills (SKILL.md); blank = defaults only
+    # Consultant model (ask_expert). Any OpenAI-compatible endpoint works; these
+    # are INDEPENDENT of server_url/api_key/model_name so the local model stays
+    # primary. Blank expert_server_url or expert_api_key disables the tool.
+    "expert_server_url": "",   # e.g. https://generativelanguage.googleapis.com/v1beta/openai/
+    "expert_api_key":    "",   # the consultant's own key (never reuses api_key)
+    "expert_model":      "",   # e.g. gemini-3.8-flash - use "List models", do not guess
+    "expert_model_history": [],  # previously used expert names, newest first (dropdown)
     "tts_enabled":       False,
     "tool_permissions":  dict(DEFAULT_PERMS),
 }
@@ -2423,6 +2550,23 @@ FETCH_BODY_LIMIT = 2 * 1024 * 1024   # max bytes downloaded from a single page (
 # guard and the total hop count is capped (urllib's default opener follows redirects
 # blindly, which lets a public URL bounce a fetch into the LAN / cloud metadata).
 FETCH_MAX_REDIRECTS = 5       # total 3xx hops allowed per fetch_url request
+
+
+def _is_model_lookup_error(err) -> bool:
+    """True when a failure is about the MODEL NAME, not quota/auth/network.
+
+    Deliberately excludes 429/401/403: a rate limit is not a wrong name, and
+    retrying with a different spelling just burns another request against an
+    exhausted quota. Verified live: a blank name returns 400 "model is not
+    specified", an unknown one returns 404 model_not_found."""
+    low = str(err or "").lower()
+    if "429" in low or "rate limit" in low or "quota" in low:
+        return False
+    if "401" in low or "403" in low or "api key not valid" in low:
+        return False
+    return ("model_not_found" in low or "model is not specified" in low
+            or "not a valid model" in low or "invalid model" in low
+            or "unknown model" in low or "model id" in low)
 
 
 class _FetchRedirectBlocked(Exception):
@@ -3938,8 +4082,50 @@ class MarkdownStream:
             pass
 
 
+def parse_tool_arguments(args_raw: str) -> tuple:
+    """(args_dict, error_kind) for one tool call's raw JSON arguments.
+
+    error_kind is None on success, else 'malformed' (unparseable) or the type
+    name of a value that parsed but is not an object.
+
+    json.loads happily returns a list, string, number or null for arguments the
+    model wrote as '["What is this code?"]'. Everything downstream assumes a
+    mapping - args_preview's .items(), _permission_preview's .get(),
+    handler(**args) - so a non-dict raises AttributeError on the worker thread
+    and kills the turn. Reject it at the single point where the shape is known
+    instead of patching each consumer.
+
+    The '_raw_arguments' unmasking lives here too: the stream finalizer masks
+    malformed model JSON as {"_raw_arguments": ...} so history stays sendable to
+    strict servers, and leaving that in place would reach the handler and die
+    with a confusing TypeError rather than the clear error below.
+    """
+    try:
+        args = json.loads(args_raw)
+    except Exception:
+        return {}, "malformed"
+    if isinstance(args, dict) and "_raw_arguments" in args:
+        orig_raw = str(args["_raw_arguments"])
+        if orig_raw.strip() not in ("", "{}"):
+            return {}, "malformed"
+        args = {}
+    if not isinstance(args, dict):
+        return {}, type(args).__name__
+    return args, None
+
+
 def args_preview(args: Dict[str, Any]) -> str:
-    """Compact one-line preview of tool arguments for accordion headers."""
+    """Compact one-line preview of tool arguments for accordion headers.
+
+    Tolerates a non-dict on purpose. A tool call whose arguments parsed to a
+    list/string/number is stored in chat history exactly as the model sent it,
+    so load_chat replays it through here long after the dispatch guard was
+    added - and .items() on a list raises AttributeError inside a root.after
+    callback, where nothing catches it. Display code must not be able to kill
+    a render."""
+    if not isinstance(args, dict):
+        s = str(args).replace("\n", " ")
+        return (s[:60] + "…") if len(s) > 60 else (s or "no args")
     parts = []
     for k, v in list(args.items())[:4]:
         s = str(v).replace("\n", " ")
@@ -4332,9 +4518,77 @@ def run_sampling_verify(client, model: str, top: dict, flat: dict, models_info=N
 
 
 
+def project_memory_file(settings: dict) -> Path:
+    """Which file is the workspace index. Explicit setting wins; else <workspace>/MEMORY.md."""
+    raw = str((settings or {}).get("project_memory_file") or "").strip()
+    if raw:
+        try:
+            return Path(raw).expanduser()
+        except Exception:
+            pass
+    return default_workspace_root() / PROJECT_MEMORY_NAME
+
+
+def _project_memory_text(settings: dict) -> str:
+    """The workspace memory INDEX, for the system prompt. '' when off or absent.
+
+    Bounded on purpose: this rides on EVERY request, so an unbounded index is an
+    unbounded per-turn cost. Unlike the ledger there is no store to page through -
+    the file is the store - so a truncated read says so explicitly and names the
+    tool that can get the whole thing, rather than letting a half-index pass as
+    the full project list.
+    """
+    try:
+        budget = int(float((settings or {}).get("project_memory_chars",
+                                               PROJECT_MEMORY_DEFAULT)))
+    except (TypeError, ValueError):
+        budget = PROJECT_MEMORY_DEFAULT
+    budget = max(0, min(budget, PROJECT_MEMORY_MAX))
+    if budget <= 0:
+        return ""
+    p = project_memory_file(settings)
+    try:
+        if not p.is_file():
+            return ""
+        raw = p.read_bytes()[:PROJECT_MEMORY_READ_MAX].decode("utf-8", "replace")
+    except Exception:
+        return ""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    note = ""
+    total = len(raw)
+    if total > budget:
+        raw = raw[:budget].rstrip()
+        note = (f"\n\n[... index truncated at {budget} of {total} chars - "
+                f"read_local_file the whole file at {p} ...]")
+    return (f"PROJECT MEMORY INDEX (workspace convention: every project has its own "
+            f"folder under {default_workspace_root() / PROJECT_MEMORY_SUBDIR} with its "
+            f"own MEMORY.md; read that file before working in a project, and update it "
+            f"when anything durable changes):\n{raw}{note}")
+
+
+def effective_custom_prompt(settings: dict) -> str:
+    """The custom system prompt as it should reach the model THIS request.
+
+    The Settings checkbox gates INJECTION only - the text itself is never cleared,
+    so switching a persona off for one session and back on later costs no retyping.
+    Gating here rather than inside build_system_message() keeps that function pure
+    (the suites call it directly with a literal string) and gives both call sites
+    ONE place to read the flag, so they cannot drift apart.
+
+    Defaults to enabled when the key is absent, so a settings file written before
+    this feature behaves exactly as it did before.
+    """
+    s = settings or {}
+    if not s.get("custom_system_prompt_enabled", True):
+        return ""
+    return str(s.get("custom_system_prompt") or "")
+
+
 def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_key: str = "",
                          custom_prompt: str = "", skills_index: str = "",
-                         ledger: str = "") -> dict:
+                         ledger: str = "", project_memory: str = "") -> dict:
     """System prompt injected at request time (never persisted to chat history).
 
     The model has no other way of knowing the real current date/time; without
@@ -4373,14 +4627,18 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
                     "use searxng_search (local SearXNG) for quick lookups where freshness does not matter.")
     if firecrawl_key:
         content += (" firecrawl_scrape is a powerful scraper (handles JavaScript-rendered pages and anti-bot "
-                    "walls) but it is METERED - each scrape consumes one of the user's limited monthly credits. "
-                    "Use it ONLY when fetch_url fails, returns an anti-bot/JS-challenge wall, or the page is known "
-                    "to be JavaScript-rendered; never for simple static pages.")
+                    "walls) - use it whenever a page needs a browser engine or resists plain fetching. "
+                    "fetch_url remains the faster first choice for simple static pages.")
     si = (skills_index or "").strip()
     if si:
         # Placed BEFORE the user's standing instructions so skills read as available
         # capability, not as rules competing with the persona.
         content += "\n\n" + si
+    pm = (project_memory or "").strip()
+    if pm:
+        # The index is a standing instruction about where to look, so it sits with
+        # the skills block and ahead of the ledger (facts) and the user's own text.
+        content += "\n\n" + pm
     led = (ledger or "").strip()
     if led:
         # The ledger is FACTS, not instructions, and it sits after the skills block but
@@ -4423,14 +4681,24 @@ HANDOFF_PREV_NOTES_LISTED = 5        # how many earlier notes the header of a ne
 HANDOFF_TITLE_SLUG_MAX = 40          # chat title chars kept in the note filename
 
 
-def default_handoff_notes_dir() -> Path:
-    """The notes folder used when Settings -> Handoff notes folder is blank (never AppData)."""
+def default_workspace_root() -> Path:
+    """The workspace folder itself (NOT the notes subfolder, NOT the data store).
+
+    Same resolution order the handoff-notes path uses: USER_WORKSPACE_ROOT when it
+    exists on this machine, else the script's own folder - so a copy of this
+    script elsewhere still finds a sensible root instead of a hardcoded path that
+    does not exist."""
     try:
         if USER_WORKSPACE_ROOT.is_dir():
-            return USER_WORKSPACE_ROOT / DEFAULT_HANDOFF_NOTES_SUBDIR
+            return USER_WORKSPACE_ROOT
     except Exception:
         pass
-    return BASE_DIR / DEFAULT_HANDOFF_NOTES_SUBDIR
+    return BASE_DIR
+
+
+def default_handoff_notes_dir() -> Path:
+    """The notes folder used when Settings -> Handoff notes folder is blank (never AppData)."""
+    return default_workspace_root() / DEFAULT_HANDOFF_NOTES_SUBDIR
 
 
 def _handoff_threshold_pct(settings: dict) -> int:
@@ -4457,6 +4725,11 @@ def _handoff_prompt(chat_title: str) -> str:
         "## What was done\nConcrete actions completed and their outcomes.\n\n"
         "## Current state\nWhere things stand right now - what works, what is in progress, "
         "what is blocked or pending.\n\n"
+        "## Project & memory files\nWhich project folder this work belongs to (e.g. "
+        "projects/<name>/), and the exact paths of any project MEMORY.md or history/ file "
+        "that was READ or UPDATED during the session. Those files live on disk, not in this "
+        "conversation, so naming them is what lets the next session pick up the thread - "
+        "say \"none yet\" if no memory file exists for this work yet.\n\n"
         "## Key decisions & constraints\nChoices made, important facts, file paths, settings, "
         "and any rules that must carry over.\n\n"
         "## Next steps\nThe specific things to do next, in order.\n\n"
@@ -4807,7 +5080,7 @@ def _handoff_rearm_pct(settings: dict) -> int:
 
 HANDOFF_TOOL_OUTPUT_CAP = 2500    # max chars of one tool result kept in a handoff request
 HANDOFF_IMAGE_PLACEHOLDER = "[image attached]"
-HANDOFF_SUMMARY_MAX_TOKENS = 2048   # bound on the summary itself (some servers reject it -> retried without)
+HANDOFF_SUMMARY_MAX_TOKENS = 4096   # bound on the summary itself (some servers reject it -> retried without)
 HANDOFF_REARM_PCT_DEFAULT = 10      # a chat may handoff again once usage has grown by this many % of the window
 
 # Budget used when the server reports NO context size (LM Studio / Ollama send no
@@ -4827,7 +5100,7 @@ HANDOFF_PROMPT_MAX_CHARS = 700      # per-prompt cap there (a pasted file must n
 # v1.1.33: the old COMPACTION_MAX_PER_CHAT cap is GONE. Compaction re-arms as many times as
 # the gauge demands; chat["compaction_archive"] stays the authoritative record of every event.
 COMPACTION_MIN_OLD      = 4         # fewer old messages than this -> not worth compacting (split too small)
-COMPACTION_SUMMARY_MAX_TOKENS = 1024   # bound on the compaction summary itself (some servers reject it -> retried without)
+COMPACTION_SUMMARY_MAX_TOKENS = 4096   # bound on the compaction summary itself (some servers reject it -> retried without)
 # v1.1.58: thinking models spend max_tokens on REASONING, not on the answer.
 # Measured on the user's qwen3.8-flash-next-iq3_s (llama.cpp): at max_tokens=1024 a
 # real archived transcript returned finish_reason='length' with content EMPTY and
@@ -4835,8 +5108,14 @@ COMPACTION_SUMMARY_MAX_TOKENS = 1024   # bound on the compaction summary itself 
 # produced a proper 4,845-char summary (reasoning 11,349 chars). So a fixed cap cannot
 # work for a thinking model; the request escalates instead. See empty_attempts in
 # _generate_compaction_summary and _handoff_worker, and SUMMARY_EMPTY_RETRIES below.
-SUMMARY_RETRY_TOKENS      = 4096    # first escalation step when a summary comes back empty
-SUMMARY_EMPTY_RETRIES     = 2       # 1024 -> 4096 -> no cap, then give up on the model
+# v1.1.68: the FIRST rung used to be 1024, which that same measurement already proved
+# is too small for this model - so every compaction burned a guaranteed-failing call
+# before escalating. Rungs raised to 4096 -> 16384 -> uncapped. Uncapped is still the
+# final answer for a thinking model, because the reasoning budget needed scales with
+# the transcript (11,349 reasoning chars for a 648-message one) and no fixed number
+# covers it; the ladder exists to give the server a chance to reject a cap cleanly.
+SUMMARY_RETRY_TOKENS      = 16384   # first escalation step when a summary comes back empty
+SUMMARY_EMPTY_RETRIES     = 2       # 4096 -> 16384 -> no cap, then give up on the model
 # v1.1.53: how much of the PREVIOUS compaction summaries may be carried forward verbatim
 # into the live summary message. Carrying everything stops the 96%-per-generation loss, but
 # an uncapped chain eventually eats the window it was meant to free (measured on a real
@@ -5466,6 +5745,7 @@ class DeskpilotApp:
         # ── root window ───────────────────────────────────────────────────
         self.root = tk.Tk()
         self.root.title(f"{APP_NAME} — AI Desktop Assistant")
+        self._set_window_icon()
         try:
             self.root.geometry(self.settings.get("window_geometry", "1280x800"))
         except tk.TclError:
@@ -5521,6 +5801,35 @@ class DeskpilotApp:
     # ════════════════════════════════════════════════════════════════════
     #  UI CONSTRUCTION
     # ════════════════════════════════════════════════════════════════════
+
+    def _set_window_icon(self) -> None:
+        """Give the window/taskbar the app icon.
+
+        Without this a Tk app shows the interpreter's default feather, which is the
+        detail that makes an installed program look unofficial next to everything
+        else on the taskbar. Searched in the same places _image_cli_dir looks,
+        because in a onefile build BASE_DIR is the temp extraction folder and the
+        .ico may also simply sit next to the exe. Every failure is silent and
+        harmless: a missing icon must never stop the app from starting.
+        """
+        bases = [getattr(sys, "_MEIPASS", None), str(BASE_DIR)]
+        if getattr(sys, "frozen", False):
+            bases.append(str(Path(sys.executable).resolve().parent))
+        else:
+            bases.append(str(Path(__file__).resolve().parent))
+        for b in bases:
+            if not b:
+                continue
+            p = Path(b) / "app_icon.ico"
+            if not p.is_file():
+                continue
+            try:
+                # default= makes the icon apply to every window, including the
+                # permission/elicitation dialogs, not just the root one.
+                self.root.iconbitmap(default=str(p))
+                return
+            except Exception:
+                continue
 
     def _configure_styles(self) -> None:
         style = ttk.Style(self.root)
@@ -6000,32 +6309,61 @@ class DeskpilotApp:
                 # <Configure> on it, and that pass finds nothing changed and returns.
                 return
             self._perm_last_sig = sig
-            x = col = row = 0
-            row_h = 0
             pad2 = 2 * self.PERM_CHIP_PADX
+
+            # Row height first: place() needs y before the loop can position chips.
+            max_h = 0
+            for _cell, _reqw in widths:
+                max_h = max(max_h, int(_cell.winfo_reqheight()))
+            row_h = (max_h + 4) if max_h else 24   # + both pady sides
+
+            # ── Flow layout with place(), NOT grid ───────────────────────────────
+            # ⚠ The bug (user screenshot): chips that wrapped to a second row spread
+            # the FIRST row apart with large uneven gaps. Cause: Tk sizes a grid
+            # COLUMN to the widest cell in it, and every row shared one column set -
+            # so a wide chip on row 1 (an MCP header like "Photocraft (20) -") widened
+            # that column for row 0 too, pushing the built-in chips apart.
+            #
+            # Per-row column OFFSETS do not fix this: the columns are still shared by
+            # the whole frame, so offsetting row 1 past row 0's columns simply shifts
+            # row 1 to the right by row 0's entire width (measured: x=1405 in a 735px
+            # canvas). place() removes the coupling entirely - each chip goes exactly
+            # where the wrap arithmetic says, with a uniform gap.
+            x = col = row = 0
+            row_w = 0
+            max_row_w = 0
+            rows_used = 1
             for cell, reqw in widths:
                 w = reqw + pad2
                 if self._perm_row_break(x, avail, w, col):
+                    max_row_w = max(max_row_w, row_w)
                     row += 1
                     col = 0
                     x = 0
-                cell.grid_forget()
-                cell.grid(row=row, column=col, sticky="w",
-                          padx=self.PERM_CHIP_PADX, pady=2)
+                    row_w = 0
+                cell.grid_forget()          # clear any legacy grid management
+                cell.place(x=x + self.PERM_CHIP_PADX, y=row * row_h + 2)
                 x += w
+                row_w = x
                 col += 1
-                row_h = max(row_h, int(cell.winfo_reqheight()) + 4)   # + both pady sides
+                rows_used = max(rows_used, row + 1)
+            max_row_w = max(max_row_w, row_w)
+
             inner.update_idletasks()
-            rows = min(max(row + 1, 1), self.PERM_BAR_MAX_ROWS)
-            want = inner.winfo_reqheight() + 8
-            new_h = max(self.PERM_BAR_MIN_H, min(want, rows * (row_h or 24) + 10))
+            rows = min(rows_used, self.PERM_BAR_MAX_ROWS)
+            # place() children do NOT propagate to the parent's requested size, so the
+            # inner frame must be sized explicitly - otherwise winfo_reqheight() and
+            # bbox("all") collapse to 0, the bar can never grow for wrapped rows, and
+            # the wheel-scroll fallback stops engaging.
+            content_h = rows_used * row_h + 4
+            inner.configure(width=max_row_w, height=content_h)
+            want = content_h + 8
+            new_h = max(self.PERM_BAR_MIN_H, min(want, rows * row_h + 10))
             # Only resize on an actual change: configuring the height re-fires
             # <Configure> on the canvas, which would otherwise re-enter this method.
             if int(canvas.cget("height")) != new_h:
                 canvas.configure(height=new_h)
-            bb = canvas.bbox("all")
-            if bb:
-                canvas.configure(scrollregion=bb)
+            canvas.configure(scrollregion=(0, 0, max_row_w, content_h))
         except tk.TclError:
             pass
 
@@ -6509,12 +6847,16 @@ class DeskpilotApp:
         budget = _handoff_budget_chars(self._ctx_window())
         attempts = 0
         empty_attempts = 0
+        salvage_reason = ""      # best reasoning text seen, used only if the ladder fails
         last_err = ""
         while client is not None:
             body, dropped = _clip_transcript_to_budget(transcript, budget)
             system = ("You are summarizing a conversation for continuity. Produce a concise summary "
                       "preserving: key decisions, facts established, file paths mentioned, code changes "
-                      "made, and any open questions. Be specific. No preamble. If tool calls were made, "
+                      "made, and any open questions. Also state which project folder the work belongs to "
+                      "and which project MEMORY.md or history/ files were read or updated - those files "
+                      "stay on disk after this summary, so naming them keeps the thread findable. "
+                      "Be specific. No preamble. If tool calls were made, "
                       "note what was fetched or changed and the key findings - do not include raw output.")
             if dropped:
                 # Say so, or the model will invent an overview of text it was never shown.
@@ -6550,16 +6892,18 @@ class DeskpilotApp:
                 # are wrong with the old behaviour: it read only .content (so real
                 # reasoning text was discarded), and it gave up after ONE empty
                 # reply while an overflow gets a whole retry ladder.
+                # v1.1.68 ORDERING FIX. v1.1.58 returned salvaged reasoning
+                # IMMEDIATELY, which short-circuited the escalation ladder below:
+                # a thinking model that spent COMPACTION_SUMMARY_MAX_TOKENS (1024)
+                # on reasoning and answered content='' was never retried at 4096 or
+                # uncapped, so the raw thinking trace became the permanent summary.
+                # Observed directly: compaction 7 of this very chat begins "We need
+                # answer user's request: summarize conversation for continuity."
+                # Reasoning is now remembered and used only as the LAST resort,
+                # preferred over the model-free digest but never over a real summary.
                 reason = _reply_reasoning(resp.choices[0].message).strip()
-                if reason:
-                    # The model DID produce text - it just put it in the wrong
-                    # field for us. Salvage it rather than degrade to a digest.
-                    # Marked, because a thinking trace is not a written summary:
-                    # it is usually the model talking to itself about the task.
-                    self._post(lambda n=len(reason): self.render_note(
-                        f"\U0001F4E6 Compaction summary came back empty but the model "
-                        f"wrote {n} chars of reasoning - carrying that over instead."))
-                    return reason
+                if reason and not salvage_reason:
+                    salvage_reason = reason
                 last_err = ("the model returned an empty summary"
                             + (f" (finish_reason={_reply_finish_reason(resp)})" if _reply_finish_reason(resp) else ""))
                 if empty_attempts < SUMMARY_EMPTY_RETRIES:
@@ -6569,6 +6913,13 @@ class DeskpilotApp:
                         f"\U0001F4E6 Compaction summary was empty - retrying with a "
                         f"larger completion budget ({c if c else 'no cap'})\u2026"))
                     continue
+                if salvage_reason:
+                    # Ladder exhausted. A thinking trace still beats a digest.
+                    self._post(lambda n=len(salvage_reason): self.render_note(
+                        f"\U0001F4E6 Compaction summary stayed empty after "
+                        f"{SUMMARY_EMPTY_RETRIES} retries; carrying over the model's "
+                        f"{n} chars of reasoning instead of a digest."))
+                    return salvage_reason
                 break
             except Exception as e:
                 last_err = str(e)
@@ -6745,6 +7096,7 @@ class DeskpilotApp:
         attempts = 0
         empty_attempts = 0
         summary = ""
+        salvage_reason = ""      # best reasoning text seen; used only if the ladder fails
         last_err = ""
         while True:
             history = _trim_for_handoff(sanitized, budget)
@@ -6759,9 +7111,10 @@ class DeskpilotApp:
                     build_system_message(str(self.settings.get("file_workspace") or ""),
                                          str(self.settings.get("exa_api_key") or ""),
                                          str(self.settings.get("firecrawl_api_key") or ""),
-                                         str(self.settings.get("custom_system_prompt") or ""),
+                                         effective_custom_prompt(self.settings),
                                          _skills_index_text(self.settings),
-                                         self._ledger_inject(chat_id)),
+                                         self._ledger_inject(chat_id),
+                                         _project_memory_text(self.settings)),
                     *history,
                     {"role": "user", "content": _handoff_prompt(title)},
                 ],
@@ -6776,19 +7129,25 @@ class DeskpilotApp:
                 if summary:
                     break
                 # v1.1.58: same salvage + escalation as _generate_compaction_summary.
+                # v1.1.68: reasoning is remembered, not returned - returning it here
+                # skipped the escalation ladder and baked a raw thinking trace into
+                # the handoff note that every later session reads as its first message.
                 reason = _reply_reasoning(resp.choices[0].message).strip()
-                if reason:
-                    self._post(lambda n=len(reason): self.render_note(
-                        f"\U0001F4E6 Handoff summary came back empty but the model wrote "
-                        f"{n} chars of reasoning - carrying that over instead."))
-                    summary = reason
-                    break
+                if reason and not salvage_reason:
+                    salvage_reason = reason
                 last_err = ("the model returned an empty summary"
                             + (f" (finish_reason={_reply_finish_reason(resp)})"
                                if _reply_finish_reason(resp) else ""))
                 if empty_attempts < SUMMARY_EMPTY_RETRIES:
                     empty_attempts += 1
                     continue
+                if salvage_reason:
+                    summary = salvage_reason
+                    self._post(lambda n=len(salvage_reason): self.render_note(
+                        f"\U0001F4E6 Handoff summary stayed empty after "
+                        f"{SUMMARY_EMPTY_RETRIES} retries; carrying over the model's "
+                        f"{n} chars of reasoning instead of a digest."))
+                    break
                 break
             except Exception as e:
                 last_err = str(e)
@@ -8810,15 +9169,15 @@ class DeskpilotApp:
         # happening while they do (a killed node/CLI subprocess takes a moment to die).
         self._set_status("⏹ Stopping… (aborting any running tool)")
 
-    def _get_client(self) -> Optional[Any]:
-        """Return a cached OpenAI client for the current server/key.
+    def _client_for(self, url: str, key: str) -> Optional[Any]:
+        """Cached OpenAI client for an explicit (url, key) pair.
 
-        Reusing one client across turns keeps its HTTP connection pool warm
-        (keep-alive), so each request skips the TCP+TLS handshake."""
+        Split out of _get_client so a SECOND endpoint (the ask_expert consultant)
+        can have its own client without touching the primary one. The cache is
+        keyed on the pair, so the two never collide and each keeps its own warm
+        connection pool."""
         if OpenAI is None:
             return None
-        url = (self.settings.get("server_url") or "").strip()
-        key = (self.settings.get("api_key") or "").strip() or "sk-local"
         cached = self._clients.get((url, key))
         if cached is not None:
             return cached
@@ -8830,6 +9189,17 @@ class DeskpilotApp:
         self._clients[(url, key)] = client
         return client
 
+    def _get_client(self) -> Optional[Any]:
+        """Return a cached OpenAI client for the current server/key.
+
+        Reusing one client across turns keeps its HTTP connection pool warm
+        (keep-alive), so each request skips the TCP+TLS handshake."""
+        if OpenAI is None:
+            return None
+        url = (self.settings.get("server_url") or "").strip()
+        key = (self.settings.get("api_key") or "").strip() or "sk-local"
+        return self._client_for(url, key)
+
     def _invalidate_clients(self) -> None:
         """Drop cached OpenAI clients (called when server URL / API key change)."""
         for c in self._clients.values():
@@ -8838,6 +9208,258 @@ class DeskpilotApp:
             except Exception:
                 pass
         self._clients.clear()
+
+    # ── ask_expert: the consultant ────────────────────────────────────
+    def _expert_root(self) -> Path:
+        """The one directory the consultant may read from.
+
+        file_workspace when it is set (that IS the user's working directory);
+        otherwise USER_WORKSPACE_ROOT if it exists on this machine, else BASE_DIR
+        - the same resolution order the handoff-notes path uses, so a copy of
+        this script on any other machine gets a real, sensible root instead of a
+        hardcoded path that does not exist (which would refuse every file and
+        print someone else's username in the error).
+
+        NOT an intersection: requiring both would refuse every file whenever
+        file_workspace points somewhere other than under USER_WORKSPACE_ROOT.
+        The point is that there is ALWAYS a confinement root, even when the
+        optional setting is blank - unlike _safe_path, which goes unrestricted
+        in that case."""
+        ws_raw = str((self.settings or {}).get("file_workspace") or "").strip()
+        if ws_raw:
+            base = Path(os.path.expanduser(ws_raw))
+        elif USER_WORKSPACE_ROOT.is_dir():
+            base = USER_WORKSPACE_ROOT
+        else:
+            base = BASE_DIR
+        return Path(base).resolve()
+
+    def _expert_safe_path(self, raw_path: str) -> Path:
+        """Resolve a path for the consultant, ALWAYS confined to the workspace.
+
+        Deliberately does NOT rely on the optional File Workspace setting being
+        set: _safe_path confines only when file_workspace is set, and blank
+        means unrestricted for the other tools. A tool that ships local file
+        contents to a third party must not inherit that optionality, so the
+        floor here is _expert_root() and it is never absent.
+
+        _safe_path already resolves symlinks, so a link inside the workspace
+        pointing outside resolves outside and is then refused by the prefix
+        check - that case is covered, not assumed."""
+        p = self._safe_path(raw_path)          # traversal + system-dir + optional jail
+        try:
+            root = self._expert_root()
+        except Exception as e:
+            raise PermissionError(f"cannot resolve the workspace root: {e}")
+        p_str, r_str = str(p).lower(), str(root).lower()
+        if p_str != r_str and not p_str.startswith(_dir_prefix(r_str)):
+            raise PermissionError(
+                f"ask_expert may only read inside the workspace ({root}): {p}")
+        return p
+
+    def _expert_read_file(self, spec: dict) -> tuple:
+        """(label, text) for one requested file; text starts with DENIED: if refused.
+
+        Char offsets mirror read_local_file so a region can be targeted instead
+        of shipping a whole 700 KB file to an outside model. Reading from disk
+        rather than pasting code into the prompt is deliberate: a small model
+        retyping code misquotes it (this session produced a citation to a test
+        file that never existed), and the expert would then review something
+        that is not real."""
+        raw = str((spec or {}).get("path") or "")
+        if not raw.strip():
+            return "(empty path)", "DENIED: no path given"
+        try:
+            p = self._expert_safe_path(raw)
+        except PermissionError as e:
+            return Path(raw).name or raw, f"DENIED: {e}"
+        if not p.is_file():
+            return p.name, "DENIED: not a file"
+        try:
+            body = p.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return p.name, f"DENIED: could not read ({e})"
+        try:
+            off = max(0, int(spec.get("offset") or 0))
+        except (TypeError, ValueError):
+            off = 0
+        try:
+            lim = int(spec.get("limit") or 0)
+        except (TypeError, ValueError):
+            lim = 0
+        if lim <= 0 or lim > EXPERT_FILE_CHARS:
+            lim = EXPERT_FILE_CHARS
+        chunk = body[off:off + lim]
+        # Label relative to the workspace root: the expert needs to know WHICH
+        # file it is looking at, but an absolute path also hands it the OS
+        # username and the whole directory layout, which is not part of the
+        # question. Fall back to the name if the path is not under the root.
+        try:
+            rel = p.relative_to(self._expert_root())
+        except Exception:
+            rel = Path(p.name)
+        label = f"{rel} (chars {off}-{off + len(chunk)} of {len(body)})"
+        if off + len(chunk) < len(body):
+            chunk += f"\n\n[... truncated: {len(body) - off - len(chunk)} more chars not sent]"
+        return label, chunk
+
+    def _expert_payload(self, question: str, files, context: str, focus: str) -> list:
+        """Build the consultant's messages FROM SCRATCH.
+
+        This is the isolation guarantee, so it is worth being blunt about why it
+        does not reuse build_system_message(): that function injects the ledger,
+        the skills index, the custom system prompt and the workspace path, and
+        the main loop passes them in. Reusing it would ship the user's durable
+        notes about their machine to a third party. The consultant gets one
+        hardcoded line and nothing else - no history, no persona, no tools.
+        """
+        _FOCUS = {
+            "review":          "Review the code for bugs, unsafe assumptions and API calls that may not exist.",
+            "debug":           "Diagnose the failure and say what to check next.",
+            "design":          "Compare the approaches and recommend one with reasons.",
+            "second_opinion":  "Give an independent view; disagree if the current approach is wrong.",
+        }
+        sys_txt = (
+            "You are a consulting engineer answering ONE narrow question. You have no "
+            "tools, no filesystem access and no access to any conversation - everything "
+            "you know is in this message. Be concrete and specific. If you name a "
+            "function, method or signature, state the library and version you believe "
+            "provides it, and say so plainly if you are unsure it exists. "
+            "Answer directly; do not ask for more context.\n\n"
+            + _FOCUS.get(str(focus or "review"), _FOCUS["review"])
+        )
+        parts = ["QUESTION:\n" + str(question or "").strip()]
+        ctx = str(context or "").strip()
+        if ctx:
+            parts.append("CONTEXT (supplied verbatim by the asking model):\n" + ctx)
+        denials, sent = [], 0
+        for spec in (files or []):
+            if isinstance(spec, str):
+                spec = {"path": spec}
+            label, text = self._expert_read_file(spec)
+            if text.startswith("DENIED:"):
+                denials.append(f"{label}: {text}")
+            else:
+                sent += 1
+                parts.append(f"FILE {label}:\n```\n{text}\n```")
+        return [{"role": "system", "content": sys_txt},
+                {"role": "user", "content": "\n\n".join(parts)}], denials, sent
+
+    def _tool_ask_expert(self, question: str = "", files=None, context: str = "",
+                         focus: str = "review") -> str:
+        """Ask the consultant. Single-shot, no tools, sees only what is named.
+
+        Guards, each load-bearing:
+          * per-turn call limit (a small model over-delegates; five 60-second
+            thinking calls in one turn is a very long wait)
+          * no `tools` kwarg, and any tool_calls in the reply are DISCARDED -
+            giving the expert the tool schemas would start a second agent loop
+            with only one of them under the permission system
+          * empty-content retry: a thinking model can spend the entire cap on
+            reasoning and return content='' (v1.1.58). Returning that blank is
+            the worst possible failure, because it happens on hard questions.
+        """
+        url = str(self.settings.get("expert_server_url") or "").strip()
+        key = str(self.settings.get("expert_api_key") or "").strip()
+        model = str(self.settings.get("expert_model") or "").strip()
+        # All three are required. Checking only url+key let a blank model through
+        # and sent model="" - verified against the live endpoint: it answers
+        # 400 "model is not specified", which reads to the model as a broken
+        # expert rather than an unconfigured one.
+        if not url or not key or not model:
+            return ("ERROR: ask_expert is not configured. Set Expert Server URL, "
+                    "Expert API Key and Expert Model in Settings "
+                    + ("(Expert Model is blank)" if (url and key and not model) else "") + ".")
+        if not str(question or "").strip():
+            return "ERROR: ask_expert needs a question."
+
+        used = int(getattr(self, "_expert_calls_this_turn", 0) or 0)
+        if used >= EXPERT_MAX_CALLS_PER_TURN:
+            return (f"ERROR: ask_expert limit reached ({EXPERT_MAX_CALLS_PER_TURN} "
+                    f"per turn). Work from what you already have.")
+
+        msgs, denials, sent_files = self._expert_payload(question, files, context, focus)
+        # Files were named but every one was refused, and there is no context to
+        # fall back on: do not spend a consult shipping a prompt whose only
+        # content is a list of denials. Say so and return WITHOUT charging the
+        # budget - nothing left the machine, so it is not one of the five.
+        if denials and not sent_files and not str(context or "").strip():
+            return ("ERROR: no files could be sent to the expert:\n  "
+                    + "\n  ".join(denials))
+        # Total-size clamp: the payload is built from user-named files, and one
+        # huge file would otherwise ride out unbounded.
+        total = sum(len(str(m.get("content") or "")) for m in msgs)
+        if total > EXPERT_TOTAL_CHARS:
+            return (f"ERROR: payload too large for one consult ({total} chars; "
+                    f"limit {EXPERT_TOTAL_CHARS}). Narrow the file ranges or ask "
+                    f"about fewer files at once.")
+
+        # Charged only once a request is actually going out.
+        self._expert_calls_this_turn = used + 1
+
+        client = self._client_for(url, key)
+        if client is None:
+            return "ERROR: could not create the expert client (is 'openai' installed?)"
+
+        label = f"{model} @ {url.split('//')[-1].rstrip('/')}"
+        kw = dict(model=model, messages=msgs, stream=False,
+                  max_tokens=EXPERT_MAX_TOKENS)
+        # NO tools / tool_choice here. That is the whole safety property.
+        txt, usage, err = _probe_create(client, kw, EXPERT_TIMEOUT_S)
+        # Gemini's /models lists IDs as "models/<name>" but its own chat examples
+        # send the bare "<name>". Which one the endpoint accepts was not
+        # verifiable here (the account was rate-limited), so try the other form
+        # once on a model error rather than making the user guess. A 429 is NOT a
+        # model error and must not trigger this.
+        if err and _is_model_lookup_error(err):
+            alt = model[7:] if model.startswith("models/") else "models/" + model
+            if alt and alt != model:
+                kw_alt = dict(kw)
+                kw_alt["model"] = alt
+                t2, u2, e2 = _probe_create(client, kw_alt, EXPERT_TIMEOUT_S)
+                if not e2 or not _is_model_lookup_error(e2):
+                    txt, usage, err = t2, u2, e2
+                    model = alt
+                    label = f"{alt} @ {url.split('//')[-1].rstrip('/')}"
+        # Thinking-model recovery: empty content but the model clearly worked.
+        if not err and not txt.strip():
+            kw2 = dict(model=model, messages=msgs, stream=False)
+            txt, usage, err = _probe_create(client, kw2, EXPERT_TIMEOUT_S)
+            if not err and not txt.strip():
+                return (f"ERROR: {label} returned an empty answer twice (it may have "
+                        f"spent the whole budget thinking). Narrow the question or "
+                        f"send less code.")
+        if err:
+            return f"ERROR: expert call failed ({label}): {_probe_first_line(err)}"
+        if denials:
+            # Partial refusal: some files went, others did not. The expert must
+            # be told which are missing or it will review an incomplete picture
+            # and say nothing about it.
+            txt = (txt.rstrip() + "\n\n[Note: these files were requested but NOT "
+                   "sent to the expert, so the answer cannot cover them:\n  "
+                   + "\n  ".join(denials) + "]")
+
+        self._post(lambda t=txt, l=label, n=used + 1:
+                   self._render_expert_note(t, l, n))
+        return (f"EXPERT CONSULT #{used + 1}/{EXPERT_MAX_CALLS_PER_TURN} ({label}) - "
+                f"advisory only, verify anything it names:\n\n{txt.strip()}")
+
+    def _render_expert_note(self, text: str, label: str, n: int) -> None:
+        """MAIN THREAD. Show the consult as its own accordion, so it is always
+        visible which parts of the reasoning came from this machine and which
+        came from a third party.
+
+        Guarded by _viewing_run_chat(): the user may have switched chats while
+        the consult was in flight, and painting into a chat that is no longer
+        open corrupts the wrong transcript (same reason _render_steered_message
+        is guarded)."""
+        if not self._viewing_run_chat():
+            return
+        body = (text or "").strip() or "(empty answer)"
+        title = f"\U0001f9e0 {label} - consulted (#{n})"
+        sid = self._add_accordion(title, COL["accent"], expanded=False)
+        self.chat_text.insert("end", body + "\n", [sid + "_body", "code_block"])
+        self._autoscroll()
 
     def _chat_worker(self, chat_id: str, messages: List[dict]) -> None:
         """Thread entry point: run the agentic loop, and NEVER let an exception
@@ -8850,11 +9472,15 @@ class DeskpilotApp:
         returns silently until the app is restarted. The inner loop's own
         error paths post _finish_turn_ui themselves; this net catches what
         they cannot, on the abnormal-exit path only (no double-finish)."""
-        # v1.1.52 (#10): the ONE choke point every turn passes through, so the
-        # steering queue can never carry a stale message into a new turn - a
-        # per-caller clear would be missed by any future turn-start path.
-        self._steer_clear()
         try:
+            # v1.1.52 (#10): the ONE choke point every turn passes through, so the
+            # steering queue can never carry a stale message into a new turn - a
+            # per-caller clear would be missed by any future turn-start path.
+            # v1.1.68: INSIDE the try. It used to sit above it, so an exception
+            # here (a missing _steer_lock, a future refactor) escaped the whole
+            # function with _busy stuck True - the exact wedge this net exists to
+            # prevent, reachable only because the guarded call was outside the guard.
+            self._steer_clear()
             self._chat_worker_inner(chat_id, messages)
         except Exception as e:
             traceback.print_exc()
@@ -8866,7 +9492,15 @@ class DeskpilotApp:
             # (normal, Stop, and the escaping-exception net above). The manifest of
             # the turn that just ended is already posted/persisted; only the
             # in-memory namespace closes.
-            self._end_turn_checkpoints(chat_id)
+            # v1.1.68: guarded. An exception raised HERE replaces the original one
+            # and escapes the thread - and because it runs in `finally` it would do
+            # so even on the clean path. _busy is already cleared by then, so it
+            # cannot wedge the UI, but it would bury the real error. Never let
+            # cleanup noise mask the failure that started the turn.
+            try:
+                self._end_turn_checkpoints(chat_id)
+            except Exception:
+                traceback.print_exc()
 
     def _chat_worker_inner(self, chat_id: str, messages: List[dict]) -> None:
         """Background daemon thread: streams model responses and executes tools.
@@ -8895,6 +9529,10 @@ class DeskpilotApp:
         # including the handoff/retry paths. Pruning happens at TURN START, never at turn
         # end, so a turn that fails midway cannot delete anything.
         self._begin_turn_checkpoints(chat_id)
+        # ask_expert's per-turn budget resets here, not in send_message: the
+        # worker is the only thing that always runs for a turn (the same reason
+        # the checkpoint namespace is opened here).
+        self._expert_calls_this_turn = 0
         # Wall-clock backstop for this prompt, from the "Turn time limit" setting
         # (0 = NO LIMIT, which is the default). MAX_TOOL_STEPS == 0 means the loop has no
         # step cap, so a deadline is the only thing that can end a model that keeps calling
@@ -8961,9 +9599,10 @@ class DeskpilotApp:
                                 messages=[build_system_message(str(self.settings.get("file_workspace") or ""),
                                    str(self.settings.get("exa_api_key") or ""),
                                    str(self.settings.get("firecrawl_api_key") or ""),
-                                   str(self.settings.get("custom_system_prompt") or ""),
+                                   effective_custom_prompt(self.settings),
                                    _skills_index_text(self.settings),
-                                   self._ledger_inject(chat_id))]
+                                   self._ledger_inject(chat_id),
+                                   _project_memory_text(self.settings))]
                                   + _prepare_request_messages(list(messages)),
                                 stream=True)
             if enabled_tools:
@@ -9308,26 +9947,22 @@ class DeskpilotApp:
                     break
                 name = tc["function"]["name"]
                 args_raw_dispatch = tc["function"].get("arguments") or "{}"
-                try:
-                    args = json.loads(args_raw_dispatch)
-                    # The finalizer above masks malformed model JSON as
-                    # {"_raw_arguments": ...} so history stays sendable to strict
-                    # servers - unmask it here, otherwise the call would reach the
-                    # handler and die with a confusing TypeError instead of the
-                    # clear "re-issue valid JSON" error below.
-                    if isinstance(args, dict) and "_raw_arguments" in args:
-                        orig_raw = str(args["_raw_arguments"])
-                        if orig_raw.strip() not in ("", "{}"):
-                            raise ValueError("masked malformed JSON")
-                        args = {}
-                except Exception:
-                    # Malformed tool-call arguments (common with local models on
-                    # large payloads): never silently run the tool with {} - that
-                    # executes a no-op and looks like "the tool produced no output".
+                args, args_err = parse_tool_arguments(args_raw_dispatch)
+                if args_err:
+                    # Malformed (or wrongly-shaped) tool-call arguments, common
+                    # with local models on large payloads: never silently run the
+                    # tool with {} - that executes a no-op and reads as "the tool
+                    # produced no output".
                     self._post(lambda n=name: self._ui_tool_call_accordion(n, {"_malformed_arguments": True}))
-                    err = (f"ERROR: The {name} tool call had malformed JSON arguments and "
-                           f"could not be parsed - it was NOT executed. Re-issue the call "
-                           f"with valid JSON (keep large payloads like code concise).")
+                    if args_err == "malformed":
+                        err = (f"ERROR: The {name} tool call had malformed JSON arguments and "
+                               f"could not be parsed - it was NOT executed. Re-issue the call "
+                               f"with valid JSON (keep large payloads like code concise).")
+                    else:
+                        err = (f"ERROR: The {name} tool call's arguments were a "
+                               f"{args_err}, not a JSON object - it was NOT executed. "
+                               f"Re-issue the call as an object of named parameters, "
+                               f"e.g. {{\"question\": \"...\"}}.")
                     messages.append({"role": "tool", "tool_call_id": tc["id"],
                                      "name": name, "content": err})
                     self._post(lambda n=name, r=err: self._ui_tool_output_accordion(n, err))
@@ -9494,6 +10129,45 @@ class DeskpilotApp:
 
     # ── permission gate + tool dispatch (worker thread) ─────────────────────
 
+    def _permission_preview(self, name: str, args: dict) -> str:
+        """The text shown in the permission modal.
+
+        For ask_expert the arguments ARE the payload that leaves the machine,
+        so the stock 600-char JSON dump is not enough to actually review what
+        is being sent to a third party. This spells out the destination, the
+        whole question, and every file with the range that will be shipped.
+        """
+        if name != "ask_expert":
+            p = json.dumps(args, ensure_ascii=False)
+            return p[:600] + "…" if len(p) > 600 else p
+        # Belt and braces: the dispatch loop already rejects non-dict arguments,
+        # so this is not the load-bearing guard - but this function calls
+        # args.get() repeatedly and must not raise wherever it is called from.
+        if not isinstance(args, dict):
+            args = {}
+        url = str(self.settings.get("expert_server_url") or "")
+        model = str(self.settings.get("expert_model") or "")
+        host = url.split("//")[-1].split("/")[0] if url else "(not configured)"
+        out = [f"SEND TO: {model} @ {host}",
+               "The expert sees NOTHING else - no chat history, no settings.\n"]
+        out.append("QUESTION:\n" + str((args or {}).get("question") or "").strip())
+        ctx = str((args or {}).get("context") or "").strip()
+        if ctx:
+            shown = ctx if len(ctx) <= 1200 else ctx[:1200] + "\n… [truncated in this preview]"
+            out.append("\nCONTEXT TEXT (" + str(len(ctx)) + " chars):\n" + shown)
+        files = (args or {}).get("files") or []
+        if files:
+            out.append("\nFILES TO SEND:")
+            for spec in files:
+                if isinstance(spec, str):
+                    spec = {"path": spec}
+                off = spec.get("offset") or 0
+                lim = spec.get("limit") or EXPERT_FILE_CHARS
+                out.append(f"  {spec.get('path')}  chars {off}-{off + lim}")
+        else:
+            out.append("\nFILES TO SEND: none")
+        return "\n".join(out)
+
     def _ask_permission_modal(self, name: str, args: dict) -> bool:
         """Modal Allow/Deny prompt, marshalled to the main thread; blocks this
         worker until the user answers (or 5 minutes pass).
@@ -9507,9 +10181,7 @@ class DeskpilotApp:
         we hold a reference to, and it self-closes (answering No) as soon as Stop
         or app-close is seen - the same shape _elicit_dialog already uses.
         """
-        preview = json.dumps(args, ensure_ascii=False)
-        if len(preview) > 600:
-            preview = preview[:600] + "…"
+        preview = self._permission_preview(name, args)
         ans: Dict[str, bool] = {"ok": False}
         ev = threading.Event()
 
@@ -9559,7 +10231,8 @@ class DeskpilotApp:
                      font=F(12, "bold")).pack(padx=16, pady=(0, 6), anchor="w")
             tk.Label(top, text="Arguments:", bg=COL["bg_main"], fg=COL["text_dim"],
                      font=F(10)).pack(padx=16, anchor="w")
-            box = tk.Text(top, height=9, width=64, bg=COL["bg_raised"], fg=COL["text"],
+            box = tk.Text(top, height=(18 if name == "ask_expert" else 9), width=64,
+                          bg=COL["bg_raised"], fg=COL["text"],
                           insertbackground=COL["text"], relief="flat", font=F(10),
                           wrap="word", padx=8, pady=6)
             box.insert("1.0", preview)
@@ -9824,10 +10497,11 @@ class DeskpilotApp:
     def _tool_firecrawl_scrape(self, url: str = "") -> str:
         """Firecrawl scrape (POST https://api.firecrawl.dev/v1/scrape).
 
-        Metered service: each scrape consumes one of the user's limited monthly
-        credits. The model-facing description + system prompt steer it to be used
-        only when plain fetch_url cannot get the content (JS-rendered pages,
-        anti-bot walls) - never as a first choice for static pages.
+        There is NO counter in this code: the only thing that ever limited this
+        tool was the wording below. The user's plan carries a generous monthly
+        allowance (1,000 calls), so the credit-hoarding steering was removed on
+        request - fetch_url is still tried first for simple static pages because
+        it is faster and free, not because a scrape is scarce.
         """
         key = (self.settings.get("firecrawl_api_key") or "").strip()
         if not key:
@@ -9963,8 +10637,7 @@ class DeskpilotApp:
             out += "\n\n" + note
             if (self.settings.get("firecrawl_api_key") or "").strip():
                 out += ("\n[Tip] This wall often blocks plain HTTP clients. firecrawl_scrape can usually get "
-                        "past it - but each scrape uses one of the user's limited monthly credits, so only "
-                        "escalate when the content is actually needed.")
+                        "past it - escalate to it when the content is needed.")
         return out
 
     def _find_node(self) -> Optional[str]:
@@ -12007,18 +12680,27 @@ class DeskpilotApp:
             ("Compaction keep-recent (most recent messages kept verbatim when compacting)", "compaction_keep_recent"),
             ("Chat render window (messages shown per chat view; older ones behind 'Load earlier messages'; 0 = show all)", "chat_render_window"),
             ("Ledger in system prompt (chars of append-only notes injected each request; 0 = off, read_ledger() still reaches them)", "ledger_inject_chars"),
+            ("Project memory index (chars of the workspace MEMORY.md injected each request; 0 = off)", "project_memory_chars"),
+            ("Project memory file (blank = <workspace>/MEMORY.md)", "project_memory_file"),
             ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
-            ("Firecrawl API Key (metered; blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
+            ("Firecrawl API Key (blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
             ("Allow Local Network (fetch_url)", "allow_local_network"),
             ("MCP Servers (stdio subprocesses; tools appear in the permission bar)", "mcp_servers"),
             ("Skills folder (extra folder scanned for SKILL.md skills; blank = <workspace>/skills only)", "skills_dir"),
+            # Consultant (ask_expert). Independent of the three rows above: the
+            # local model stays primary and these only ever get consulted.
+            ("Expert Server URL (ask_expert; blank = tool off)", "expert_server_url"),
+            ("Expert API Key (ask_expert; blank = tool off)", "expert_api_key"),
+            ("Expert Model (exact ID, e.g. gemini-3.8-flash)", "expert_model"),
         ]
         entries: Dict[str, tk.Entry] = {}
         model_combo: Optional[ttk.Combobox] = None
+        expert_combo: Optional[ttk.Combobox] = None
         local_net_var: Optional[tk.BooleanVar] = None
         _note_var: Optional[tk.BooleanVar] = None
         custom_prompt_text: Optional[tk.Text] = None
+        cp_enabled_var: Optional[tk.BooleanVar] = None
         for i, (label, key) in enumerate(rows):
             if key == "mcp_servers":
                 # Managed list of stdio MCP servers (Add/Remove); connecting is
@@ -12089,14 +12771,55 @@ class DeskpilotApp:
                 model_combo.set(self.settings.get("model_name", ""))
                 model_combo.pack(side="left", fill="x", expand=True)
                 continue
+            if key == "expert_model":
+                # Editable combobox, same shape as Model Name: the exact ID
+                # matters (a wrong one is a 400/404), and "List models" fills it
+                # from the expert endpoint's own /models so the name is never
+                # guessed. Free typing still works for providers that do not
+                # list models.
+                exp_row = tk.Frame(inner, bg=COL["bg_main"])
+                exp_row.grid(row=i, column=1, columnspan=2, sticky="ew",
+                             pady=6, padx=(0, 8))
+                expert_combo = ttk.Combobox(exp_row, values=[], width=44,
+                                            style="Tool.TCombobox", font=F(11))
+                expert_combo.set(self.settings.get("expert_model", ""))
+                expert_combo.pack(side="left", fill="x", expand=True)
+                continue
             if key == "custom_system_prompt":
+                # ONE row, two controls: the enable checkbox sits directly above the
+                # text box in the same col-1 cell, because the toggle and the text are
+                # one logical control. A separate row made them read as two unrelated
+                # settings.
+                #
+                # Why the checkbox is NOT in col 0 (where the label usually goes):
+                #  - the col-0 label is what p7b's re-wrap machinery sizes and shrinks
+                #    (row_labels); a Checkbutton there is not in that list, so its long
+                #    text would pin the label column's minimum width - the exact bug
+                #    P7b fixed.
+                #  - test_p7_settings_layout asserts one col-0 label PER ROW, so a row
+                #    without one fails the census.
+                # Keeping the label and stacking the controls in col 1 satisfies both.
+                #
+                # Gates INJECTION only: unticking keeps the text, so a persona can be
+                # switched off for one session and back on later with no retyping - the
+                # whole reason the control exists.
+                cp_frame = tk.Frame(inner, bg=COL["bg_main"])
+                cp_frame.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
+                cp_frame.columnconfigure(0, weight=1)
+                cp_enabled_var = tk.BooleanVar(
+                    value=bool(self.settings.get("custom_system_prompt_enabled", True)))
+                tk.Checkbutton(cp_frame, text="Enable (unticked = the text below is kept but NOT sent)",
+                               variable=cp_enabled_var, bg=COL["bg_main"], fg=COL["text"],
+                               activebackground=COL["bg_main"], activeforeground=COL["text"],
+                               selectcolor=COL["bg_deep"], font=F(10)) \
+                    .grid(row=0, column=0, sticky="w", pady=(0, 4))
                 # Multi-line: persona/style instructions can run to several lines.
-                custom_prompt_text = tk.Text(inner, width=44, height=5, wrap="word",
+                custom_prompt_text = tk.Text(cp_frame, width=44, height=5, wrap="word",
                                              bg=COL["bg_deep"], fg=COL["text"],
                                              insertbackground=COL["text"], relief="flat",
                                              font=F(10))
                 custom_prompt_text.insert("1.0", self.settings.get("custom_system_prompt", ""))
-                custom_prompt_text.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
+                custom_prompt_text.grid(row=1, column=0, sticky="ew")
                 continue
             if key == "allow_local_network":
                 local_net_var = tk.BooleanVar(value=bool(self.settings.get("allow_local_network", False)))
@@ -12126,7 +12849,7 @@ class DeskpilotApp:
                 _rowf = sk_rowf
             e = tk.Entry(_rowf or inner, width=44, bg=COL["bg_deep"], fg=COL["text"],
                          insertbackground=COL["text"], relief="flat",
-                         show="*" if key in ("api_key", "exa_api_key", "firecrawl_api_key") else "")
+                         show="*" if key in ("api_key", "exa_api_key", "firecrawl_api_key", "expert_api_key") else "")
             e.insert(0, self.settings.get(key, ""))
             if _rowf is None:
                 e.grid(row=i, column=1, sticky="ew", pady=6, padx=(0, 8))
@@ -12326,6 +13049,69 @@ class DeskpilotApp:
                 pass
 
         use_btn.configure(command=_use_loaded)
+
+        # ── Expert model list (ask_expert) ───────────────────────────
+        # The expert endpoint's own /models is the only reliable source for the
+        # exact ID; guessing it produced a name that is not in Google's list at
+        # all. Fetched on the expert URL+key, NOT the primary ones.
+        def _refresh_expert_models() -> None:
+            eurl = entries["expert_server_url"].get().strip()
+            ekey = entries["expert_api_key"].get().strip()
+            if not eurl or not ekey:
+                exp_lbl.configure(text="Set Expert Server URL and API Key first.")
+                return
+            try:
+                exp_btn.configure(text="Loading...")
+                expert_combo.configure(state="disabled")
+            except tk.TclError:
+                return
+
+            def _eworker():
+                info = fetch_model_info(eurl, ekey, timeout=20)
+                # Gemini's /models returns "models/<name>" while its own chat
+                # examples use the bare "<name>". Offer the bare form (what the
+                # docs show); _tool_ask_expert retries the other form if the
+                # endpoint disagrees, so either one works.
+                ids = []
+                for m in info:
+                    mid = str(m.get("id") or "").strip()
+                    if not mid:
+                        continue
+                    bare = mid[7:] if mid.startswith("models/") else mid
+                    if bare not in ids:
+                        ids.append(bare)
+
+                def _edone():
+                    try:
+                        if not top.winfo_exists():
+                            return
+                        hist = [h for h in (self.settings.get("expert_model_history") or [])
+                                if isinstance(h, str)]
+                        merged = list(ids) + [h for h in hist if h not in ids]
+                        expert_combo.configure(values=merged, state="normal")
+                        exp_btn.configure(text="List models")
+                        if ids:
+                            pro = [i for i in ids if "pro" in i.lower()]
+                            exp_lbl.configure(
+                                text=f"{len(ids)} models from the expert endpoint"
+                                     + (f" - Pro: {', '.join(pro[:4])}" if pro else ""))
+                        else:
+                            exp_lbl.configure(text="No model list from that endpoint "
+                                                  "(check the URL/key) - type the ID.")
+                    except tk.TclError:
+                        pass
+                self._post(_edone)
+
+            threading.Thread(target=_eworker, daemon=True).start()
+
+        exp_btn = tk.Button(exp_row, text="List models",
+                            command=_refresh_expert_models,
+                            bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                            relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
+        exp_btn.pack(side="left", padx=(8, 0))
+        exp_lbl = tk.Label(exp_row, text="", bg=COL["bg_main"], fg=COL["text_dim"],
+                           font=F(9), justify="left")
+        exp_lbl.pack(side="left", padx=(8, 0))
         # Loaded-model note: created here (the refresh callback references it), packed
         # into the footer frame further down so it never collides with a grid row.
         loaded_lbl = tk.Label(top, text="", bg=COL["bg_main"], fg=COL["text_dim"],
@@ -12477,6 +13263,8 @@ class DeskpilotApp:
             for k, e in entries.items():
                 self.settings[k] = e.get().strip()
             self.settings["custom_system_prompt"] = cp
+            if cp_enabled_var is not None:
+                self.settings["custom_system_prompt_enabled"] = bool(cp_enabled_var.get())
             if local_net_var is not None:
                 self.settings["allow_local_network"] = bool(local_net_var.get())
             # Model Name comes from the combobox (editable - free typing still works),
@@ -12491,6 +13279,15 @@ class DeskpilotApp:
                 elif status == "ambiguous":
                     self._set_status("Model Name matches several server models - used as typed")
             self.settings["model_name"] = model_val
+            # Expert Model comes from its own combobox (not in `entries`, so the
+            # loop above cannot see it) - without this the field would never save.
+            exp_val = str(expert_combo.get()).strip() if expert_combo is not None else ""
+            self.settings["expert_model"] = exp_val
+            if exp_val:
+                eh = [h for h in (self.settings.get("expert_model_history") or [])
+                      if isinstance(h, str) and h != exp_val]
+                eh.insert(0, exp_val)
+                self.settings["expert_model_history"] = eh[:MODEL_HISTORY_MAX]
             if model_val:
                 hist = [h for h in (self.settings.get("model_history") or [])
                         if isinstance(h, str) and h != model_val]
@@ -12561,6 +13358,15 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 _lg = LEDGER_INJECT_DEFAULT
             self.settings["ledger_inject_chars"] = max(0, min(LEDGER_INJECT_MAX, _lg))
+            # Project memory index budget: same clamp shape as the ledger, and 0 = OFF.
+            # _project_memory_text clamps again at read time, so a hand-edited settings
+            # file cannot make every request carry an unbounded index.
+            try:
+                _pm = int(float(self.settings.get("project_memory_chars",
+                                                  PROJECT_MEMORY_DEFAULT)))
+            except (TypeError, ValueError):
+                _pm = PROJECT_MEMORY_DEFAULT
+            self.settings["project_memory_chars"] = max(0, min(PROJECT_MEMORY_MAX, _pm))
             # Sampling: coerce + clamp each field; blank/garbage -> "" (key omitted from requests).
             _samp: Dict[str, Any] = {}
             for _sk, _sl, _lo, _hi, _si, _st, _so in SAMPLING_SCHEMA:
@@ -12942,6 +13748,10 @@ class DeskpilotApp:
                     self._mcp_connect_running = False
 
     def _mcp_connect_worker(self) -> None:
+        # A bundled Node (installed next to the exe by the Windows installer) has
+        # to be on PATH before any server is spawned, or `npx -y ...` fails with
+        # "not found on PATH". Cheap and idempotent; a system Node wins if present.
+        _ensure_bundled_node_on_path()
         wanted = self._mcp_servers_cfg()
         # Close servers that are no longer configured. Pop under the lock,
         # close OUTSIDE it (close() can block ~3 s on a stuck subprocess).
