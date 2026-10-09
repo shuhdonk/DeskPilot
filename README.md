@@ -37,9 +37,11 @@ Deskpilot is built to run unattended AI agents safely on your hardware. It imple
 
 ## 📦 Install
 
-**Windows (easiest):** download and run the installer — it bundles Python, all dependencies and Node.js, needs no admin rights, and leaves your settings and chat history untouched on uninstall:
+**Windows — easiest, one file.** Download the installer and double-click it. It bundles Python, all dependencies and Node.js, needs no admin rights, and leaves your settings and chat history untouched when uninstalled:
 
-* ⬇️ **[DeskPilot-Setup-1.1.70.exe](https://github.com/shuhdonk/DeskPilot/raw/main/installer/DeskPilot-Setup-1.1.70.exe)** (128 MB) — committed under [`installer/`](https://github.com/shuhdonk/DeskPilot/tree/main/installer) and tracked with Git LFS, so `git clone` pulls it down automatically. The current version number always lives at the top of [`deskpilot.py`](deskpilot.py).
+* ⬇️ **[DeskPilot-Setup-1.1.70.exe](https://github.com/shuhdonk/DeskPilot/raw/main/installer/DeskPilot-Setup-1.1.70.exe)** — 128 MB
+
+> **If your browser shows the file page instead of saving it:** GitHub cannot *preview* a binary this large, so the [`blob/…` page](https://github.com/shuhdonk/DeskPilot/blob/main/installer/DeskPilot-Setup-1.1.70.exe) prints "we can't show files that are this big right now" — that is only the viewer. The file itself is there: use the **raw** link above, or press **Download raw file** (the ⬇ icon) on that page. Alternatively, `git clone` fetches it automatically — it is stored with Git LFS.
 
 **Windows / Linux from source:** follow [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) or [INSTALL_LINUX.md](INSTALL_LINUX.md) — step-by-step, copy-paste ready.
 
