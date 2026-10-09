@@ -39,8 +39,7 @@ Deskpilot is built to run unattended AI agents safely on your hardware. It imple
 
 **Windows (easiest):** download and run the installer — it bundles Python, all dependencies and Node.js, needs no admin rights, and leaves your settings and chat history untouched on uninstall:
 
-* ⬇️ **[DeskPilot-Setup-1.1.70.exe](https://github.com/shuhdonk/DeskPilot/releases/latest/download/DeskPilot-Setup-1.1.70.exe)** (127 MB) — or see all builds on the [Releases page](https://github.com/shuhdonk/DeskPilot/releases).
-
+* ⬇️ **[DeskPilot-Setup-1.1.70.exe](https://github.com/shuhdonk/DeskPilot/blob/main/installer/DeskPilot-Setup-1.1.70.exe)** (127 MB)
 **Windows / Linux from source:** follow [INSTALL_WINDOWS.md](INSTALL_WINDOWS.md) or [INSTALL_LINUX.md](INSTALL_LINUX.md) — step-by-step, copy-paste ready.
 
 ```bash
