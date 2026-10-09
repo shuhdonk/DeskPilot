@@ -2,7 +2,9 @@
 
 ![Deskpilot Interface](assets/DeskPilot.jpg)
 
-![Deskpilot Settings](assets/DeskPilot-Settings.jpg)
+![Deskpilot Settings](assets/DeskPilot-Settings1.jpg)
+
+![Deskpilot Settings](assets/DeskPilot-Settings2.jpg)
 
 Deskpilot is a standalone, AI desktop assistant built with Python and Tkinter. Designed for power users, it acts as a fully agentic copilot on your local machine.
 
