@@ -98,9 +98,9 @@ import urllib.request
 import uuid
 import webbrowser
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
@@ -140,6 +140,10 @@ try:
     from faster_whisper import WhisperModel   # local dictation - keeps audio on this machine
 except Exception:            # pragma: no cover
     WhisperModel = None      # type: ignore
+try:
+    from spellchecker import SpellChecker     # chat-box spell check (v1.1.78)
+except Exception:            # pragma: no cover
+    SpellChecker = None      # type: ignore
 
 # ---------------------------------------------------------------------------
 #  Local dictation (faster-whisper) - optional; auto-used when installed
@@ -356,9 +360,12 @@ def wav_bytes_to_float32(wav_bytes: bytes):
     import io as _io
     import wave
     import numpy as np
-    wf = wave.open(_io.BytesIO(wav_bytes))
-    rate, nch, width = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
-    raw = wf.readframes(wf.getnframes())
+    with wave.open(_io.BytesIO(wav_bytes)) as wf:
+        # The handle used to be left open, and the ValueError below then raised with it
+        # still attached. Not merely untidy here: this repo's suites run under
+        # `python -W error`, where the resulting ResourceWarning is a hard failure.
+        rate, nch, width = wf.getframerate(), wf.getnchannels(), wf.getsampwidth()
+        raw = wf.readframes(wf.getnframes())
     if width != 2 or nch != 1:
         raise ValueError(f"unsupported WAV format (rate={rate} ch={nch} width={width})")
     pcm = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
@@ -544,6 +551,8 @@ _safe_stdio()
 
 MCP_PROTOCOL_VERSION = "2025-03-26"
 MCP_MAX_SERVERS = 8          # hard cap on configured servers
+MCP_TOOL_NAME_MAX = 64       # OpenAI-compatible cap on a function name; a longer one
+                             # makes the provider reject the WHOLE tools array
 MCP_INIT_TIMEOUT = 15        # seconds for spawn + initialize handshake
 MCP_CALL_TIMEOUT = 120       # seconds per tools/call (long-running tools)
 MCP_MAX_IMAGES_PER_CALL = 8  # images taken from ONE tools/call result (a chatty server
@@ -607,10 +616,22 @@ def mcp_split_content(result: Any) -> tuple:
 
 
 def mcp_tool_name(server: str, raw: str) -> str:
-    """Namespaced tool name: mcp_<server>_<tool>, sanitized to [A-Za-z0-9_]."""
+    """Namespaced tool name: mcp_<server>_<tool>, sanitized to [A-Za-z0-9_].
+
+    OpenAI-compatible providers cap a function name at 64 characters and reject the
+    ENTIRE tools array when one is over, so a long server+tool pair has to be shortened
+    rather than passed through. The tail is replaced by a hash of the full name: the
+    result is deterministic (dispatch looks tools up by name, so two calls must agree)
+    and stays unique across tools whose names share a prefix.
+    """
     def _clean(s: str) -> str:
         return re.sub(r"[^A-Za-z0-9_]", "_", s).strip("_") or "x"
-    return f"mcp_{_clean(server)}_{_clean(raw)}"
+    name = f"mcp_{_clean(server)}_{_clean(raw)}"
+    if len(name) <= MCP_TOOL_NAME_MAX:
+        return name
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:8]
+    keep = MCP_TOOL_NAME_MAX - len(digest) - 1
+    return name[:keep].rstrip("_") + "_" + digest
 
 
 # v1.1.56 (#4 of the external review): the old implementation split on
@@ -622,6 +643,12 @@ def mcp_tool_name(server: str, raw: str) -> str:
 # A quoted value keeps its spaces; a bare value stops at the first space, which
 # is the same rule as a shell and is what the docstring tells the user to do.
 _ENV_PAIR_RE = re.compile(r"([^\s=]+)=(\"[^\"]*\"|'[^']*'|\S*)")
+# One argv token: a run of pieces, where a piece is a double-quoted span, a
+# single-quoted span, or any single non-space character. Grouping pieces (rather
+# than matching one quoted span OR one bare span) is what lets --root="C:\My Docs"
+# fuse into a single argument the way a shell word does.
+_ARG_TOKEN_RE = re.compile(r"(?:\"[^\"]*\"|'[^']*'|\S)+")
+_ARG_PIECE_RE = re.compile(r"\"[^\"]*\"|'[^']*'|\S")
 
 
 def _parse_env_pairs(text: str) -> Dict[str, str]:
@@ -642,8 +669,156 @@ def _parse_env_pairs(text: str) -> Dict[str, str]:
     return out
 
 
+def _parse_args_list(text: str) -> list:
+    """Split one command-line string into argv entries (the Add-MCP-Server args field).
+
+    Same rule the env field uses since v1.1.56, and the same reason shlex is not used:
+    POSIX shlex treats '\\' as an escape and deletes the backslashes from an unquoted
+    Windows path ('C:\\Program Files\\node.exe' -> 'C:Program Filesnode.exe'), which is
+    silent corruption instead of a visible mis-split; shlex(posix=False) keeps them but
+    leaves the surrounding quotes IN the token, which is equally wrong for an argv entry.
+
+    So: a double-quoted run is one argument with the quotes removed, a single-quoted run
+    likewise, and quoted and bare runs adjacent to each other fuse into ONE argument
+    ('--root="C:\\My Docs"' -> one entry), which is what a shell does and what users
+    type. A quote with no closing partner is kept literally rather than dropped.
+    'serve --root "C:\\My Docs"' -> ['serve', '--root', 'C:\\My Docs']
+    """
+    out: list = []
+    for m in _ARG_TOKEN_RE.finditer(text or ""):
+        pieces = []
+        for p in _ARG_PIECE_RE.finditer(m.group(0)):
+            tok = p.group(0)
+            if len(tok) >= 2 and tok[0] == tok[-1] and tok[0] in "\"'":
+                tok = tok[1:-1]        # strip the quotes around this piece only
+            pieces.append(tok)
+        out.append("".join(pieces))
+    return out
+
+
+# ── MCP schema sanitising for strict tool servers (v1.1.72) ───────────────────
+# JSON Schema draft-06+ allows a subschema to be a BOOLEAN: "items": true means
+# "any item is valid", "additionalProperties": false means "no extras allowed".
+# Both are perfectly legal, and MCP servers emit them constantly. llama.cpp's
+# tool-schema converter does NOT accept them - it requires every subschema to be an
+# object and answers:
+#
+#   500 llama-server error: JSON schema error at #/properties/events/items:
+#   schema must be an object
+#
+# which kills the whole request, not just that tool. Observed on this machine against
+# a llama.cpp/Unsloth-Studio server at 192.168.1.189:8000, where the offender was
+# PhotoCraft's ui_pointer ("items": true). The same tools work on the Strata server,
+# which is permissive - so the failure looks like "that model is broken" when the
+# schemas are the problem. Settings -> Test Connection never sends tools, which is why
+# it succeeds and only the first prompt fails (llama.cpp compiles the grammar lazily,
+# at request time - hence "thinking" appearing before the error).
+#
+# Measured across the four servers configured here: 33 offending positions (Playwright
+# 26, PhotoCraft 2, LightCraft 4, FilmCraft 0). Normalising them makes every MCP tool
+# usable on strict backends without asking each upstream server to change.
+_SCHEMA_BOOL_SUBKEYS = ("items", "additionalItems", "propertyNames", "contains", "not")
+# Keys whose VALUE is a LIST of subschemas. A boolean in one of these is also a
+# subschema position, and it cannot be dropped: the elements are meaningful (dropping
+# one from anyOf/oneOf silently changes the constraint, and from prefixItems it
+# re-types the tuple). They get the object encoding instead - which is exactly
+# equivalent, so no judgement call is needed.
+# "items" is listed separately because it is a subschema when it is an OBJECT and a
+# subschema LIST only in the legacy draft-03 tuple form; both are handled.
+_SCHEMA_LIST_KEYS = ("anyOf", "oneOf", "allOf", "prefixItems")
+# Keys whose VALUE is a MAP FROM NAMES TO SUBSCHEMAS. A boolean among those values is
+# a boolean schema, and it is the shape Zod emits for `z.any()` /
+# `z.unknown()` - {"properties": {"value": true}} - which llama.cpp's converter
+# rejects outright, taking the whole tool list down with it.
+_SCHEMA_PROPERTY_MAPS = ("properties", "patternProperties", "$defs", "definitions")
+
+
+def sanitize_tool_schema(schema: Any) -> Any:
+    """Return `schema` with boolean subschemas converted to the object form that
+    strict converters (llama.cpp) require. Recursive; non-mutating.
+
+    It copies every container it touches because the input is the MCP client's CACHED
+    tool list - editing it in place would corrupt the server's own definition for the
+    rest of the session.
+
+    Mapping, chosen so the meaning is preserved wherever that is possible:
+
+      items/additionalItems/propertyNames: true  -> key dropped ("anything valid" IS
+                                                    the default when the key is absent)
+      items/propertyNames: false                 -> key dropped. `false` means "nothing
+                                                    is valid", which has no object
+                                                    equivalent that is not misleading;
+                                                    dropping is the permissive choice
+                                                    and matches every other handling
+                                                    here. Not seen in practice.
+      not: true  -> not: {}      ({} matches everything, so `not` rejects everything -
+                                  exactly what `not: true` means)
+      not: false -> key dropped  (nothing is excluded, which is the same as no `not`)
+      additionalProperties: true  -> key dropped (it is the default; removes the boolean
+                                  without changing meaning)
+      additionalProperties: false -> LEFT ALONE. {} would mean "any extras allowed",
+                                  the OPPOSITE of false, so rewriting it would silently
+                                  loosen the schema. llama.cpp demonstrably tolerates
+                                  `false` here: 26 Playwright schemas carrying it were
+                                  accepted before the request died on PhotoCraft's
+                                  `items: true`, and the tool array is sent in order.
+
+    Booleans inside a subschema LIST (anyOf/oneOf/allOf/prefixItems, and the legacy
+    draft-03 tuple `items`) become the equivalent object form rather than being
+    dropped, because their position carries meaning.
+
+    Non-schema booleans are untouched: `nullable`, `uniqueItems`, `exclusiveMinimum`,
+    `additionalProperties` inside a `properties` map, etc. - only the keywords listed
+    in _SCHEMA_BOOL_SUBKEYS (plus additionalProperties) are subschema positions.
+    """
+    def _list_elem(val: bool) -> dict:
+        # Object encoding of a boolean inside a subschema LIST. Equivalent, not merely
+        # convenient: {} matches anything (= true) and {"not": {}} matches nothing
+        # (= false, because {} matches every instance), so the constraint is unchanged
+        # and the element's POSITION in the list is preserved.
+        return {} if val else {"not": {}}
+
+    def _walk(node: Any) -> Any:
+        if isinstance(node, list):
+            return [_walk(v) for v in node]
+        if not isinstance(node, dict):
+            return node
+        out: Dict[str, Any] = {}
+        for k, v in node.items():
+            if isinstance(v, bool) and k in _SCHEMA_BOOL_SUBKEYS:
+                if v and k == "not":
+                    out[k] = {}          # not:true == not:{} (reject everything)
+                # every other boolean here means "no constraint" == key absent
+                continue
+            if isinstance(v, bool) and k == "additionalProperties":
+                if v is False:
+                    out[k] = False       # proven tolerated; {} would INVERT the meaning
+                continue                 # true is the default -> drop
+            if isinstance(v, list) and (k in _SCHEMA_LIST_KEYS or k == "items"):
+                # subschema LIST: anyOf/oneOf/allOf/prefixItems, or draft-03 tuple items
+                out[k] = [(_list_elem(e) if isinstance(e, bool) else _walk(e))
+                          for e in v]
+                continue
+            if isinstance(v, dict) and k in _SCHEMA_PROPERTY_MAPS:
+                # A MAP OF SUBSCHEMAS: the values are schemas, so a boolean there is a
+                # boolean schema. Zod (and JSON Schema itself) allow
+                # {"properties": {"value": true}}; llama.cpp's converter rejects the
+                # whole tool list over it, so coerce to the object form here.
+                out[k] = {pk: (_list_elem(pv) if isinstance(pv, bool) else _walk(pv))
+                          for pk, pv in v.items()}
+                continue
+            out[k] = _walk(v)
+        return out
+
+    return _walk(schema)
+
+
 def mcp_tool_schema(server: str, raw: str, tool: dict) -> dict:
-    """Convert one MCP tool definition to an OpenAI function-calling schema."""
+    """Convert one MCP tool definition to an OpenAI function-calling schema.
+
+    The server's inputSchema is passed through sanitize_tool_schema() first: MCP
+    servers legitimately emit boolean subschemas, and strict tool servers (llama.cpp)
+    reject the entire request over them. See the note above sanitize_tool_schema."""
     name = mcp_tool_name(server, raw)
     desc = str(tool.get("description") or "").strip() or f"MCP tool {raw} from server {server}"
     params = tool.get("inputSchema")
@@ -654,7 +829,7 @@ def mcp_tool_schema(server: str, raw: str, tool: dict) -> dict:
         "function": {
             "name": name,
             "description": desc[:1000],
-            "parameters": params,
+            "parameters": sanitize_tool_schema(params),
         },
     }
 
@@ -1248,7 +1423,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.71"
+VERSION    = "1.1.90"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -1280,13 +1455,67 @@ TURN_TIME_LIMIT_MAX   = 86400 # upper bound for the setting (24 h); 0 always mea
 COMPACTION_THRESHOLD_DEFAULT = 70   # % of the context window; 0 disables auto-compaction (C1).
                                     # Kept BELOW the default handoff threshold (75) so an in-place
                                     # compaction fires before a fork would - see SOW C5 note.
-COMPACTION_KEEP_RECENT_DEFAULT = 10 # most-recent message entries kept verbatim when compacting (C1)
+COMPACTION_KEEP_RECENT_DEFAULT = 30 # most-recent message entries kept verbatim when compacting (C1).
+                                    # Raised from 10 in v1.1.75: one agentic turn routinely runs 40+
+                                    # tool calls, so 10 entries fell INSIDE the turn still in progress
+                                    # and compaction summarized work that was not finished. The model
+                                    # then re-derived facts it already had and re-introduced bugs it
+                                    # had already fixed - observed directly in a 276-call session.
+COMPACTION_KEEP_RECENT_MAX   = 200  # upper bound for that setting (message count)
+COMPACTION_KEEP_MAX_FRACTION = 0.5  # the verbatim tail may never exceed this share of the chat.
+                                    # The setting is a CEILING, not a floor: with keep_recent=30 a
+                                    # 30-message chat would split at 0 and compaction would refuse
+                                    # to run at all (regression found by test_v1154_archive F, which
+                                    # uses a 30-message fixture). Halving the history still leaves a
+                                    # usable recent tail while always leaving something to fold.
 CHAT_RENDER_WINDOW_DEFAULT = 120   # message entries rendered per chat view (0 = render all); v1.1.36
 STOP_POLL_S      = 0.25       # max latency of the Stop button while a tool is blocking
 IMAGE_CLI_TIMEOUT = 900       # seconds, local FLUX/SDXL CLI subprocess
 PROC_OUTPUT_CAP  = 4_000_000  # bytes per stream kept from a subprocess (deadlock-safe drain)
 TOOL_OUTPUT_LIMIT = 192000   # max chars of ANY tool result sent back to the model (hard cap)
 JS_STDOUT_CAP    = 48_000   # chars of run_javascript stdout returned to the model (schema text shares this)
+
+# ── Tool-result eviction at request time (v1.1.75) ───────────────────────────
+# The agentic loop appends one tool result per step and never removes any, so a
+# long turn grows the context until compaction summarizes it. Compaction is
+# lossy, and inside a single turn it is actively harmful: it folds away the
+# exact file contents, error text and verification numbers the turn is still
+# using, and the model re-derives them (or gets them wrong the second time).
+# Eviction attacks the growth BEFORE compaction has to. It is deliberately:
+#   REQUEST-TIME ONLY - the saved chat keeps every full result, so the user's
+#     transcript, the archive and scrollback are untouched. Nothing is lost;
+#     re-reading the file is always possible.
+#   BOUNDED BY COUNT, not tokens - simple to reason about, and it cannot be
+#     gamed by one huge result.
+#   CHUNKED - see _evict_old_tool_results(). The boundary advances in groups of
+#     TOOL_EVICTION_CHUNK instead of one per step, so the outgoing prefix stays
+#     byte-identical between breaks and the engine's KV prefix cache survives
+#     (a per-step rewrite would invalidate the whole tail every single call).
+TOOL_KEEP_VERBATIM_DEFAULT = 12   # newest tool results sent in full; older ones become stubs (0 = off)
+TOOL_KEEP_VERBATIM_MAX     = 500  # upper bound for that setting
+TOOL_EVICTION_CHUNK        = 8    # eviction boundary advances in chunks, for KV-cache prefix reuse
+TOOL_STUB_HEAD             = 160  # chars of the original result kept inside a stub
+TOOL_NUDGE_EVERY_DEFAULT   = 20   # advisory tool-economy note every N tool steps (0 = off)
+TOOL_NUDGE_EVERY_MAX       = 500  # upper bound for that setting
+
+# ── outgoing-request debug dump (v1.1.76) ────────────────────────────────
+# Eviction, the nudge and the compaction gates all mutate the REQUEST, never
+# the saved chat, so none of them is observable from the UI. This hook writes
+# the exact payload that is about to be sent, so "what did the model actually
+# see?" is answerable without editing the app. OFF unless the DESKPILOT_DEBUG_REQUEST
+# environment variable is set - deliberately NOT a Settings field, because a
+# forgotten checkbox would quietly start writing every turn to disk forever.
+DEBUG_REQUEST_ENV          = "DESKPILOT_DEBUG_REQUEST"
+DEBUG_REQUEST_DIRNAME      = "request_debug"
+DEBUG_REQUEST_MAX_FILES    = 40    # rolling window; the oldest dumps are pruned
+DEBUG_REQUEST_TEXT_CAP     = 2000  # chars of each message body kept in a dump
+DEBUG_REQUEST_SECRET_HINTS = ("api_key", "apikey", "token", "secret", "password",
+                              "authorization", "auth", "credential", "x-api-key")
+# Key-name matching alone is not enough: nested headers and pasted keys slip
+# through. Anything that LOOKS like a credential is scrubbed wherever it sits.
+DEBUG_REQUEST_SECRET_RE = re.compile(
+    r"(?i)\b(?:sk-[A-Za-z0-9_\-]{8,}|pk-[A-Za-z0-9_\-]{8,}|gh[pousr]_[A-Za-z0-9]{8,}"
+    r"|xox[baprs]-[A-Za-z0-9\-]{8,}|ya29\.[A-Za-z0-9_\-]{8,}|AIza[0-9A-Za-z_\-]{12,})\b")
 # ── run_shell (SOW #6) ───────────────────────────────────────────────────────
 # Deliberately NOT sandboxed: it grants exactly what run_javascript already
 # grants (unsandboxed node with full fs + child_process), in one line instead of
@@ -1391,6 +1620,29 @@ PROJECT_MEMORY_SUBDIR   = "projects"      # where per-project memory files live
 PROJECT_MEMORY_DEFAULT  = 8000            # chars injected (0 = off)
 PROJECT_MEMORY_MAX      = 24000           # ceiling on that setting
 PROJECT_MEMORY_READ_MAX = 64000           # bytes read from disk before capping
+# v1.1.86 (SOW item 5 Gap 1): the ACTIVE project's own MEMORY.md is injected too.
+# Its own budget, separate from the index: the two files have different shapes and
+# different growth rates, and one knob for both meant a big project memory could only
+# be carried by inflating every index. Sized from the REAL files, not a guess - the
+# largest project memory in this workspace measured 26,483 chars (farmsentry,
+# 2026-10-19), so the default carries every current project with headroom and none
+# silently loses its tail. It rides on every request, but as a STABLE prefix that
+# changes only when the project or its memory changes, so a prefix-caching server
+# reuses it instead of re-prefilling it per turn.
+PROJECT_MEMORY_PROJECT_DEFAULT = 28000    # chars of the active project's MEMORY.md
+PROJECT_MEMORY_PROJECT_MAX     = 32000    # ceiling on that setting
+# Active-project naming (v1.1.81). Declared up here because TOOL_SCHEMAS interpolates
+# PROJECT_SLUG_MAX into the set_project schema at import time - defining it further
+# down makes the module fail to import at all, which is a red screen, not a red test.
+PROJECT_SLUG_MAX = 40
+# A project folder is created under <workspace>/projects/, so a name that escapes
+# it is a path-traversal bug wearing a UX hat. ".." survives the key regex
+# (dots are legal in filenames), so it is rejected explicitly rather than trusted
+# to be filtered out by shape. "projects" is reserved for the same reason "history"
+# is: a project by that name would live at projects/projects/ and make every path
+# in the index read like a typo.
+_PROJECT_RESERVED = {"", ".", "..", "history", "projects", "node_modules",
+                     "__pycache__"}
 _LEDGER_LOCK = threading.Lock()   # serialises appends (worker + main thread)
 # Serialises index rebuilds: _ensure_search_index() is called from the main thread
 # (sidebar search) and the chat worker (search_chats tool), and the rebuild does
@@ -1399,7 +1651,18 @@ _LEDGER_LOCK = threading.Lock()   # serialises appends (worker + main thread)
 _SEARCH_BUILD_LOCK = threading.Lock()
 TEMP_VALUES       = tuple(f"{v / 10:.1f}" for v in range(21))  # per-chat temperature choices: 0.0 .. 2.0 in 0.1 steps (21 values)
 TEMP_DEFAULT      = "0.7"                                    # default temperature (sent when a chat has no explicit value)
-THINK_VALUES      = ("Off", "Low", "Medium", "High")          # per-chat thinking level choices (no Extra High: == High on Qwen3.8)
+# Per-chat thinking level choices. "Default" means SEND NOTHING and let the server
+# decide - it is the shipped default because "High" forced reasoning_effort=xhigh on
+# every new chat, which is the slowest setting there is on a reasoning model and is
+# not what a fresh install should assume.
+# v1.1.77: High and XHigh are now SEPARATE choices. They used to be the same value -
+# "High" mapped to the template's maximum, xhigh - so a chat set to High was silently
+# running at maximum deliberation, and there was no way to ask for the plain "high"
+# tier at all. On Qwen3.8 Flash-Next high and xhigh resolve identically, so chats
+# already set to High are unaffected in practice; on engines that honour the full
+# ladder the distinction is real and worth exposing.
+THINK_VALUES      = ("Default", "Off", "Low", "Medium", "High", "XHigh")
+THINK_DEFAULT     = "Default"
 
 # Sampler parameters (Settings -> Sampling). Global for every chat session by design:
 # the chat UI stays uncluttered, so these live in Settings only and apply to all chats.
@@ -1418,9 +1681,19 @@ SAMPLING_SCHEMA = (
     ("repetition_penalty", "Repetition Penalty  (1.0 = off; strongest of the three)",    1.0,   2.0,   False, "flat", 1.0),
     ("presence_penalty",   "Presence Penalty  (-2 to 2, 0 = off)",                     -2.0,  2.0,   False, "top",  0),
     ("frequency_penalty",  "Frequency Penalty  (-2 to 2, 0 = off)",                    -2.0,  2.0,   False, "top",  0),
+    # Seed (v1.1.77). Blank = OMITTED = random, which is the right default; 0 is a
+    # VALID seed on llama.cpp, so it cannot be the "off" value and off is None here
+    # (the schema's only blank-omission case, same as top_p). It buys determinism,
+    # not quality - its use is reproducible A/B of a setting change, not better prose.
+    ("seed",               "Seed  (blank = random; set it to make a run repeatable)",    0,     2147483647, True, "top", None),
 )
 SAMPLING_DEFAULTS = {k: "" for (k, _l, _lo, _hi, _i, _t, _o) in SAMPLING_SCHEMA}
 SAMPLING_FLAT_KEYS = tuple(k for (k, _l, _lo, _hi, _i, t, _o) in SAMPLING_SCHEMA if t == "flat")
+SAMPLING_TOP_KEYS  = tuple(k for (k, _l, _lo, _hi, _i, t, _o) in SAMPLING_SCHEMA if t == "top")
+# Every sampler key by name, for the server-rejection retry: a strict endpoint that
+# refuses a top-level field (seed is the likeliest) must lose THAT field and be
+# retried, not fail the request.
+SAMPLING_ALL_KEYS  = SAMPLING_FLAT_KEYS + SAMPLING_TOP_KEYS
 FLUSH_INTERVAL   = 0.05     # seconds between UI flushes while streaming
 # Core system directories that local file tools must never touch (security guard).
 FORBIDDEN_SYSTEM_DIRS_WINDOWS = ("c:\\windows", "c:\\$recycle.bin", "c:\\system volume information")
@@ -1570,7 +1843,142 @@ def _as_bool(value) -> bool:
     return bool(value)
 
 
-# ── Dark modern palette ──────────────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+#  Chat-box spell check (v1.1.78) - optional, INPUT BOX ONLY
+# ---------------------------------------------------------------------------
+# Deliberately scoped to the one widget the user types into. Model output is
+# markdown and code, and no other surface in the app is the user's prose.
+#
+# Measured on this machine (2026-10-14) before writing this, so the cost is
+# known rather than assumed:
+#   import 22 ms | en dictionary ~23 MB RAM, loaded once, off the UI thread
+#   0.249 ms to re-scan a 1864-char box on EVERY keystroke (no debounce needed
+#   at that cost, but one is used anyway so a paste of 10k chars stays free)
+#   WITHOUT the filter below: 15/15 technical terms flagged, i.e. unusable.
+# The filter is therefore the feature, not a refinement of it.
+
+# A word-shaped run of letters. Apostrophes stay inside the token ("don't");
+# hyphens deliberately do NOT, so "right-click" scans as right + click - both
+# real words - instead of flagging every legitimate hyphenated compound.
+# Digits, underscores, dots and slashes are excluded too, which is why the
+# boundary test in _spell_worth_checking looks at the RAW text: otherwise
+# "espeakng_loader" scans as two words and flags "espeakng".
+SPELL_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z'\u2019]*")
+
+# Characters that mean "this token is part of something bigger" - a path, a
+# dotted module, a snake_case identifier, a version, a URL, a port.
+SPELL_GLUE = set("_./\\:@~#$%^&*+=<>|'\"0123456789")
+
+# Correct words the frequency list does not contain, plus short tokens that
+# distance-1 matching turns into noise. Lower-cased for lookup.
+SPELL_ALLOW = {
+    "ok", "okay", "hi", "hey", "yo", "pls", "thx", "idk", "imo", "btw", "todo",
+    "app", "apps", "api", "apis", "gpu", "gpus", "cpu", "cpus", "ram", "ssd",
+    "exe", "dll", "msi", "pdf", "png", "jpg", "jpeg", "gif", "svg", "url",
+    "urls", "json", "yaml", "yml", "toml", "csv", "xml", "html", "css", "sql",
+    "py", "js", "ts", "md", "txt", "bat", "sh", "tk", "ui", "ux", "ai", "llm",
+    "llms", "chat", "chats", "prompt", "prompts", "desktop", "deskpilot",
+    "workflow", "workflows", "repo", "repos", "venv", "cli", "gui", "sdk",
+    "mac", "windows", "linux", "ubuntu", "github", "git", "reddit", "ebay",
+    "shopify", "gmail", "localhost", "websocket", "websockets", "dropdown",
+    "checkbox", "checkboxes", "scrollbar", "tooltip", "tooltips", "tokenizer",
+    "pre", "re", "sub", "min", "max", "len", "str", "int", "bool", "dict",
+    "dir", "dirs", "env", "cfg", "ini", "log", "logs", "tty", "utf", "ascii",
+    "doesn", "wasn", "isn", "aren", "couldn", "wouldn", "shouldn", "haven",
+    # short technical/contraction forms the frequency list rejects but that are
+    # never what the user meant to flag. Needed because the length floor is 2,
+    # so anything 2-3 chars and unknown would otherwise be underlined.
+    "mtp", "usb", "api", "ddr", "pct", "err", "dont", "im", "ive", "re",
+    "vpn", "nas", "pc", "pcs", "lan", "wan", "ip", "mac", "rgb", "fan",
+    # only ever arise from a dropped apostrophe ("i ll", "i ve"), which the
+    # checker cannot correct anyway - flagging them is pure noise
+    "ll", "ve", "cant", "wont", "id", "ill", "yall",
+}
+
+
+def _spell_worth_checking(text: str, start: int, end: int) -> bool:
+    """True only for plain English prose worth flagging.
+
+    Skips anything identifier-shaped. The boundary test is what keeps paths,
+    snake_case names, versions and URLs out of the results - the token regex
+    alone would split them and flag the fragments.
+    """
+    word = text[start:end]
+    if len(word) < 2:                       # single letters: 'i', 'a', 's' are words
+        return False
+    if word.lower() in SPELL_ALLOW:
+        return False
+    if word.isupper():                      # MTP, PDF, GPU
+        return False
+    if any(c.isupper() for c in word[1:]):  # camelCase / internal caps: PyInstaller
+        return False
+    # glued to a non-letter on either side => identifier, path, URL or version
+    if start > 0 and text[start - 1] in SPELL_GLUE:
+        return False
+    if end < len(text) and text[end] in SPELL_GLUE:
+        return False
+    return True
+
+
+def spell_scan(text: str, checker, extra_allow=None) -> List[Tuple[int, int, str]]:
+    """Return [(start, end, word)] for suspected misspellings in `text`.
+
+    `checker` is anything with .unknown([w]) -> iterable; None returns [].
+    `extra_allow` is the user's own saved word list. Pure and side-effect free
+    so it can be tested without Tk.
+    """
+    if checker is None or not text:
+        return []
+    allow = {w.lower() for w in (extra_allow or ())}
+    out: List[Tuple[int, int, str]] = []
+    for m in SPELL_TOKEN_RE.finditer(text):
+        s, e = m.start(), m.end()
+        if not _spell_worth_checking(text, s, e):
+            continue
+        w = m.group(0)
+        if w.lower() in allow:
+            continue
+        try:
+            if checker.unknown([w]):
+                out.append((s, e, w))
+        except Exception:
+            break        # dictionary went away - stop, never raise into the UI
+    return out
+
+
+def spell_suggestions(word: str, checker, limit: int = 5) -> List[str]:
+    """Candidate corrections, best first. Empty if none.
+
+    NOTE: pyspellchecker's candidates() returns **None**, not an empty list,
+    when nothing matches - naive callers crash on every unknown word.
+    """
+    if checker is None:
+        return []
+    try:
+        cands = checker.candidates(word)
+    except Exception:
+        return []
+    if not cands:
+        return []
+    # Frequency first, then letter overlap. Charset overlap alone ranks 'teh' ->
+    # ['eth', 'teth', 'the', ...] because 'eth' shares every letter; real usage
+    # frequency puts the word the user actually meant on top. The dictionary is
+    # read defensively - a custom checker object may not expose it.
+    _dict = getattr(getattr(checker, "word_frequency", None), "dictionary", None)
+
+    def _freq(c: str) -> int:
+        try:
+            return int(_dict.get(c, 0) or 0) if _dict is not None else 0
+        except Exception:
+            return 0
+
+    return sorted(cands, key=lambda c: (-_freq(c),
+                                        -len(set(c.lower()) & set(word.lower())),
+                                        c.lower()))[:limit]
+
+
+# ---------------------------------------------------------------------------
+#  Dark modern palette ──────────────────────────────────────────────────────
 COL = {
     "bg_deep":   "#171717",   # deepest surface (sidebar, code blocks)
     "bg_main":   "#202123",   # main chat workspace
@@ -1625,6 +2033,7 @@ TOOLS: List[tuple] = [
     ("read_archive",         "📦 Archive"),
     ("remember",             "🧷 Remember"),
     ("read_ledger",          "📓 Ledger"),
+    ("set_project",          "📁 Project"),
     ("set_clipboard",        "📋 Set"),
     ("transcribe_audio",     "🎧 Audio"),
     # Consultant. Must be listed here too or it gets no permission chip, and the
@@ -1643,7 +2052,9 @@ TOOL_SCHEMAS: Dict[str, dict] = {
         "function": {
             "name": "searxng_search",
             "description": ("Search the web using a local SearXNG metasearch instance. "
-                            "Returns top results with titles, URLs and short snippets."),
+                            "Returns top results with titles, URLs and short snippets. "
+                            "Use it to CHECK a fact you are not sure of, not only to "
+                            "look up something new."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1660,7 +2071,9 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "name": "exa_search",
             "description": ("Search the web with Exa (neural/semantic search). Returns titles, URLs "
                             "and relevant text excerpts. Use it when the most up-to-date information is "
-                            "needed (current events, recent news, latest developments); needs an Exa API key in Settings."),
+                            "needed (current events, recent news, latest developments), or to CHECK a "
+                            "fact you are not sure of rather than answering from memory; needs an Exa "
+                            "API key in Settings."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -1759,12 +2172,37 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                             f"each capped at {SHELL_STDOUT_CAP} chars - redirect to a "
                             "file and read it back with read_local_file for larger "
                             "output. The command starts in the configured File "
-                            "Workspace, so prefer paths relative to it."),
+                            "Workspace, so prefer paths relative to it. "
+                            "\u26a0\ufe0f QUOTING (cmd.exe, not POSIX): the command line "
+                            "reaches cmd.exe VERBATIM, so double quotes work the way cmd "
+                            "intends \u2014 `python -c \"print('hi')\"` and "
+                            "`dir \"C:\\Program Files\"` are both fine. Two shapes cmd "
+                            "genuinely cannot do: a command that STARTS with a quote (cmd "
+                            "strips one matched pair of OUTER quotes), and a NEWLINE INSIDE "
+                            "A QUOTED ARGUMENT (cmd truncates its own input at the first "
+                            "newline, so it can never reach the program \u2014 no quoting form "
+                            "works and use_script_file cannot help: write the code to a .py "
+                            "file with write_local_file and run that). A multi-line command "
+                            "IS handled \u2014 it is run for you from a temp .cmd where "
+                            "newlines behave. When quoting is awkward, or you need a real "
+                            "multi-step script, set use_script_file=true (same command, run "
+                            "from a temp .cmd) or write a .py/.cmd file with write_local_file "
+                            "and run that. A .cmd file is batch context: '%' is a variable "
+                            "marker there, so write '%%' and use '%%i' in a FOR loop."),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "command": {"type": "string",
                                 "description": "The command line to execute."},
+                    "use_script_file": {
+                        "type": "boolean",
+                        "description": ("Run the command through a temporary "
+                        "script file instead of inline. Lets a multi-line "
+                        "script work (inline, cmd runs only line 1 and still "
+                        "reports exit code 0) and avoids awkward inline "
+                        "quoting. Cannot help a newline inside a quoted "
+                        "argument. Costs one extra file write. Batch "
+                        "semantics apply: use '%%' and '%%i'.")},
                     "timeout": {"type": "integer",
                                 "description": (f"Optional seconds before the command "
                                                 f"is killed (default {SHELL_TIMEOUT}, "
@@ -2147,6 +2585,66 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             }
         }
     },
+    "set_project": {
+        "type": "function",
+        "function": {
+            "name": "set_project",
+            "description": ("Declare which project this conversation is working on. "
+                            "Call it as soon as the job is identifiable - at the START "
+                            "of work, not at the end - and again whenever the work moves "
+                            "to a different project. It shows the project in the top bar, "
+                            "and it makes the app inject that project's own MEMORY.md "
+                            "path into every following request.\n\n"
+                            "Existing project: pass just the name (any casing/spacing - "
+                            "'GB10 Alert' finds 'GB10_Alert').\n"
+                            "New project: pass name + a one-line description, and "
+                            "optionally entry_point. The app creates "
+                            "projects/<slug>/, writes its MEMORY.md stub, and adds the "
+                            "row to the workspace index for you - do NOT hand-edit the "
+                            "index table.\n\n"
+                            "Naming: when the user describes a thing to build rather than "
+                            "naming it, invent a good name yourself - they like a clever "
+                            "one. If the real name only becomes clear after you have "
+                            "started, call again with rename_from set to the placeholder "
+                            "slug; the folder, the index row and every chat pointing at "
+                            "it are renamed together.\n\n"
+                            "If the user says the project is wrong, that means call this "
+                            "again with the right name.\n\n"
+                            "A name that matches no folder but closely resembles one (a "
+                            "typo like 'Price-Stock_Monitor' for an existing "
+                            "'Price-Stock_Montor') is NOT created: the call is refused "
+                            "and the real names are listed, because a near-duplicate "
+                            "splits one project's memory across two folders that both "
+                            "look authoritative. Re-call with the exact existing name to "
+                            "adopt it, or pass force_new=true if this really is new."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string",
+                             "description": ("Project name or existing folder. Normalised "
+                                             "to a lowercase-hyphen slug, max "
+                                             f"{PROJECT_SLUG_MAX} chars.")},
+                    "description": {"type": "string",
+                                    "description": ("One line: what the project is. Used "
+                                                    "for the index row and the memory "
+                                                    "stub on first creation only.")},
+                    "entry_point": {"type": "string",
+                                    "description": ("Optional main file or command, e.g. "
+                                                    "'app.py', 'run.bat'. Index row \"Entry "
+                                                    "point\" column.")},
+                    "rename_from": {"type": "string",
+                                    "description": ("Set only when renaming: the current "
+                                                    "slug this project is being renamed "
+                                                    "away from.")},
+                    "force_new": {"type": "boolean",
+                                  "description": ("Set true to create the name anyway when "
+                                                  "it closely resembles an existing project "
+                                                  "and you really do mean a NEW project.")}
+                },
+                "required": ["name"]
+            }
+        }
+    },
     "read_ledger": {
         "type": "function",
         "function": {
@@ -2297,6 +2795,11 @@ DEFAULT_PERMS = {
     # user's documents, so both sit at the same trust level as search_chats.
     "remember":              "always",
     "read_ledger":           "always",
+    # set_project touches only app state plus a folder under <workspace>/projects/,
+    # so it sits at the same trust level as remember(). It must NOT be "ask": the
+    # whole point is that the model declares the project without the user being
+    # interrupted to approve it - the visible answer is the green top-bar label.
+    "set_project":           "always",
     "set_clipboard":         "ask",
     "transcribe_audio":      "ask",
     # ask_expert sends the material you name to a THIRD PARTY over the network.
@@ -2331,14 +2834,25 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "handoff_notes_dir": "",      # folder for handoff notes; blank = <this folder>/deskpilot_data/handoff_notes
     "compaction_threshold": COMPACTION_THRESHOLD_DEFAULT,   # auto-compact context at this % usage (0 = off); C1
     "compaction_keep_recent": COMPACTION_KEEP_RECENT_DEFAULT,  # most-recent message entries kept verbatim; C1
+    "tool_keep_verbatim": TOOL_KEEP_VERBATIM_DEFAULT,  # newest tool results sent in full; older ones stubbed (0 = off)
+    "tool_nudge_every": TOOL_NUDGE_EVERY_DEFAULT,      # advisory efficiency note every N tool steps (0 = off; never ends a turn)
     "chat_render_window": CHAT_RENDER_WINDOW_DEFAULT,  # message entries rendered per chat view (0 = all); v1.1.36
     "project_memory_chars": PROJECT_MEMORY_DEFAULT,  # chars of the workspace MEMORY.md index injected each request (0 = off); v1.1.66
     "project_memory_file": "",    # explicit index file; blank = <workspace>/MEMORY.md
+    "project_memory_project_chars": PROJECT_MEMORY_PROJECT_DEFAULT,  # chars of the ACTIVE project's own MEMORY.md injected each request (0 = off); v1.1.86
     "ledger_inject_chars": LEDGER_INJECT_DEFAULT,  # chars of ledger tail in the system prompt (0 = off); Tier 3
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "custom_system_prompt_enabled": True,  # gate the prompt above WITHOUT discarding it; False = kept but not sent
+    "spellcheck_enabled": False,  # underline suspected misspellings in the INPUT BOX only (needs pyspellchecker); v1.1.78
+    "spellcheck_words": [],       # user's "Add to dictionary" words, persisted; v1.1.78
     "sampling_defaults": dict(SAMPLING_DEFAULTS),  # sampler params applied to EVERY chat (Settings -> Sampling)
     "show_sampling_note": True,   # render one "what was actually sent" note per user prompt
+    # Studio mode (v1.1.77). The per-chat checkbox is the switch; these two govern
+    # HOW MUCH it strips. Both default ON because that is the point of the mode -
+    # tools and the operator framing are what made generative output thin - and both
+    # are the escape hatch for a chat that needs a tool while staying in Studio.
+    "studio_tools_off": True,      # Studio chat: withhold tool schemas (per-tool grants re-admit)
+    "studio_sampling": True,       # Studio chat: loosen top_k / temperature
     "allow_local_network": False,  # fetch_url may reach LAN/localhost/cloud-metadata addresses
     "mcp_servers":       [],   # MCP stdio servers (Settings -> MCP Servers)
     # Servers whose per-tool permission chips are shown in the bar. Absent = collapsed
@@ -2903,6 +3417,299 @@ def _prepare_request_messages(messages: List[dict]) -> List[dict]:
     return out
 
 
+# ── Tool-result eviction + tool-economy nudge (v1.1.75) ──────────────────────
+# Prefix of the replacement text. Checking for it makes eviction idempotent: a
+# stub is never re-stubbed, so its bytes stay identical across requests and the
+# engine's KV prefix cache keeps covering it.
+TOOL_STUB_PREFIX = "[tool result evicted from context"
+
+
+def _tool_keep_verbatim(settings: dict) -> int:
+    """How many newest tool results are re-sent in full; 0 (or junk) = eviction OFF."""
+    try:
+        v = int(float(settings.get("tool_keep_verbatim", TOOL_KEEP_VERBATIM_DEFAULT)))
+    except (TypeError, ValueError):
+        v = TOOL_KEEP_VERBATIM_DEFAULT
+    return max(0, min(TOOL_KEEP_VERBATIM_MAX, v))
+
+
+def _tool_nudge_every(settings: dict) -> int:
+    """Advisory nudge every N tool steps; 0 (or junk) = nudge OFF."""
+    try:
+        v = int(float(settings.get("tool_nudge_every", TOOL_NUDGE_EVERY_DEFAULT)))
+    except (TypeError, ValueError):
+        v = TOOL_NUDGE_EVERY_DEFAULT
+    return max(0, min(TOOL_NUDGE_EVERY_MAX, v))
+
+
+def _evict_old_tool_results(messages: List[dict], keep: int) -> List[dict]:
+    """Replace the CONTENT of older tool results with a short stub (request copy).
+
+    Why: the agentic loop appends one tool result per step and never drops one,
+    so a long turn inflates the context until compaction summarizes it. In the
+    middle of a turn that is the worst possible moment - the folded-away content
+    is exactly the file text, error output and measurement numbers the turn is
+    still working with, and the model re-derives them, badly. Eviction trims the
+    bulk (tool output is by far the largest share of a tool-heavy conversation)
+    while leaving the human-readable thread intact.
+
+    Guarantees, each of which is load-bearing:
+      * NOTHING IS REMOVED. Only `content` of role=="tool" is rewritten, so the
+        assistant tool_calls message and its tool_call_id results still pair up
+        and strict servers stay happy. Message count and order are unchanged.
+      * REQUEST COPY ONLY. The persisted chat keeps every full result; the user
+        can always scroll back, and re-reading the file is always available.
+      * NEVER the newest `keep` results - the work in progress is untouched.
+      * CHUNKED. The boundary jumps in groups of TOOL_EVICTION_CHUNK rather than
+        one per step, so most steps send a byte-identical prefix to the previous
+        step and the KV prefix cache is reused instead of busted every call.
+      * IDEMPOTENT + DETERMINISTIC. A stub depends only on the original result,
+        never on the current step, so the same message always stubs to the same
+        bytes. That is what makes the prefix cache hold across turns.
+    """
+    if keep <= 0:
+        return messages
+    idx = [i for i, m in enumerate(messages)
+           if isinstance(m, dict) and m.get("role") == "tool"
+           and isinstance(m.get("content"), str)]
+    n = len(idx)
+    if n <= keep:
+        return messages
+    # How many of the OLDEST to stub. Rounded down to a chunk so the boundary
+    # moves rarely; `keep` newest always stay verbatim, so the effective window
+    # ranges from keep to keep+chunk-1.
+    cut = ((n - keep) // TOOL_EVICTION_CHUNK) * TOOL_EVICTION_CHUNK
+    if cut <= 0:
+        return messages
+    out = list(messages)
+    for i in idx[:cut]:
+        m = out[i]
+        c = m["content"]
+        if c.startswith(TOOL_STUB_PREFIX):
+            continue                      # already stubbed - keep the bytes identical
+        if len(c) <= TOOL_STUB_HEAD + 140:
+            # A stub is ~230 chars. Stubbing a short result makes the prompt BIGGER
+            # (41 -> 233 measured), which is the opposite of the point. Treat anything
+            # this size as already cheap and leave the bytes untouched.
+            continue
+        name = str(m.get("name") or "tool")
+        head = " ".join(c[:TOOL_STUB_HEAD].split())
+        # The head is the point: a one-line reminder of what the call returned is
+        # usually enough to stop the model re-running it. The size is included so
+        # it can judge whether re-reading is worth the round trip.
+        out[i] = {k: v for k, v in m.items() if k not in APP_LOCAL_MSG_KEYS}
+        out[i]["content"] = (
+            f"{TOOL_STUB_PREFIX} to save context; the full output is still in the "
+            f"chat history] {name} returned {len(c)} chars, starting: "
+            f"{head}\u2026 [re-run the call only if you need the exact text again]")
+    return out
+
+
+# Fixed text, deliberately containing NO counters or per-step numbers: anything
+# that varies would change the tail of the request and invalidate the prefix
+# cache from that point on. It also has to be unmistakably ADVISORY - the loop
+# must never treat it as permission to stop.
+TOOL_NUDGE_TEXT = (
+    "[Efficiency note, not a stop condition.] This turn has run many tool calls and "
+    "older tool outputs have been trimmed from context to keep it manageable - the "
+    "full results remain in the chat history. Work on: batch the checks that are "
+    "left into one comprehensive call instead of many narrow ones; do not re-read a "
+    "file or re-run a probe unless you genuinely need its exact text again; once the "
+    "deliverable exists, verify it once and report it. Keep going until the work is "
+    "genuinely finished and tested - finishing the job still matters more than "
+    "saving calls, and nothing here ends the turn.")
+
+
+def _tool_economy_nudge(step: int, every: int) -> Optional[dict]:
+    """One advisory message every `every` tool steps, or None.
+
+    Appended to the END of the request copy only (never to `messages`), and with
+    identical text every time, so it costs one short suffix on the steps it
+    fires and nothing on the others. It is guidance only: the loop condition is
+    untouched and no call site can end a turn because of it."""
+    if every <= 0 or step <= 0 or step % every:
+        return None
+    return {"role": "user", "content": TOOL_NUDGE_TEXT}
+
+
+def _outgoing_prompt_tokens(messages: List[dict], settings: dict) -> int:
+    """Token estimate of the request that WOULD go out right now.
+
+    The context gates must measure the same shape the loop actually sends - i.e.
+    after _prepare_request_messages() AND _evict_old_tool_results() - otherwise,
+    once eviction is on, the gauge over-reports and compaction/handoff fire
+    earlier than they need to, which undoes the point of evicting. Still only a
+    lower bound (it omits the system prompt and the tool schemas), exactly as the
+    existing gates assume; they pair it with the server's own figure for that."""
+    return estimate_prompt_tokens(_evict_old_tool_results(
+        _prepare_request_messages(list(messages)), _tool_keep_verbatim(settings)))
+
+
+# ── outgoing-request debug dump (v1.1.76) ──────────────────────────────────
+def _debug_request_dir() -> Optional[Path]:
+    """Where to write request dumps, or None when the hook is off.
+
+    Reads the environment on every call (not once at import) so a test can
+    toggle it, and so the value is never captured in a settings file.
+    "1"/"true"/"." means <data dir>/request_debug; anything else is a path.
+    """
+    raw = (os.environ.get(DEBUG_REQUEST_ENV) or "").strip()
+    if not raw:
+        return None
+    if raw.lower() in ("1", "true", "yes", "on", "."):
+        return BASE_DIR / DEBUG_REQUEST_DIRNAME
+    return Path(raw).expanduser()
+
+
+def _debug_scrub(text: str) -> str:
+    """Replace credential-shaped strings so a debug file cannot become a key log."""
+    if not text:
+        return text
+    return DEBUG_REQUEST_SECRET_RE.sub("<redacted:looks-like-a-key>", text)
+
+
+def _debug_safe_kwargs(value: Any) -> Any:
+    """Copy of a request kwarg with anything credential-like redacted.
+
+    Recursive on purpose: the client holds the keys, so kwargs *should* never
+    carry them, but a nested header dict (extra_headers -> Authorization) is
+    exactly where a top-level-only check leaks.
+    """
+    if isinstance(value, dict):
+        out = {}
+        for k, v in value.items():
+            if any(h in str(k).lower() for h in DEBUG_REQUEST_SECRET_HINTS):
+                out[k] = "<redacted>"
+            else:
+                out[k] = _debug_safe_kwargs(v)
+        return out
+    if isinstance(value, list):
+        return [_debug_safe_kwargs(v) for v in value]
+    if isinstance(value, str):
+        return _debug_scrub(value)
+    return value
+
+
+def _debug_safe_content(content: Any) -> Any:
+    """Copy of a message body that is safe and sane to put in a dump.
+
+    base64 image payloads are replaced by a size note: one screenshot expands
+    to hundreds of KB of base64, which would bury the text the dump exists to
+    inspect. Text is capped, with the true length reported, so a 190 KB tool
+    result does not make the JSON unreadable.
+    """
+    if isinstance(content, str):
+        content = _debug_scrub(content)
+        if len(content) <= DEBUG_REQUEST_TEXT_CAP:
+            return content
+        return (content[:DEBUG_REQUEST_TEXT_CAP] +
+                f"... [+{len(content) - DEBUG_REQUEST_TEXT_CAP} chars elided]")
+    if isinstance(content, list):
+        out = []
+        for part in content:
+            if not isinstance(part, dict):
+                out.append(_debug_safe_content(part))
+                continue
+            if part.get("type") == "image_url":
+                url = str((part.get("image_url") or {}).get("url", ""))
+                out.append({"type": "image_url",
+                            "url_summary": f"<{len(url)} chars, payload elided>"})
+            elif part.get("type") == "image_ref":
+                out.append({"type": "image_ref", "path": str(part.get("path", ""))})
+            elif part.get("type") == "text":
+                out.append({"type": "text", "text": _debug_safe_content(part.get("text"))})
+            else:
+                out.append({k: _debug_safe_content(v) for k, v in part.items()})
+        return out
+    return content
+
+
+def _debug_msg_hash(m: Any) -> str:
+    """Stable fingerprint of one outgoing message, for prefix comparison.
+
+    Hashed on the FULL message (not the capped copy) so the comparison reflects
+    what the server really receives: two requests sharing a 40-message prefix is
+    exactly the KV-cache claim eviction makes, and it must be measurable.
+    """
+    try:
+        blob = json.dumps(m, sort_keys=True, default=str)
+    except Exception:
+        blob = repr(m)
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:16]
+
+
+_DEBUG_REQ_PREFIX: Dict[str, List[str]] = {}   # chat_id -> per-message hashes of the last dump
+
+
+def _debug_dump_request(kwargs: Dict[str, Any], step: int, chat_id: str) -> None:
+    """Write the payload about to be sent to the server. Never raises.
+
+    This is the only way to see the v1.1.75 behaviour directly: eviction and the
+    nudge change the request and nothing else, so without it they are invisible
+    except through the context gauge. The dump records the request shape AND the
+    derived facts worth checking - how many tool results went out stubbed vs
+    verbatim, the token estimate, and how much of the prefix is byte-identical to
+    the previous request for this chat (the KV-cache reuse claim).
+    """
+    d = _debug_request_dir()
+    if d is None:
+        return
+    try:
+        msgs = kwargs.get("messages") or []
+        hashes = [_debug_msg_hash(m) for m in msgs]
+        prev = _DEBUG_REQ_PREFIX.get(chat_id) or []
+        shared = 0
+        while shared < len(hashes) and shared < len(prev) and hashes[shared] == prev[shared]:
+            shared += 1
+        _DEBUG_REQ_PREFIX[chat_id] = hashes
+        stubbed = 0
+        verbatim = 0
+        for m in msgs:
+            if isinstance(m, dict) and m.get("role") == "tool":
+                c = m.get("content")
+                if isinstance(c, str) and c.startswith(TOOL_STUB_PREFIX):
+                    stubbed += 1
+                else:
+                    verbatim += 1
+        # Belt and braces: nothing credential-shaped reaches the file, at any
+        # depth. A debug aid must never become a key logger.
+        safe_kwargs = _debug_safe_kwargs({k: v for k, v in kwargs.items()
+                                          if k != "messages"})
+        payload = {
+            "captured": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "version": VERSION,
+            "chat_id": chat_id,
+            "step": step,
+            "message_count": len(msgs),
+            "tool_results_verbatim": verbatim,
+            "tool_results_stubbed": stubbed,
+            "est_prompt_tokens": estimate_prompt_tokens(msgs),
+            "prefix_shared_with_previous_request": shared,
+            "prefix_changed_at_message": shared if shared < len(hashes) else -1,
+            "message_hashes": hashes,
+            "request": {**safe_kwargs,
+                       "messages": [{k2: (_debug_safe_content(v2) if k2 == "content"
+                                        else v2) for k2, v2 in m.items()}
+                                     if isinstance(m, dict) else m for m in msgs]},
+        }
+        d.mkdir(parents=True, exist_ok=True)
+        name = (time.strftime("%Y%m%d-%H%M%S") + f"-step{step}-" +
+                str(chat_id)[:8] + ".json")
+        (d / name).write_bytes(json.dumps(payload, indent=2,
+                                  default=str).encode("utf-8"))
+        # Rolling window: a long session would otherwise accumulate thousands of
+        # dumps, each with a full request body.
+        try:
+            files = sorted(p for p in d.glob("*.json") if p.is_file())
+            for old in files[:-DEBUG_REQUEST_MAX_FILES]:
+                old.unlink()
+        except OSError:
+            pass
+    except Exception:
+        # A debug aid must never take down a turn.
+        pass
+
+
 # ════════════════════════════════════════════════════════════════════════════
 #  PERSISTENCE HELPERS
 # ════════════════════════════════════════════════════════════════════════════
@@ -3027,6 +3834,88 @@ def _atomic_write(path: Path, text: str) -> None:
             raise
 
 
+# ── hang watchdog (v1.1.90) ─────────────────────────────────────────────────
+# The app has a rare, TOTAL freeze: Windows logs `Application Hang` (Id 1002) /
+# AppHangB1 and the window will not come back until the process is killed. WER
+# supplies only a signature hash (P4=ae95, P5=67246080 on every occurrence since at
+# least Oct 11), never a stack, so the freeze has never been root-caused. Reasoning
+# over the code has not found it either - the obvious candidate (a _post + blocking
+# wait issued FROM the main thread, which would starve its own queue) was tested and
+# is unreachable: _execute_tool runs only on the agentic worker.
+#
+# So: catch it instead. The main thread already beats every 50 ms through
+# _poll_ui_queue, so a stale beat IS the definition of "not responding". A daemon
+# thread watches that beat and writes EVERY thread's stack to
+# <data dir>/hang_reports/, turning the next occurrence into a trace naming the
+# exact blocked frame - and, because it re-dumps while still stalled, showing
+# whether that frame is stuck or merely slow.
+#
+# ⚠ The watchdog must NEVER touch Tk. Cross-thread Tcl calls are unreliable (the
+#   whole reason _post() exists), so everything it reports is snapshotted into plain
+#   attributes BY the main thread; the watchdog only reads those.
+# ⚠ Limitation worth knowing: if the main thread is blocked inside a C call that
+#   holds the GIL, no Python thread runs at all and nothing is written. Absence of a
+#   report after a hang is therefore evidence, not silence - it would mean the block
+#   is inside native code rather than a Python-level stall.
+
+HANG_STALL_S          = 8.0   # beat older than this => dump. Above Tk's own "not
+                              # responding" threshold, and high enough that dragging
+                              # a menu (which runs its own event loop) stays quiet.
+HANG_WATCH_INTERVAL_S = 1.0   # how often the watchdog looks
+HANG_REREPORT_S       = 30.0  # re-dump while still stalled: stuck vs moving frame
+HANG_MAX_DUMP_PER_RUN = 12    # bound disk use; a hang outliving this is already caught
+_HANG_DUMPS = [0]             # process-wide, so booting many apps cannot flood
+
+
+def _hang_report_dir() -> Path:
+    """Read SETTINGS_FILE at call time - main() relocates it after import."""
+    return SETTINGS_FILE.parent / "hang_reports"
+
+
+def _hang_dump(app, stalled_s: float) -> Optional[Path]:
+    """Write every thread's stack. Never raises, never blocks the caller.
+
+    Returns the report path (used by the tests to prove a dump really happened).
+    """
+    try:
+        if _HANG_DUMPS[0] >= HANG_MAX_DUMP_PER_RUN:
+            return None
+        _HANG_DUMPS[0] += 1
+        d = _hang_report_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        names = {t.ident: t.name for t in threading.enumerate() if t.ident}
+        frames = sys._current_frames()
+        main_id = threading.main_thread().ident
+        out: List[str] = [
+            "Deskpilot %s  |  MAIN THREAD STALLED %.1f s" % (VERSION, stalled_s),
+            "local time      : %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "ui queue depth  : %s" % getattr(app, "_ui_queue_depth", "?"),
+            "last main action: %s" % getattr(app, "_main_activity", "?"),
+            "turn in flight  : %s" % ("YES" if getattr(app, "_busy", False) else "no"),
+            "threads         : %s" % ", ".join(sorted(t.name for t in threading.enumerate())),
+            "",
+        ]
+        # Main thread first: it is the one that stopped pumping events.
+        for tid, frame in sorted(frames.items(), key=lambda kv: (kv[0] != main_id, kv[0])):
+            out.append("=" * 72)
+            out.append("%s thread id=%s name=%s"
+                       % ("MAIN" if tid == main_id else "    ", tid, names.get(tid, "?")))
+            out.append("=" * 72)
+            out.append("".join(traceback.format_stack(frame)))
+            out.append("")
+        fp = d / ("hang_%s_%02d.txt"
+                 % (datetime.now().strftime("%Y%m%d_%H%M%S"), _HANG_DUMPS[0]))
+        fp.write_text("\n".join(out), encoding="utf-8")
+        try:
+            print("[%s] ⚠ main thread stalled %.0f s - stack dump written to %s"
+                  % (APP_NAME, stalled_s, fp))
+        except Exception:
+            pass
+        return fp
+    except Exception:
+        return None      # diagnostics must never become the outage they describe
+
+
 def resolve_data_dir() -> Path:
     r"""Pick a writable directory for settings/chats/images.
 
@@ -3104,6 +3993,13 @@ def _searxng_base_url(settings: Dict[str, Any]) -> str:
         except Exception:
             host = "localhost"
         base = f"http://{host}:8080"
+    base = base.rstrip("/")
+    # A saved value that already ends in /search is the mistake this absorbs: every call
+    # site appends /search itself, so "http://host:8080/search" would fetch
+    # ".../search/search" and SearXNG answers 404. Accept either form, always hand back
+    # the base.
+    if base.lower().endswith("/search"):
+        base = base[:-len("/search")]
     return base.rstrip("/")
 
 
@@ -3129,10 +4025,15 @@ def load_settings() -> Dict[str, Any]:
     if not isinstance(mh, list):
         mh = []
     s["model_history"] = [str(x) for x in mh if str(x).strip()][:MODEL_HISTORY_MAX]
+    _sync_active_file_workspace(s)
     return s
 
 
 def save_settings(settings: Dict[str, Any]) -> bool:
+    # Sync FIRST: a File Workspace change must take effect for project resolution
+    # immediately, not after the next restart, and it must not depend on the write
+    # succeeding (a read-only data dir still leaves this session configured).
+    _sync_active_file_workspace(settings)
     try:
         _atomic_write(SETTINGS_FILE, json.dumps(settings, indent=2, ensure_ascii=False))
         return True
@@ -3295,20 +4196,113 @@ def _fmt_ctx(n: Any) -> str:
     return str(n)
 
 
+# Set by load_chats() when chats.json was PRESENT but unreadable, and cleared by
+# any successful load. save_chats() consults it to refuse the one sequence that
+# destroys history: failed load -> empty in-memory store -> save over the real file.
+LOAD_FAILURE_NOTE: Optional[str] = None
+
+
+def _salvage_bytes(path: Path) -> Tuple[bytes, Optional[str]]:
+    """Read a possibly-damaged file, returning (bytes, error-or-None).
+
+    Chunked on purpose: a whole-file read() raises and hands back nothing, while
+    reading incrementally keeps whatever prefix was readable before the failure
+    (bad UTF-8 mid-file, an AV scanner releasing its lock partway, a truncated
+    write). Those salvaged bytes are often the only copy worth preserving.
+    """
+    buf = bytearray()
+    err: Optional[str] = None
+    try:
+        with open(path, "rb") as fh:
+            while True:
+                try:
+                    chunk = fh.read(1 << 20)
+                except OSError as e:
+                    err = f"{type(e).__name__}: {e}"
+                    break
+                if not chunk:
+                    break
+                buf += chunk
+    except OSError as e:
+        err = f"{type(e).__name__}: {e}"
+    return bytes(buf), err
+
+
+def _preserve_unreadable(path: Path, why: str, raw: bytes) -> None:
+    """Copy unreadable bytes aside BEFORE anything can overwrite them.
+
+    _atomic_write's rolling .bak cannot rescue this case: it copies whatever the
+    live file holds at save time, so it backs up the corrupt content, and a second
+    save cycle rotates even that away. This sidecar is what survives a
+    wipe-then-save-twice sequence.
+    """
+    global LOAD_FAILURE_NOTE
+    dest = None
+    try:
+        ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        dest = path.with_name(f"{path.name}.corrupt-{ts}")
+        n = 1
+        while dest.exists():                     # two failures inside one second
+            dest = path.with_name(f"{path.name}.corrupt-{ts}.{n}")
+            n += 1
+        dest.write_bytes(raw)
+    except OSError as e:
+        print(f"[{APP_NAME}] Could not preserve unreadable {path.name}: {e}")
+        dest = None
+    LOAD_FAILURE_NOTE = (f"{path} was present but unreadable ({why}); "
+                         f"{len(raw)} bytes" +
+                         (f" preserved at {dest}" if dest else " could not be preserved"))
+    print(f"[{APP_NAME}] {LOAD_FAILURE_NOTE}")
+
+
+def _chats_from_legacy_list(raw: list) -> Dict[str, Any]:
+    """Very old stores were a bare LIST of chat dicts.
+
+    Upgrading in memory beats the old behaviour, which loaded them as an empty
+    store and let the next save write {} over the real history.
+    """
+    chats: Dict[str, Any] = {}
+    order: List[str] = []
+    for i, entry in enumerate(raw):
+        if not isinstance(entry, dict):
+            continue
+        cid = str(entry.get("id") or f"legacy_{i}_{uuid.uuid4().hex[:8]}")
+        while cid in chats:
+            cid = f"{cid}-{i}"
+        entry.setdefault("id", cid)
+        chats[cid] = entry
+        order.append(cid)
+    return {"order": order, "chats": chats}
+
+
 def load_chats() -> Dict[str, Any]:
+    global LOAD_FAILURE_NOTE
+    LOAD_FAILURE_NOTE = None
     data = {"order": [], "chats": {}}
     if CHATS_FILE.exists():
-        try:
-            raw = json.loads(CHATS_FILE.read_text(encoding="utf-8"))
-            if isinstance(raw, dict) and isinstance(raw.get("chats"), dict):
-                chats = raw["chats"]
-                order = [c for c in (raw.get("order") or []) if c in chats]
-                for cid in chats:                        # keep any unlisted chats too
-                    if cid not in order:
-                        order.append(cid)
-                data = {"order": order, "chats": chats}
-        except Exception:
-            pass
+        raw_bytes, read_err = _salvage_bytes(CHATS_FILE)
+        parsed, why = None, None
+        if read_err:
+            why = f"read failed: {read_err}"
+        else:
+            try:
+                parsed = json.loads(raw_bytes.decode("utf-8"))
+            except Exception as e:
+                why = f"{type(e).__name__}: {e}"
+        if parsed is None:
+            _preserve_unreadable(CHATS_FILE, why or "unparseable", raw_bytes)
+        elif isinstance(parsed, list):
+            data = _chats_from_legacy_list(parsed)
+        elif isinstance(parsed, dict) and isinstance(parsed.get("chats"), dict):
+            chats = parsed["chats"]
+            order = [c for c in (parsed.get("order") or []) if c in chats]
+            for cid in chats:                        # keep any unlisted chats too
+                if cid not in order:
+                    order.append(cid)
+            data = {"order": order, "chats": chats}
+        else:
+            # Valid JSON, wrong shape: still bytes that must not be clobbered.
+            _preserve_unreadable(CHATS_FILE, "unexpected top-level shape", raw_bytes)
     try:
         _migrate_inline_images(data)    # one-time shrink of legacy base64 images (no-op after run)
     except Exception as e:
@@ -3318,6 +4312,19 @@ def load_chats() -> Dict[str, Any]:
 
 
 def save_chats(chats: Dict[str, Any]) -> bool:
+    # Refuse the exact history-wiping sequence: the load failed, nothing was
+    # recovered, and an empty store is about to replace a file that had content.
+    # Deliberately narrow - the flag is set only at load time and cleared by any
+    # successful load, so "user deleted every chat, then save empty" still works.
+    if LOAD_FAILURE_NOTE and not (chats or {}).get("order"):
+        try:
+            had_content = CHATS_FILE.exists() and CHATS_FILE.stat().st_size > 0
+        except OSError:
+            had_content = False
+        if had_content:
+            print(f"[{APP_NAME}] Refusing to overwrite {CHATS_FILE.name} with an "
+                  f"empty store: {LOAD_FAILURE_NOTE}")
+            return False
     try:
         _atomic_write(CHATS_FILE, json.dumps(chats, indent=1, ensure_ascii=False))
         return True
@@ -4154,18 +5161,148 @@ def chat_thinking_extra_body(chat) -> Optional[dict]:
     """Per-chat thinking level -> the extra_body dict to send with the request.
 
     Off          -> {"enable_thinking": False} (no thinking at all)
-    Low/Medium/High -> {"chat_template_kwargs": {"reasoning_effort": low|medium|xhigh}}
-                       (Qwen3-style server extension; High maps to the template's
-                       xhigh, its maximum - 'Extra High' would be identical)
-    Blank / legacy / junk -> None: send nothing, server default applies, so old
-    chats keep their existing behavior unchanged."""
+    Low/Medium/High/XHigh -> {"chat_template_kwargs": {"reasoning_effort":
+                       low|medium|high|xhigh}} (Qwen3-style server extension).
+                       v1.1.77: High is now the plain "high" tier and XHigh the
+                       template's maximum - they used to collapse onto the same
+                       value, which made "High" mean maximum deliberation.
+    "Default" / blank / legacy / junk -> None: send nothing, server default applies, so
+    old chats keep their existing behavior unchanged."""
     val = str((chat or {}).get("thinking", "") or "").strip().lower()
     if val == "off":
         return {"enable_thinking": False}
-    effort = {"low": "low", "medium": "medium", "high": "xhigh"}.get(val)
+    effort = {"low": "low", "medium": "medium", "high": "high", "xhigh": "xhigh"}.get(val)
     if effort is not None:
         return {"chat_template_kwargs": {"reasoning_effort": effort}}
     return None
+
+
+# ── Studio mode (v1.1.77) ───────────────────────────────────────────────────
+# A per-chat mode for GENERATIVE work (artifacts: HTML, SVG, CSS, long-form prose),
+# measured against the request envelope this app actually builds. The built-in system
+# prompt used to open with "Keep answers concise." and the envelope carries a tool
+# schema per tool, a skills index, a project-memory index and a ledger - all of which
+# frame the model as a terse OPERATOR. For "make me an animated squirrel" that framing
+# costs real quality: the same model, same endpoint, same samplers produced a plain
+# SVG in Deskpilot and a 28 KB interactive simulation in the server's own chat.
+# Studio mode removes that framing for one chat at a time, and can be un-done
+# mid-conversation with no loss: the persona, skills, memory and ledger are all kept
+# on disk, only withheld while the mode is on.
+STUDIO_SYSTEM_PROMPT = (
+    "You are Deskpilot, in Studio mode: a maker working on one artifact at a time, "
+    "not an operator servicing requests. The user's tools are switched off for this "
+    "session, so you will not be asked to read, write, run, scrape or verify anything "
+    "- you are asked to MAKE something, and to make it well.\n"
+    "Ship complete, self-contained, polished work. Prefer a single file the user can "
+    "open and see working. Favour craft over brevity: real structure, real detail, "
+    "coherent visual and typographic decisions, sensible defaults, and the edge cases "
+    "handled. Do not summarise what you built, do not list next steps, do not ask "
+    "permission to continue - produce the thing, then a short note on the decisions "
+    "that matter."
+)
+
+
+# Studio has two intensities, and the checkbox cycles off -> full -> pure -> off.
+#   full : STUDIO_SYSTEM_PROMPT, tools withheld (minus any the chat re-enables),
+#          sampling loosened. A generative BRIEF, which is not the same as no brief.
+#   pure : NOTHING is sent as the system message and no DeskPilot framing of any kind
+#          is added. This is the closest DeskPilot can get to the inference engine's
+#          own chat: the model sees the conversation and nothing else.
+# Why the distinction matters: "no constraints" and "a brief that says ship the app"
+# produce similar-looking output, so a single Studio mode that always injected a
+# generative prompt could never fully match the raw chat - the brief is itself a
+# steering input, and a model told to be maximalist behaves differently from a model
+# told nothing. Only 'pure' removes the brief.
+# Tools behave the SAME in full and pure: withheld by default, and re-admitted one at a
+# time by clicking a red chip. The mode changes the BRIEF, never the tool set.
+STUDIO_MODES = ("off", "full", "pure")
+STUDIO_MODE_LABELS = {"off": "Studio", "full": "Studio · Full", "pure": "Studio · Pure"}
+
+
+def chat_studio_mode(chat) -> str:
+    """'off' | 'full' | 'pure'. Tolerates absent/legacy/junk: the boolean True from the
+    first cut of this feature means 'full', and 'none' (the name 'pure' replaced) maps
+    to 'pure', so chats saved under either earlier spelling keep working."""
+    v = (chat or {}).get("studio", False)
+    if isinstance(v, str):
+        s = v.strip().lower()
+        if s == "none":
+            return "pure"
+        if s in ("full", "pure"):
+            return s
+        if s in ("", "0", "false", "no", "off"):
+            return "off"
+        return "full"
+    return "full" if v else "off"
+
+
+def chat_studio(chat) -> bool:
+    """True in either Studio intensity."""
+    return chat_studio_mode(chat) != "off"
+
+
+def studio_next_mode(mode: str) -> str:
+    """off -> full -> none -> off."""
+    try:
+        i = STUDIO_MODES.index(str(mode or "off").strip().lower())
+    except ValueError:
+        i = 0
+    return STUDIO_MODES[(i + 1) % len(STUDIO_MODES)]
+
+
+def studio_tool_grants(chat) -> set:
+    """Tool names this chat has explicitly re-enabled while in Studio mode.
+
+    Per-chat on purpose: the global tool_permissions bar is the operator's normal
+    control, and a Studio session's needs are per-conversation - this chat wants the
+    web search, the next one wants nothing. Stored as a plain list so it survives the
+    JSON chat file unchanged."""
+    g = (chat or {}).get("studio_tools", [])
+    if isinstance(g, (list, tuple, set, frozenset)):
+        return {str(x) for x in g}
+    return set()
+
+
+def studio_tool_withheld(chat, name: str, studio_tools_off_setting) -> bool:
+    """True when this tool must be kept out of this chat's request.
+
+    Studio mode withholds by default; a per-tool grant re-admits exactly that tool and
+    nothing else. A tool whose global permission is Off stays out - Off is a hard user
+    veto, and a Studio grant is not a licence to override it."""
+    if not chat_studio(chat) or not studio_tools_off_setting:
+        return False
+    return str(name) not in studio_tool_grants(chat)
+
+
+def studio_all_tools_withheld(chat, studio_tools_off_setting) -> bool:
+    """True when Studio withholds EVERY tool (no grants yet) - the state the toolbar
+    shows as an all-red bar and the dispatch guard treats as 'no tools at all'."""
+    return (chat_studio(chat) and bool(studio_tools_off_setting)
+            and not studio_tool_grants(chat))
+
+
+def studio_tools_off(chat, studio_tools_off_setting) -> bool:
+    """Whether Studio mode is in its tools-withheld state for this chat.
+
+    The per-chat checkbox is the intent; the global setting is the escape hatch for a
+    chat that wants tools throughout Studio. Off keeps every chip live. When it is on,
+    individual tools can be re-admitted per chat via studio_tool_grants()."""
+    return chat_studio(chat) and bool(studio_tools_off_setting)
+
+
+def studio_sampling_overrides(chat, studio_sampling_setting) -> dict:
+    """Sampler values Studio mode forces, or {} when the feature is off.
+
+    top_k 20 is a hard truncation for long structured output, and 0.7 is tuned for
+    operational replies; both blunt generative range. Returned as strings in the
+    sampling_defaults shape so sampling_kwargs() can apply its normal coercion,
+    clamping and off-value rules to them - Studio mode must not bypass them."""
+    if not chat_studio(chat) or not studio_sampling_setting:
+        return {}
+    return {"top_k": "80", "temperature": STUDIO_TEMPERATURE}
+
+
+STUDIO_TEMPERATURE = "0.9"   # per-chat temp Studio mode applies (over the 0.7 default)
 
 
 
@@ -4187,7 +5324,7 @@ def _coerce_sampling(raw, lo, hi, is_int):
     return int(round(v)) if is_int else round(float(v), 6)
 
 
-def sampling_kwargs(settings) -> dict:
+def sampling_kwargs(settings, overrides: Optional[dict] = None) -> dict:
     """Sampler parameters from Settings, split the way the API needs them.
 
     Returns {"top": {...}, "flat": {...}}: 'top' are real OpenAI chat.completions fields
@@ -4196,12 +5333,18 @@ def sampling_kwargs(settings) -> dict:
     off-value, or when the server has rejected it. Values are clamped to their range and
     sent verbatim otherwise - no snapping, no rounding beyond float cleanup.
 
+    `overrides` (Studio mode) wins over the saved value for any key it names, and goes
+    through the SAME coercion, clamping and off-value rules - an override is a value,
+    not a licence to skip validation.
+
     Read on the worker thread at request-build time; never mutates settings."""
     top: Dict[str, Any] = {}
     flat: Dict[str, Any] = {}
     src = (settings or {}).get("sampling_defaults")
     if not isinstance(src, dict):
         src = {}
+    if overrides:
+        src = {**src, **{k: v for k, v in overrides.items() if v is not None}}
     for key, _label, lo, hi, is_int, target, off in SAMPLING_SCHEMA:
         v = _coerce_sampling(src.get(key, ""), lo, hi, is_int)
         if v is None:
@@ -4225,7 +5368,7 @@ def format_sampling_note(chat, top: dict, flat: dict, pruned: dict, thinking: Op
     Ground truth of the REQUEST, not of the settings dialog: keys omitted because they are
     off show as 'off', and anything the server rejected is labelled 'rejected' so a silently
     ignored parameter cannot masquerade as an applied one."""
-    parts = ["temp " + str(chat_temperature(chat))]
+    parts = ["temp " + str(top.get("temperature") or chat_temperature(chat))]
     if thinking is None:
         parts.append("thinking default")
     elif "enable_thinking" in thinking:
@@ -4291,8 +5434,16 @@ def _probe_first_line(err: str) -> str:
     return (txt[:180] + "...") if len(txt) > 180 else txt
 
 
-def _probe_reply_text(resp) -> tuple:
-    """(text, usage) from a completion response - tolerant of both non-stream and stream shapes."""
+def _probe_reply_text(resp, include_reasoning: bool = False) -> tuple:
+    """(text, usage) from a completion response - tolerant of both non-stream and stream shapes.
+
+    include_reasoning: when content is empty, fall back to the reply's reasoning text.
+    Off by DEFAULT because most callers are capability probes that ask the model to
+    echo a token - reasoning text there is noise, and returning it would make a model
+    look like it answered when it never produced a completion. The expert path turns
+    it on: a thinking model that puts its answer in reasoning_content is genuinely
+    answering, and losing that is what made every consult look like a failure.
+    """
     text = ""
     try:
         choices = list(getattr(resp, "choices", None) or [])
@@ -4301,6 +5452,8 @@ def _probe_reply_text(resp) -> tuple:
             msg = getattr(ch, "message", None)
             if msg is not None:
                 text = str(getattr(msg, "content", "") or "")
+                if not text.strip() and include_reasoning:
+                    text = _reply_reasoning(msg)
             else:
                 d = getattr(ch, "delta", None)
                 if d is not None:
@@ -4325,7 +5478,7 @@ def _probe_completions(client, timeout):
         return comp
 
 
-def _probe_create(client, kw: dict, timeout=None) -> tuple:
+def _probe_create(client, kw: dict, timeout=None, include_reasoning: bool = False) -> tuple:
     """Send ONE probe request; returns (text, usage, error_string) and never raises.
 
     A max_tokens/max_completion_tokens refusal is a server limitation, NOT a sampler verdict, so
@@ -4345,7 +5498,7 @@ def _probe_create(client, kw: dict, timeout=None) -> tuple:
                 return "", None, str(e2)
         else:
             return "", None, str(e)
-    _txt, _usage = _probe_reply_text(resp)
+    _txt, _usage = _probe_reply_text(resp, include_reasoning=include_reasoning)
     return _txt, _usage, None
 
 
@@ -4529,6 +5682,217 @@ def project_memory_file(settings: dict) -> Path:
     return default_workspace_root() / PROJECT_MEMORY_NAME
 
 
+# ── Active project (v1.1.81) ────────────────────────────────────────────────
+# The workspace index lists projects; this is which one the CURRENT chat is
+# working on. It is a field on the chat dict (like "studio"/"temperature"), not a
+# separate store: a chat is the unit of work, so the answer must travel with it,
+# and adding a file here would create a second thing that can disagree with
+# chats.json. The model declares it with set_project(); the top bar displays it;
+# the system prompt states it. No picker, no click - the user just talks.
+# (PROJECT_SLUG_MAX / _PROJECT_RESERVED live with the other constants above.)
+
+
+def project_key(raw) -> str:
+    """Comparison key for a project name. NOT the folder name - see resolve_project.
+
+    'Price Tracker' -> 'price-tracker', 'GB10_Alert' -> 'gb10-alert', 'gb10 alert'
+    -> 'gb10-alert'. Normalising is the whole ballgame: a trailing space or a stray
+    capital would silently never match the real folder, and the failure mode is
+    invisible - the project would look set while pointing at a MEMORY.md that does
+    not exist. Returns '' for anything unusable (caller decides how to complain).
+    """
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    # Reject traversal on the RAW input, BEFORE sanitising - the order is the whole
+    # lesson. The character filter below turns '../evil' into '..evil' and the strip
+    # then turns it into 'evil', so a check placed after them inspects a perfectly
+    # clean-looking name and waves through what began as an escape attempt. A name
+    # containing a separator is not a project name at all, so it is refused rather
+    # than repaired.
+    if ".." in s or "/" in s or "\\" in s or s in _PROJECT_RESERVED:
+        return ""
+    s = re.sub(r"[\s_]+", "-", s)
+    s = re.sub(r"[^a-z0-9.\-]", "", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-.")
+    if ".." in s or s in _PROJECT_RESERVED:
+        return ""
+    return s[:PROJECT_SLUG_MAX].strip("-.")
+
+
+def projects_root() -> Path:
+    return default_workspace_root() / PROJECT_MEMORY_SUBDIR
+
+
+def resolve_project(raw):
+    """(canonical_name, path, existed) for a user/model-supplied project name.
+
+    Resolves against the folders that ACTUALLY exist, which is not the same as
+    normalising the input. The real folders are `GB10_Alert` and
+    `Price-Stock_Montor`; slugifying either yields a name that does not exist on
+    disk, so a naive implementation would happily create `projects/gb10-alert`
+    beside `GB10_Alert` - a duplicate project whose memory file is a second copy
+    nobody reads. So: match by key, return the REAL folder name, and only invent a
+    new (clean, lowercase-hyphen) name when nothing matches.
+
+    The chat stores the canonical name, not the key, because every path built from
+    it has to resolve. Compare with project_key(), never with ==.
+    """
+    key = project_key(raw)
+    if not key:
+        return "", None, False
+    root = projects_root()
+    try:
+        if root.is_dir():
+            for d in sorted(root.iterdir()):
+                try:
+                    if d.is_dir() and project_key(d.name) == key:
+                        return d.name, d, True
+                except OSError:
+                    continue
+    except OSError:
+        pass
+    return key, root / key, False
+
+
+# How close a near-miss has to be before it is worth mentioning. Measured
+# 2026-10-16 against this workspace's real folder names: deliberate typos score
+# 0.941-0.973, unrelated-but-share-a-word names score 0.64-0.78.
+PROJECT_FUZZY_MIN = 0.86
+
+# Tool calls that count as "working in a project", and the argument holding the
+# path. run_shell is excluded on purpose - see _note_project_activity.
+PROJECT_ACTIVITY_TOOLS = {
+    "read_local_file", "write_local_file", "edit_local_file",
+    "search_files", "list_directory",
+}
+PROJECT_ACTIVITY_KEYS = ("path",)
+
+
+def close_project(raw, limit: int = 3):
+    """Existing project folders that LOOK like `raw` but are not it: [(name, ratio)].
+
+    Exists because similarity alone cannot tell a typo from a deliberate new name,
+    and picking a threshold to do it was tried on real data and failed:
+        Price-Stock_Monitor -> Price-Stock_Montor   0.973   typo, want a match
+        deskpiot            -> deskpilot            0.941   typo, want a match
+        artcraft2           -> artcraft             0.941   NEW project, must NOT match
+    The typo and the new name score IDENTICALLY, so no ratio separates them. What
+    does separate them is where the difference sits: a name that merely extends an
+    existing key (artcraft2, strata-tune-v2, deskpilot-app, ebay-5090-scout-v2) is
+    someone choosing a new name, while a name that diverges in the middle
+    (monitor/montor, deskpiot/despilot) is a slip of the keyboard. So a candidate
+    is only proposed when neither key is a prefix of the other. Verified against
+    all 15 names in this workspace.
+
+    Proposes rather than adopts: silently resolving artcraft2 to artcraft would be
+    the same class of bug this whole feature exists to remove.
+    """
+    key = project_key(raw)
+    if not key:
+        return []
+    out = []
+    root = projects_root()
+    try:
+        if not root.is_dir():
+            return []
+        entries = sorted(root.iterdir())
+    except OSError:
+        return []
+    for d in entries:
+        try:
+            if not d.is_dir():
+                continue
+        except OSError:
+            continue
+        other = project_key(d.name)
+        if not other or other == key:
+            continue
+        if other.startswith(key) or key.startswith(other):
+            continue                      # extension or abbreviation: intentional
+        ratio = difflib.SequenceMatcher(None, key, other).ratio()
+        if ratio >= PROJECT_FUZZY_MIN:
+            out.append((d.name, round(ratio, 3)))
+    out.sort(key=lambda t: (-t[1], t[0].lower()))
+    return out[:max(1, limit)]
+
+
+def project_dir(name: str) -> Path:
+    return projects_root() / str(name or "")
+
+
+def project_memory_path(name: str) -> Path:
+    """Where this project's own memory file lives - the thing the index exists to point at."""
+    return project_dir(name) / PROJECT_MEMORY_NAME
+
+
+def chat_project(chat) -> str:
+    """The active project's canonical folder name for a chat, or '' when unset.
+
+    Returned verbatim (not keyed) because callers build paths from it. Tolerates
+    None and legacy chats, which simply have no "project" key.
+    """
+    if not isinstance(chat, dict):
+        return ""
+    return str(chat.get("project") or "").strip()
+
+
+# The index table the row has to land in. Matched loosely on purpose: this file is
+# user-editable prose, so the parser keys on the one stable thing (a cell whose
+# first column is a `projects/<name>/` path) instead of on exact header wording.
+_INDEX_ROW_RE = re.compile(r"^\|\s*`projects/([^/`]+)/`\s*\|")
+
+
+def index_upsert_project(text: str, name: str, description: str = "",
+                         entry_point: str = "", old_name: str = "") -> tuple:
+    """Insert (or rename) one project row in the workspace index. Pure.
+
+    Returns (new_text, action) where action is 'created' | 'renamed' | 'exists' |
+    'no-table'. Rows are matched by project_key so `GB10_Alert` and `gb10-alert`
+    are the same project and never produce two rows.
+
+    Never rewrites an existing row's other columns, and never touches 'Last
+    activity' on a row that already exists: that column rides in EVERY system
+    prompt, so refreshing it per call would change the prefix and drop the KV
+    cache for no benefit. It is stamped only when the row is born.
+
+    'no-table' means the file does not look like the index any more - the caller
+    must then report the miss rather than write a row somewhere arbitrary.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return text, "no-table"
+    lines = text.split("\n")
+    idx = [i for i, l in enumerate(lines) if _INDEX_ROW_RE.match(l)]
+    if not idx:
+        return text, "no-table"
+    want, old = project_key(name), project_key(old_name)
+    row_of = {}
+    for i in idx:
+        row_of[project_key(_INDEX_ROW_RE.match(lines[i]).group(1))] = i
+
+    # Rename: rewrite the folder cell of the old row, leave its prose alone.
+    if old and old != want:
+        i = row_of.get(old)
+        if i is not None:
+            if want in row_of:      # target row already there; don't duplicate
+                return text, "exists"
+            lines[i] = _INDEX_ROW_RE.sub(f"| `projects/{name}/` |", lines[i], count=1)
+            return "\n".join(lines), "renamed"
+
+    if want in row_of:
+        return text, "exists"
+
+    # A literal pipe would split the row into extra columns, so escape it rather
+    # than delete it - descriptions legitimately contain "on | off" style text.
+    desc = re.sub(r"\s+", " ", str(description or "")).strip().replace("|", "\\|")[:220]
+    row = (f"| `projects/{name}/` | {desc or f'{name} project.'} "
+           f"| {entry_point or '-'} | `MEMORY.md` "
+           f"| {datetime.now().strftime('%Y-%m-%d')} |")
+    lines.insert(idx[-1] + 1, row)
+    return "\n".join(lines), "created"
+
+
 def _project_memory_text(settings: dict) -> str:
     """The workspace memory INDEX, for the system prompt. '' when off or absent.
 
@@ -4565,7 +5929,74 @@ def _project_memory_text(settings: dict) -> str:
     return (f"PROJECT MEMORY INDEX (workspace convention: every project has its own "
             f"folder under {default_workspace_root() / PROJECT_MEMORY_SUBDIR} with its "
             f"own MEMORY.md; read that file before working in a project, and update it "
-            f"when anything durable changes):\n{raw}{note}")
+            f"when anything durable changes):\n{raw}{note}"
+            # The split rule rides on EVERY request on purpose. It used to live only
+            # in the index body, where a model skimming it has been known to "fix" an
+            # over-budget memory file by DELETING rows from it - unrecoverable loss.
+            # Two projects lost real history that way before the rule was moved here.
+            f"\n\nMEMORY SIZE RULE: a project MEMORY.md that outgrows its budget is "
+            f"SPLIT, never trimmed. Move detail into a sibling file "
+            f"(projects/<name>/HARDWARE.md, RULES.md, history/<topic>.md) and leave "
+            f"the main file as an index whose rows say what lives where. Deleting or "
+            f"compressing a fact to hit a byte target DESTROYS information and is "
+            f"never the right fix; splitting preserves it. Verify after splitting "
+            f"that every fact is still findable in the project.")
+
+
+def _project_memory_project_text(settings: dict, project_name: str) -> str:
+    """The ACTIVE project's own MEMORY.md, for the system prompt. '' when off/absent.
+
+    SOW item 5 Gap 1. The index says WHICH folder to look in; this is what actually
+    makes the model aware, because "read the project memory first" is a step a model
+    skips under pressure - and by the time it skips it, it has already re-derived a
+    settled fact or created a second memory file beside the real one. Injecting the
+    file removes the optional step instead of recommending it.
+
+    Reads the folder that ACTUALLY exists via resolve_project(), never a slugified
+    guess: the real folders are `GB10_Alert` and `Price-Stock_Montor`, and a path
+    built from a normalised name would silently read nothing while looking correct.
+
+    Truncation is stated rather than hidden - a silently cut memory file reads like a
+    complete one, and the model then treats the missing half as never having existed.
+    """
+    name = str(project_name or "").strip()
+    if not name:
+        return ""
+    try:
+        budget = int(float((settings or {}).get("project_memory_project_chars",
+                                                PROJECT_MEMORY_PROJECT_DEFAULT)))
+    except (TypeError, ValueError):
+        budget = PROJECT_MEMORY_PROJECT_DEFAULT
+    budget = max(0, min(budget, PROJECT_MEMORY_PROJECT_MAX))
+    if budget <= 0:
+        return ""
+    canonical, path, existed = resolve_project(name)
+    if not existed or path is None:
+        return ""
+    p = path / PROJECT_MEMORY_NAME
+    try:
+        if not p.is_file():
+            return ""
+        size = p.stat().st_size
+        raw = p.read_bytes()[:PROJECT_MEMORY_READ_MAX].decode("utf-8", "replace")
+    except Exception:
+        return ""
+    raw = raw.strip()
+    if not raw:
+        return ""
+    total = len(raw)
+    note = ""
+    if total > budget:
+        raw = raw[:budget].rstrip()
+        # "+" when the DISK read was capped before the budget was reached, so the
+        # reported total is a floor rather than a number that looks exact.
+        note = (f"\n\n[... {PROJECT_MEMORY_NAME} truncated at {budget} of {total}"
+                f"{'+' if size > PROJECT_MEMORY_READ_MAX else ''} chars - "
+                f"read_local_file the whole file at {p} ...]")
+    return (f"ACTIVE PROJECT MEMORY - {PROJECT_MEMORY_SUBDIR}/{canonical}/{PROJECT_MEMORY_NAME} "
+            f"(injected so this project's rules, entry points and settled decisions are "
+            f"known without a lookup; update this file in the same turn as any durable "
+            f"change, and split it rather than trimming it):\n{raw}{note}")
 
 
 def effective_custom_prompt(settings: dict) -> str:
@@ -4588,34 +6019,58 @@ def effective_custom_prompt(settings: dict) -> str:
 
 def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_key: str = "",
                          custom_prompt: str = "", skills_index: str = "",
-                         ledger: str = "", project_memory: str = "") -> dict:
+                         ledger: str = "", project_memory: str = "",
+                         project: str = "", studio=False,
+                         project_memory_full: str = "") -> Optional[dict]:
     """System prompt injected at request time (never persisted to chat history).
 
     The model has no other way of knowing the real current date/time; without
     this, questions like "what time is it?" get hallucinated answers. Built
     fresh for every API call so long sessions don't go stale.
 
+    v1.1.77: the opening line used to end with "Keep answers concise." It was
+    hardcoded, gated by nothing, and sat in every request the app ever sent - the one
+    instruction in the envelope that explicitly demanded brevity, and the reason
+    generative asks came back thin even with the user's persona switched off. It is
+    gone; the user's own custom system prompt is the place for style now.
+
+    studio selects the intensity (see STUDIO_MODES):
+      False / "off"  -> the full operational prompt below.
+      True  / "full" -> STUDIO_SYSTEM_PROMPT only.
+      "pure"         -> returns None: NO system message is sent at all. This is the
+                        raw-chat shape - the model gets the conversation and nothing
+                        else, with no DeskPilot brief steering it. Callers must omit
+                        the returned None from the message list (nothing in this app
+                        assumes messages[0] is a system message).
+
+    A generative session has no use for the workspace jail, tool guidance, tool-economy
+    paragraph, skills index, ledger or user persona - every one of them reads as "be a
+    terse operator", so 'full' returns the brief ALONE and ignores those arguments.
+
+    ⚠ PROJECT MEMORY is decided by the CALLER, not here (v1.1.83): the request path
+    appends the workspace memory index to STUDIO_SYSTEM_PROMPT for 'full', because a
+    generative session still has to know which project it is in. So 'full' is NOT
+    literally "STUDIO_SYSTEM_PROMPT only" on the wire - it is that plus project
+    memory. 'pure' remains nothing at all. Do not move that append in here: this
+    function's 'full' contract (one exact string) is what the Studio identity test
+    pins, and folding memory in would make the test unable to tell the two apart.
+
     custom_prompt (Settings -> Custom System Prompt) is appended AFTER all the
     built-in context so persona/style instructions layer on top of - and can
     never replace - the operational facts above.
+
+    The date/time is NOT here: it changes every minute and would invalidate the
+    engine's KV prefix cache for the whole conversation. See build_time_note(),
+    which carries it on the newest user message instead.
     """
-    now = datetime.now().astimezone()
-    off = now.utcoffset()
-    if off is not None:
-        total_min = int(off.total_seconds()) // 60   # whole minutes (fractional seconds irrelevant)
-        sign = "+" if total_min >= 0 else "-"
-        h, m = divmod(abs(total_min), 60)
-        off_s = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")   # e.g. UTC+5:30, UTC-4
-    else:
-        off_s = "unknown offset"
+    mode = studio if isinstance(studio, str) else ("full" if studio else "off")
+    mode = {"none": "pure"}.get(mode.strip().lower(), mode.strip().lower())
+    if mode == "pure":
+        return None
+    if mode == "full":
+        return {"role": "system", "content": STUDIO_SYSTEM_PROMPT}
     content = (
-        f"You are Deskpilot, a helpful local AI desktop assistant running on the user's computer. "
-        f"Current date and time on the user's machine: "
-        f"{now.strftime('%A, %B %d, %Y at %I:%M %p')} "
-        f"(timezone {now.strftime('%Z') or 'local'}, {off_s}). "
-        f"If the user asks about the current date or time, use this information; "
-        f"for other time zones, convert from it and mention the conversion. "
-        f"Keep answers concise."
+        f"You are Deskpilot, a helpful local AI desktop assistant running on the user's computer."
     )
     if file_workspace:
         content += (f" The user has restricted the local file tools to this workspace folder: {file_workspace}. "
@@ -4629,6 +6084,27 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
         content += (" firecrawl_scrape is a powerful scraper (handles JavaScript-rendered pages and anti-bot "
                     "walls) - use it whenever a page needs a browser engine or resists plain fetching. "
                     "fetch_url remains the faster first choice for simple static pages.")
+    content += (" Tool economy: each tool call costs a full round trip and its output stays in "
+                "context, so batch what you can - one comprehensive call that prints several "
+                "things beats several narrow calls asking one question each; use search_files to "
+                "locate code before reading whole files; do not re-read a file you already read "
+                "this turn unless it changed. Verify the work, but verify it once and "
+                "comprehensively rather than repeatedly in small probes.")
+    # v1.1.86 (SOW item 2): the capability existed but nothing TRIGGERED it, so it
+    # went unused unless the user happened to ask. This is the nudge, and it is
+    # deliberately paired with a budget - an unbounded "always verify" turns every
+    # answer into a research project and trades hallucination for latency. One check
+    # per question; if it does not settle the matter, say what is uncertain instead of
+    # burning more calls. ask_expert already carries its own "use it where a fresh pair
+    # of eyes helps" guidance, so this line only has to make the FIRST move automatic.
+    content += (" Verify before you assert: when a claim is about something that can "
+                "have changed (prices, stock, versions, dates, what a product or API "
+                "currently does, who holds what role) - or you would hesitate to bet "
+                "on it - check it rather than answering from memory: one exa_search or "
+                "searxng_search, or ask_expert for a code or design question you are "
+                "unsure about. Budget it: one check per question, and if the first one "
+                "does not settle it, state what is still uncertain and say so plainly "
+                "instead of presenting a guess as a fact.")
     si = (skills_index or "").strip()
     if si:
         # Placed BEFORE the user's standing instructions so skills read as available
@@ -4639,6 +6115,25 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
         # The index is a standing instruction about where to look, so it sits with
         # the skills block and ahead of the ledger (facts) and the user's own text.
         content += "\n\n" + pm
+    proj = (project or "").strip()
+    if proj:
+        # Which of those projects THIS chat is working on, plus the path to its
+        # memory file. The index says where to look in general; this removes the
+        # remaining guess, which is what made "read the project memory first"
+        # skippable. Changes only when the project changes, so the prefix is
+        # stable turn to turn (one re-prefill per project switch, not per turn).
+        content += ("\n\nACTIVE PROJECT: " + proj
+                    + " - before working in it, read "
+                    + PROJECT_MEMORY_SUBDIR + "/" + proj + "/" + PROJECT_MEMORY_NAME
+                    + ". If the work here belongs to a different project, or starts a "
+                    "new one, call set_project() so the label and the index follow.")
+    pmf = (project_memory_full or "").strip()
+    if pmf:
+        # The active project's OWN memory, placed directly after the line that names
+        # it: that line is the pointer, this is the payload, and keeping them adjacent
+        # means the model never has to connect two separate sections. Appended AFTER
+        # the index so the (stable) index prefix stays stable for prompt caching.
+        content += "\n\n" + pmf
     led = (ledger or "").strip()
     if led:
         # The ledger is FACTS, not instructions, and it sits after the skills block but
@@ -4649,6 +6144,75 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
     if custom:
         content += "\n\nUser instructions (apply to every reply):\n" + custom
     return {"role": "system", "content": content}
+
+
+def build_time_note() -> str:
+    """The volatile per-request date/time line, kept OUT of the system message.
+
+    Why this exists (v1.1.73, measured on the local Strata server): the KV
+    prefix cache can only reuse a contiguous prefix, so a single changed token
+    invalidates everything after it. The timestamp used to sit at token ~20 of
+    the system prompt and change every minute, which threw away the whole cache
+    on most minute boundaries - a full re-prefill, ~12 s at 100K context and
+    ~55 s at 400K. Measured A/B on a 65K-token request shaped like a real
+    DeskPilot one: timestamp inside the system prompt reused 16,384 tokens
+    (25%); moved to the newest user message it reused 49,152 (75%), and prefill
+    fell 7.1 s -> 3.0 s.
+
+    Appending it to the newest user message costs nothing, because that message
+    is new content on every turn anyway - the cache was always going to stop
+    there. Returns '' when the clock is unusable, so callers can skip it.
+    """
+    try:
+        now = datetime.now().astimezone()
+    except Exception:
+        return ""
+    off = now.utcoffset()
+    if off is not None:
+        total_min = int(off.total_seconds()) // 60   # whole minutes (fractional seconds irrelevant)
+        sign = "+" if total_min >= 0 else "-"
+        h, m = divmod(abs(total_min), 60)
+        off_s = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")   # e.g. UTC+5:30, UTC-4
+    else:
+        off_s = "unknown offset"
+    return (f"\n\nCurrent date and time on the user's machine: "
+            f"{now.strftime('%A, %B %d, %Y at %I:%M %p')} "
+            f"(timezone {now.strftime('%Z') or 'local'}, {off_s}). "
+            f"If the user asks about the current date or time, use this information; "
+            f"for other time zones, convert from it and mention the conversion.")
+
+
+def _stamp_last_user(messages: List[dict], note: str) -> List[dict]:
+    """Return a copy of `messages` with `note` appended to the LAST user turn.
+
+    The request list is built fresh per call, but the message dicts are shared
+    with the persisted chat history, so the target user message is COPIED before
+    its text is extended - mutating it in place would write the timestamp into
+    the saved transcript and make every future turn diverge on a stale stamp.
+
+    Content may be a plain string or a multimodal part list; both are handled,
+    and a list gets a new trailing text part rather than touching the images.
+    If there is no user message at all (a handoff with an empty thread) the
+    note is dropped: an assistant-only history is not a place to put it, and
+    inventing a user turn would change the conversation shape."""
+    if not note:
+        return messages
+    out = list(messages)
+    for i in range(len(out) - 1, -1, -1):
+        m = out[i]
+        if not isinstance(m, dict) or m.get("role") != "user":
+            continue
+        c = m.get("content")
+        m = dict(m)
+        if isinstance(c, str):
+            m["content"] = c + note
+        elif isinstance(c, list):
+            m["content"] = list(c) + [{"type": "text", "text": note.strip()}]
+        else:
+            m["content"] = note.strip()
+        out[i] = m
+        return out
+    return out
 
 
 def _turn_time_limit(settings: dict) -> int:
@@ -4681,13 +6245,54 @@ HANDOFF_PREV_NOTES_LISTED = 5        # how many earlier notes the header of a ne
 HANDOFF_TITLE_SLUG_MAX = 40          # chat title chars kept in the note filename
 
 
+# Settings -> File Workspace, mirrored to module scope so the module-level project
+# helpers (projects_root / resolve_project / project_dir / project_memory_path) can
+# honour it WITHOUT threading a settings dict through all six of them and their ~14
+# call sites. Synced by load_settings() and save_settings(), the only two paths that
+# install or change settings, so it cannot go stale behind a Settings edit.
+#
+# ⚠ Why this exists: USER_WORKSPACE_ROOT is a hardcoded path that only exists on the
+# author's machine. On anyone else's it falls through to BASE_DIR, which in a onefile
+# build is sys._MEIPASS - an EPHEMERAL temp directory deleted at exit. So projects/,
+# each project's MEMORY.md and the handoff notes were written somewhere the model
+# could not read (it is jailed to file_workspace by _safe_path) and which vanishes on
+# quit: project memory silently never injected, for every user but the author.
+#
+# Blank file_workspace means "unrestricted", and the fallback chain below is the old
+# behaviour verbatim - so a test that leaves file_workspace blank and patches
+# USER_WORKSPACE_ROOT keeps passing untouched.
+_ACTIVE_FILE_WORKSPACE: str = ""
+
+
+def _sync_active_file_workspace(settings) -> None:
+    """Mirror settings['file_workspace'] into _ACTIVE_FILE_WORKSPACE. Never raises."""
+    global _ACTIVE_FILE_WORKSPACE
+    try:
+        _ACTIVE_FILE_WORKSPACE = str((settings or {}).get("file_workspace") or "").strip()
+    except Exception:
+        _ACTIVE_FILE_WORKSPACE = ""
+
+
 def default_workspace_root() -> Path:
     """The workspace folder itself (NOT the notes subfolder, NOT the data store).
 
-    Same resolution order the handoff-notes path uses: USER_WORKSPACE_ROOT when it
-    exists on this machine, else the script's own folder - so a copy of this
-    script elsewhere still finds a sensible root instead of a hardcoded path that
-    does not exist."""
+    Order: the user's File Workspace when it is set AND exists, else
+    USER_WORKSPACE_ROOT when that exists on this machine, else the script's own
+    folder. The first step is what makes projects/, project MEMORY.md files and
+    handoff notes land inside the folder the file tools are allowed to read; see
+    _ACTIVE_FILE_WORKSPACE above for the failure it removes.
+
+    A configured-but-missing folder deliberately falls through rather than being
+    returned: callers mkdir beneath this root, and handing back a path the user
+    mistyped (or a drive that is unplugged) would scatter new folders next to it."""
+    ws = _ACTIVE_FILE_WORKSPACE
+    if ws:
+        try:
+            p = Path(os.path.expanduser(ws)).resolve()
+            if p.is_dir():
+                return p
+        except Exception:
+            pass
     try:
         if USER_WORKSPACE_ROOT.is_dir():
             return USER_WORKSPACE_ROOT
@@ -4879,7 +6484,15 @@ def _skill_dirs(settings) -> List[Path]:
     raw = (settings or {}).get("skills_dir", "")
     if isinstance(raw, str) and raw.strip():
         add(raw.strip())
-    for base in (USER_WORKSPACE_ROOT, BASE_DIR):
+    # default_workspace_root(), NOT USER_WORKSPACE_ROOT (v1.1.89). The latter is a
+    # hardcoded path that exists on exactly one machine, so on any other install - or
+    # in a --onefile build, where BASE_DIR is a temp extraction dir - a blank
+    # 'Skills folder' scanned nothing at all, and the message below told the user to
+    # create someone else's Desktop folder. default_workspace_root() already prefers
+    # the configured File Workspace, then USER_WORKSPACE_ROOT, then BASE_DIR, and
+    # add() dedupes on the resolved path, so the BASE_DIR entry is a harmless no-op
+    # when the two coincide.
+    for base in (default_workspace_root(), BASE_DIR):
         try:
             if base.is_dir():
                 add(base / SKILLS_SUBDIR)
@@ -5327,7 +6940,8 @@ def _deterministic_handoff(chat: dict, max_chars: int = HANDOFF_FALLBACK_MAX_CHA
 # logs, and what the re-compaction detector in _generate_compaction_summary looks for.
 # (The EVENT count lives in chat["compaction_archive"] - never in marker counts: a
 # re-compaction folds the previous summary, and its marker, into the new one.)
-COMPACTION_MARKER = "[COMPACTED"
+COMPACTION_MARKER = "[COMPACTED"
+
 SESSION_HANDOFF_MARKER = "[Session Handoff]"   # intro a handoff seeds into a continued session
 
 
@@ -5352,7 +6966,14 @@ def _compaction_split_index(messages: List[dict], keep_recent: int) -> int:
     a valid request beats an exact count.
     Returns 0 when no safe boundary exists (caller then declines to compact)."""
     n = len(messages or [])
-    idx = max(0, n - int(keep_recent or 0))
+    # Defensive floor: keep_recent <= 0 would put idx at n and messages[idx] below
+    # would raise IndexError. Unreachable through the clamped call site, but this
+    # function is also called directly by tests and future callers.
+    try:
+        keep_recent = max(2, int(keep_recent))
+    except (TypeError, ValueError):
+        keep_recent = 2
+    idx = max(0, n - keep_recent)
     while idx > 0:
         cur = messages[idx]
         prev = messages[idx - 1]
@@ -5672,6 +7293,13 @@ class DeskpilotApp:
         self._active_md: Optional[MarkdownStream] = None   # main thread only
         self._reasoning_sid: Optional[str] = None          # main thread only
         self._reasoning_sids: List[str] = []               # open reasoning drawers this turn (main thread)
+        # (index, len(_code_buttons), len(_image_thumbs), len(_links), len(_accordions))
+        # at the start of the current model step - see _ui_mark_step_render().
+        self._step_render_mark: Optional[tuple] = None
+        # Snapshot of the above taken just before a step's tool phase, so a Stop
+        # mid-phase can drop the phantom accordions while keeping the streamed text
+        # (which the rollback deliberately preserves in history).
+        self._tool_phase_render_mark: Optional[tuple] = None
         self._supports_usage_opts = True
         self._ctx_used = 0          # last known prompt_tokens for the active session (set on main thread)
         self._ctx_total = 0         # context window size from /models metadata (main thread)
@@ -5715,6 +7343,18 @@ class DeskpilotApp:
         self._search_result_widgets: List[tk.Widget] = []  # full-text result rows in the sidebar
         self._search_last_build: float = 0.0               # rate limit on index rebuilds
         self._search_debounce = None                       # after() id for the body search
+        # ── spell check (v1.1.78) - INPUT BOX ONLY ──
+        # The dictionary costs ~23 MB and ~0.3 s to build, so it is created lazily
+        # on first use in a worker thread and never at startup. _spell_engine is
+        # read from the main thread only after _post() has installed it.
+        self._spell_engine = None                          # SpellChecker | None (built lazily)
+        self._spell_building = False                       # worker in flight - don't race it
+        self._spell_after = None                           # after() id of the pending rescan
+        self._spell_hits: List[tuple] = []                 # [(start,end,word)] from the last scan
+        self._spell_menu_index = None                      # index under the cursor at right-click
+        self._spell_error: str = ""                        # why the engine failed, for the menu
+        self._spell_failed = False                         # permanent failure - never retry
+        self._spell_retries = 0                            # bounded wait-for-build retries
         self._archive_expanded: Dict[str, set] = {}         # cid -> {compaction_number} drawers opened this session
         self._clients: Dict[tuple, Any] = {}       # (server_url, api_key) -> cached OpenAI client (keep-alive pooling)
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
@@ -5722,6 +7362,28 @@ class DeskpilotApp:
         self._sampling_sent: Optional[dict] = None   # last request's sampling payload (worker writes, note renders)
         self._verify_running = False            # a "Verify parameters" probe is in flight (Settings -> Sampling)
         self._pending_thinking: Optional[str] = None      # welcome-state thinking change, same
+        self._pending_studio: Optional[str] = None        # welcome-state Studio mode
+        # welcome-state active project, set by set_project() before any chat exists
+        # (the usual case: the model declares the project on the first turn, which is
+        # the turn that creates the chat). Consumed by new_chat().
+        self._pending_project: Optional[str] = None
+        # Chats whose project has been WORKED ON during this app session. The top bar
+        # lights up from this set, not from the stored `project` field: a chat opened
+        # from the history list is being read, not worked on, and the stored field is
+        # true of every old chat that ever declared one - so the bar used to be green
+        # the moment you clicked any past conversation (user request, 2026-10-16).
+        # In-memory on purpose: it is session state, so restarting the app starts dark
+        # and nothing is persisted. The stored field still drives the system-prompt
+        # injection (chat_project) - only the DISPLAY is gated here.
+        self._project_active_chats: set = set()
+        # v1.1.88: per-chat compaction sequence, worker-side. chat["compaction_archive"]
+        # is appended on the MAIN thread inside _persist_compaction, so a worker that
+        # derives the next number from len(archive) reads a value that has not caught up
+        # yet and two compactions can share a number - and the marker text hands THAT
+        # number to the model as read_archive(compaction=N), so a duplicate silently
+        # points it at the wrong archive entry. Worker-written, main-thread-never-read,
+        # keyed by chat id, and deliberately NOT part of self.chats (invariant #4).
+        self._compaction_seq: Dict[str, int] = {}
         # ── MCP (Model Context Protocol) servers ────────────────────────────
         self._mcp_clients: Dict[str, MCPClient] = {}   # server name -> connected client
         self._mcp_lock = threading.Lock()              # guards _mcp_clients (iteration vs mutation across threads)
@@ -5786,6 +7448,7 @@ class DeskpilotApp:
         self.root.bind("<Control-f>", lambda e: (self.chat_search.focus_set(), "break")[1])
         self.root.after(300, self.apply_dark_titlebar)      # HWND must exist first
         self._poll_ui_queue()             # start draining worker-thread UI callbacks
+        self._start_hang_watchdog()       # dump stacks if this thread ever stops beating
         self._refresh_ctx_topbar()        # populate the top-bar context readout (background)
         self._mcp_connect_all()           # start configured MCP servers (background thread)
 
@@ -5980,9 +7643,16 @@ class DeskpilotApp:
                                        fg=COL["text_dim"], font=F(11))
         self.top_model_label = tk.Label(top, text="", bg=COL["bg_main"],
                                         fg=COL["text_dim"], font=F(11))
+        # v1.1.81: which project this chat is working on. A DISPLAY, not a control -
+        # the model declares it via set_project() and the user corrects it in words.
+        # Blank when unset; green with the name once a project is declared (the
+        # colour is set by _update_project_topbar, NOT here - this fg is only the
+        # initial state of an empty label).
+        self.project_top_label = tk.Label(top, text="", bg=COL["bg_main"],
+                                          fg=COL["text_dim"], font=F(11, "bold"))
         # pack right->left: status | speed | context | temperature | model (model at far right)
         for w in (self.status_label, self.speed_label, self.ctx_top_label,
-                  self.temp_top_label, self.top_model_label):
+                  self.temp_top_label, self.project_top_label, self.top_model_label):
             w.pack(side="right", padx=(0, 12 if w is not self.top_model_label else 14), pady=10)
 
         # v1.1.46 (#4c): per-turn checkpoint revert. Deliberately a TOP-BAR control and
@@ -6006,7 +7676,21 @@ class DeskpilotApp:
         mid = tk.Frame(area, bg=COL["bg_main"])
         mid.pack(fill="both", expand=True)
         self.chat_text = tk.Text(
-            mid, wrap="word", bg=COL["bg_main"], fg=COL["text"],
+            mid,
+            # height=10 is load-bearing, not cosmetic. tk.Text defaults to 24 LINES,
+            # which REQUESTS ~620 px here; the pane below it (the input row) needs ~91 px
+            # and the header ~54, so the column requested ~765 px. Tk's pack sizes each
+            # slave top-down at its REQUESTED height and simply UNMAPS whatever falls off
+            # the end - expand only shares out SPARE space, it never reserves room for a
+            # later slave. So at any window shorter than ~765 px the entire input row
+            # vanished: no text box, no Send button, no error. Measured on a fresh boot
+            # at the app's own minimum size (960x620): inp mapped=0, every child mapped=0.
+            # A small requested height keeps the column's request under the window floor
+            # so the row always maps, while fill="both"+expand=True below still lets this
+            # widget grow into every spare pixel (visually identical at normal sizes).
+            # Do not "restore" the default 24 - it silently re-breaks short windows.
+            height=10,
+            wrap="word", bg=COL["bg_main"], fg=COL["text"],
             insertbackground=COL["text"], relief="flat", bd=0,
             font=F(12), padx=14, pady=10, spacing1=2, spacing3=2,
             selectbackground=COL["bg_raised"], selectforeground=COL["text"])
@@ -6037,19 +7721,46 @@ class DeskpilotApp:
         # thin frame packed exactly where the Text used to be, so every button on the row
         # keeps its original side="left" order (mic / TTS / temp+thinking / Send).
         # Styling mirrors the chat pane scrollbar; Tk 9-safe (explicit bd/highlightthickness).
+        #
+        # v1.1.86: `box` is BUILT here but deliberately NOT packed here - see the
+        # "input row" note above the mic button for why. Its children pack inside it
+        # normally; only box's own slot in `inp` is deferred to the end of this method.
         box = tk.Frame(inp, bg=COL["bg_deep"])
-        box.pack(side="left", fill="both", expand=True)
         self.input_text = tk.Text(
-            box, height=3, wrap="word", bg=COL["bg_deep"], fg=COL["text"],
+            box,
+            # width=20 is load-bearing, not cosmetic. tk.Text defaults to width=80
+            # CHARACTERS, which at this font REQUESTS ~740 px. The row's fixed cluster
+            # needs ~402 px, so the row requested ~1159 px - and when the window was
+            # narrower than that, pack did not shrink the box: it UNMAPPED the whole
+            # input frame. Measured on a fresh boot at the app's own minimum size
+            # (960x620): inp mapped=0, every child mapped=0 - no text box and no Send
+            # button at all, with no error anywhere. A requested width of ~200 px keeps
+            # the row's request near 600 px, so it fits, and expand=True below still
+            # lets it grow into every spare pixel (measured 1402 px at 2163 wide).
+            # Do not "restore" the default 80: it silently re-breaks small windows.
+            width=20,
+            height=3, wrap="word", bg=COL["bg_deep"], fg=COL["text"],
             insertbackground=COL["text"], relief="flat", bd=0,
+            # Undo must be ON or edit_separator() in _spell_replace is a no-op and
+            # Ctrl+Z does nothing in the input box. Tk Text undo is per-widget, so
+            # this cannot leak into the chat view.
+            undo=True, autoseparators=True, maxundo=-1,
             font=F(12), padx=10, pady=8)
         self.input_scroll = tk.Scrollbar(box, orient="vertical", command=self.input_text.yview,
                                          bg=COL["bg_raised"], troughcolor=COL["bg_deep"],
                                          highlightthickness=0, borderwidth=0)
         self.input_text.configure(yscrollcommand=self.input_scroll.set)
+        # Spell check underline (v1.1.78) - INPUT BOX ONLY. Tk 8.6 has no wavy
+        # underline, so this is a straight one; the colour is the app's existing
+        # warning red rather than a new palette key.
+        self.input_text.tag_configure("spell_bad", underline=True, foreground=COL["danger"])
         self.input_scroll.pack(side="right", fill="y")
         self.input_text.pack(side="left", fill="both", expand=True)
         self.input_text.bind("<Return>", self._on_input_return)
+        # Spell check: rescans are debounced (160 ms) and cost ~0.25 ms for a
+        # ~1900-char box, so typing never waits on the dictionary. KeyRelease
+        # covers typing; the context-menu Paste handler covers pasting.
+        self.input_text.bind("<KeyRelease>", lambda e: self._spell_schedule(), add="+")
         # Right-click context menu (Cut/Copy/Paste/Select All) on both text widgets;
         # chat_text additionally gets click handlers for embedded image thumbnails.
         self.chat_text.bind("<Button-1>", self._on_chat_click)
@@ -6058,23 +7769,55 @@ class DeskpilotApp:
         self.chat_text.bind("<Motion>", self._on_chat_motion)
         self.chat_text.bind("<Button-3>", self._on_chat_right_click)
         self.input_text.bind("<Button-3>", self._show_context_menu)
+        # Start spell checking if it was left on; harmless no-op otherwise (and
+        # a no-op when pyspellchecker is absent, which is the default install).
+        try:
+            self._spell_apply_state()
+        except Exception:
+            pass
+
+        # ── input row: the fixed-width cluster is PACKED ON THE RIGHT (v1.1.86) ──
+        # Measured on this machine before the change: the text box REQUESTS 757 px
+        # (3 rows + its scrollbar) and was packed before everything to its right, so
+        # as the window narrowed it ate the space the cluster needed and the tail of
+        # the row simply disappeared - at 1400 px Send went unmapped; at 1280 px the
+        # mode column did too; at 1100 px mic, TTS, temp/thinking, Prompt, Studio and
+        # Send were ALL gone, leaving only 📎 and the box. A clipped Send button is
+        # not a cosmetic bug - it removes the only way to submit a message.
+        #
+        # Tk funds every slave at its REQUESTED width in PACK ORDER and only then
+        # shrinks the expand=True one, so the fix is to pack the cluster BEFORE the
+        # box. It must be packed with side="right": pack places left-side slaves
+        # left-to-right in pack order, so merely packing them first (still side="left")
+        # funded them correctly but MOVED THE WHOLE CLUSTER TO THE LEFT of the text
+        # box - which is exactly what the first v1.1.86 build shipped and the user
+        # caught on sight. side="right" gets both properties at once: funded first,
+        # and anchored to the right edge. They are packed outermost-in, so the visual
+        # order stays 📎 [text box] 🎤 🔊 temp/thinking Prompt/Studio Send.
+        #
+        # Construction order is untouched, because a child's position in the parent's
+        # stacking order comes from construction and the layout tests read that order.
+        #
+        # NO new minsize here on purpose. The root window already sets
+        # self.root.minsize(960, 620) at creation, and a second call later in the
+        # build silently REPLACES it - measured: adding minsize(900, 520) here lowered
+        # the existing floor by 60 px wide and 100 px tall, which is a regression
+        # dressed up as a fix. With the reordering above, nothing clips at 960 (or at
+        # 860, or 800), so the pre-existing floor is already sufficient.
 
         self.mic_btn = tk.Button(inp, text="🎤", command=self.toggle_mic,
                                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
                                  relief="flat", bd=0, width=3, cursor="hand2",
                                  font=F(13))
-        self.mic_btn.pack(side="left", padx=(6, 2))
 
         self.tts_btn = tk.Button(inp, text="🔊", command=self.toggle_tts,
                                  bg=COL["bg_raised"], fg=COL["text_dim"], activebackground="#4B5563",
                                  relief="flat", bd=0, width=3, cursor="hand2",
                                  font=F(13))
-        self.tts_btn.pack(side="left", padx=(2, 6))
 
         # Per-chat temperature + thinking selectors stacked in a narrow column:
         # temperature on top, Thinking On/Off directly below it (user-requested layout).
         sel_col = tk.Frame(inp, bg=COL["bg_main"])
-        sel_col.pack(side="left", padx=(6, 2))
         self.temp_combo = ttk.Combobox(sel_col, values=list(TEMP_VALUES), state="readonly",
                                        width=8, style="Tool.TCombobox", font=F(11))
         self.temp_combo.set(TEMP_DEFAULT)
@@ -6082,15 +7825,72 @@ class DeskpilotApp:
         self.temp_combo.pack(side="top")
         self.think_combo = ttk.Combobox(sel_col, values=list(THINK_VALUES), state="readonly",
                                         width=8, style="Tool.TCombobox", font=F(11))
-        self.think_combo.set("High")
+        self.think_combo.set(THINK_DEFAULT)
         self.think_combo.bind("<<ComboboxSelected>>", lambda e: self._on_thinking_selected())
         self.think_combo.pack(side="top", pady=(2, 0))
+
+        # ── Studio mode (v1.1.77) ──────────────────────────────────────
+        # Per-chat, under the attachment button, as requested. It CYCLES on click:
+        # off -> full -> pure -> off.
+        #   full : a generative brief, tools withheld, sampling loosened.
+        #   pure : NO system message at all and no DeskPilot framing - the raw-chat
+        #          shape, which is what was asked for ("no brief, no constraints").
+        # Tools behave identically in both: red = withheld, click a red chip to re-admit
+        # THAT tool for this chat only, click again to revoke. The request is built from
+        # the same predicate, so the bar and the wire cannot disagree. Hover text lists
+        # all three modes in one line each, so the difference is visible without clicking.
+        # ── Mode column: Prompt toggle stacked above Studio (v1.1.83) ────────
+        # Both live in ONE side="left" frame so adding the second control costs no
+        # horizontal space - the row is as wide as the wider of the two labels, and
+        # the tall Send button already sets the row height, so nothing grows
+        # vertically either. The user asked for it "above or below" Studio with the
+        # section kept no wider than it was; stacking is what satisfies both.
+        mode_col = tk.Frame(inp, bg=COL["bg_main"])
+
+        # Settings -> "Custom system prompt" has always had an Enable checkbox in the
+        # dialog; this is a SECOND control on the SAME setting, not a new setting.
+        # It gates INJECTION only: unticking keeps the text, so a persona can be
+        # dropped for one session and restored later with no retyping.
+        self.prompt_var = tk.BooleanVar(
+            value=bool(self.settings.get("custom_system_prompt_enabled", True)))
+        self.prompt_check = tk.Checkbutton(
+            mode_col, text="Prompt", variable=self.prompt_var,
+            command=self._on_prompt_toggled,
+            bg=COL["bg_main"], fg=COL["text_dim"], activebackground=COL["bg_main"],
+            activeforeground=COL["accent"], selectcolor=COL["bg_deep"],
+            highlightthickness=0, bd=0, cursor="hand2", font=F(10, "bold"))
+        self.prompt_check.pack(side="top", anchor="w")
+        self._perm_tooltip(self.prompt_check, self._prompt_tip_text)
+
+        self.studio_var = tk.BooleanVar(value=False)
+        self.studio_check = tk.Checkbutton(
+            mode_col, text="Studio", variable=self.studio_var,
+            command=self._on_studio_toggled,
+            bg=COL["bg_main"], fg=COL["text_dim"], activebackground=COL["bg_main"],
+            activeforeground=COL["accent"], selectcolor=COL["bg_deep"],
+            highlightthickness=0, bd=0, cursor="hand2", font=F(10, "bold"))
+        self.studio_check.pack(side="top", anchor="w")
+        self._perm_tooltip(self.studio_check, self._studio_tip_text)
 
         self.send_btn = tk.Button(inp, text="➤ Send", command=self.send_message,
                                   bg=COL["accent"], fg="#FFFFFF", activebackground="#2563EB",
                                   relief="flat", bd=0, padx=18, pady=10, cursor="hand2",
                                   font=F(12, "bold"))
-        self.send_btn.pack(side="left")
+        # ── pack order: right-side cluster FIRST, then the expanding box ──────
+        # Packed outermost-in, so the visual left-to-right order is unchanged from
+        # before the fix: 📎 [text box] 🎤 🔊 temp/thinking Prompt/Studio ➤ Send.
+        # padx is ABSOLUTE (left, right) for every side, so the tuples below are the
+        # ORIGINAL ones verbatim - "mirroring" them for side="right" would shift the
+        # spacing, because pack does not flip padx when the side changes.
+        self.send_btn.pack(side="right")
+        mode_col.pack(side="right", padx=(6, 0))
+        sel_col.pack(side="right", padx=(6, 2))
+        self.tts_btn.pack(side="right", padx=(2, 6))
+        self.mic_btn.pack(side="right", padx=(6, 2))
+
+        # Packed LAST so it is funded LAST: it gets whatever the cluster left over and
+        # shrinks instead of starving it (see the note above the mic button).
+        box.pack(side="left", fill="both", expand=True)
 
     # ── Tool permissions bar (v1.1.41: click-to-cycle chips, flow-wrapped) ────
     # One dropdown per tool made this bar ~125 px wide PER TOOL (the Combobox, not
@@ -6116,6 +7916,231 @@ class DeskpilotApp:
         """The one place a permission state's colour is defined."""
         return {"always": COL["success"], "ask": COL["warning"], "off": COL["danger"]}.get(
             perm, COL["text_dim"])
+
+    # ── Studio mode (v1.1.77) ────────────────────────────────────────────
+
+    def _studio_mode(self) -> str:
+        """Studio mode of the chat the toolbar is describing.
+
+        In the welcome state there is no chat yet, so the pending value is the state
+        and it applies to the conversation the next send creates - same shape as the
+        pending temperature/thinking, for the same reason."""
+        chat = self.current_chat()
+        if chat is None:
+            # chat_studio_mode is the ONE parser for this value: it maps None -> off,
+            # True -> full, 'none' -> pure, 'off'/''/junk -> off. The old inline
+            # `return "full" if p else "off"` treated the STRING 'off' as truthy, so
+            # cycling the welcome-screen checkbox to off read back as 'full'.
+            return chat_studio_mode({"studio": getattr(self, "_pending_studio", None)})
+        return chat_studio_mode(chat)
+
+    def _studio_active(self) -> bool:
+        return self._studio_mode() != "off"
+
+    def _studio_chat_view(self) -> dict:
+        """The chat the TOOLBAR describes: the real one, or a stand-in carrying the
+        pending welcome-state mode when no chat exists yet.
+
+        Chips are painted from the same predicate that builds the request, so they must
+        see the same Studio state. Passing current_chat() raw left every chip green while
+        pending Studio was armed - a green chip the model will not receive is the lie
+        this predicate exists to prevent. Grants cannot exist without a chat, so the
+        stand-in only ever carries the mode."""
+        return self.current_chat() or {"studio": self._studio_mode()}
+
+    def _studio_chip_fg(self, name: str) -> str:
+        """Chip colour from the SAME predicate that builds the request: red = withheld
+        (not in the request, refused at dispatch), normal = live. Never a guess."""
+        if studio_tool_withheld(self._studio_chat_view(), name,
+                                self.settings.get("studio_tools_off", True)):
+            return COL["danger"]
+        return self._perm_color(self._perm_get(name))
+
+    def _studio_tip_text(self) -> str:
+        """Hover text for the Studio checkbox. Built at hover time so the tool state it
+        reports is current - a click must never leave a stale sentence on screen."""
+        mode = self._studio_mode()
+        chat = self.current_chat()
+        grants = sorted(studio_tool_grants(chat))
+        # One short line per mode, always shown, with the live one marked - so the
+        # difference between full and pure is readable on hover without clicking through.
+        def line(m: str) -> str:
+            desc = {"off":  "off   - normal operator mode: full system prompt, all tools",
+                    "full": "full  - generative brief in place of the system prompt",
+                    "pure": "pure  - NO system prompt at all: the raw chat"}[m]
+            return ("> " if m == mode else "  ") + desc
+        lines = [f"STUDIO MODE - {mode} (click to cycle off -> full -> pure -> off)", "",
+                 line("off"), line("full"), line("pure"), ""]
+        if mode == "full":
+            lines += ["Your prompt, skills, ledger and tool guidance are withheld; top_k",
+                      "and temperature loosen. Project memory IS still sent, so the",
+                      "model keeps knowing which project it is in and what was settled.", ""]
+        elif mode == "pure":
+            lines += ["The model sees this conversation and nothing else - no brief, no",
+                      "persona, no constraints. Closest to the inference engine's own chat.", ""]
+        if mode != "off":
+            if self.settings.get("studio_tools_off", True):
+                lines += ["Tools: same in full and pure - all withheld by default (chips red).",
+                          "Click a red chip to enable THAT tool for this chat; click again to revoke.",
+                          (f"  Enabled now: {', '.join(grants)}" if grants
+                           else "  Enabled now: none"), ""]
+            else:
+                lines += ["Tools: available (Settings -> Sampling keeps tools on in Studio).", ""]
+        lines += [
+            "Per-chat, saved with the chat. Switching off restores your prompt, skills,",
+            "memory and ledger exactly as they were - nothing is deleted.",
+        ]
+        return "\n".join(lines)
+
+    def _apply_studio_mode(self, mode: str) -> None:
+        """Store a mode on the active chat (or as pending in the welcome state) and
+        repaint everything that depends on it."""
+        chat = self.current_chat()
+        if chat is not None:
+            chat["studio"] = mode
+            save_chats(self.chats)
+        else:
+            self._pending_studio = mode
+        self._sync_studio_check_from_mode(mode)
+        self._refresh_perm_colors()
+        self._update_temp_topbar()
+        n = len(studio_tool_grants(chat))
+        msg = {"off": "🎨 Studio off - operator mode restored",
+               "full": "🎨 Studio FULL - generative brief, operator framing removed",
+               "pure": "🎨 Studio PURE - no system prompt sent at all (raw chat)"}[mode]
+        if mode != "off" and self.settings.get("studio_tools_off", True):
+            msg += f" - tools withheld ({n} enabled)"
+        self._set_status(msg)
+
+    def _on_studio_toggled(self) -> None:
+        """Click: cycle off -> full -> pure -> off.
+
+        Tk flips the BooleanVar before calling us, so the variable is NOT the source of
+        truth here - the stored mode is. Reading the var would desync it on the
+        full -> pure step, where the box stays checked but the mode changes.
+        """
+        self._apply_studio_mode(studio_next_mode(self._studio_mode()))
+
+    def _prompt_tip_text(self) -> str:
+        """Hover text for the Prompt checkbox, built at hover time so the state it
+        reports is current (a stale sentence on a toggle is worse than none)."""
+        on = bool(self.prompt_var.get())
+        txt = str(self.settings.get("custom_system_prompt") or "").strip()
+        lines = [
+            "SYSTEM PROMPT - " + ("ON" if on else "OFF") + " (click to toggle)",
+            "",
+            "Sends your Settings \u2192 Custom system prompt (persona/style rules) with",
+            "every request. Unticked: the text is KEPT in Settings, just not sent.",
+            "",
+        ]
+        if not txt:
+            lines += ["(no custom prompt is set - Settings \u2192 Custom system prompt)"]
+        elif len(txt) <= 220:
+            lines += ["Current text:", "  " + txt]
+        else:
+            lines += ["Current text:", "  " + txt[:220] + " \u2026"]
+        if self._studio_mode() != "off":
+            lines += ["", "Studio is on, so the prompt is already suppressed by the mode;",
+                      "this control is inert until Studio is switched off."]
+        return "\n".join(lines)
+
+    def _on_prompt_toggled(self) -> None:
+        """Click: flip the global custom-prompt gate and persist it.
+
+        Deliberately GLOBAL, not per-chat: it mirrors the Settings checkbox, and two
+        controls on one setting must not disagree about scope. Studio still wins -
+        the mode suppresses the prompt upstream - so this is refreshed rather than
+        trusted to hold."""
+        if self._closed:
+            return
+        want = bool(self.prompt_var.get())
+        self.settings["custom_system_prompt_enabled"] = want
+        try:
+            save_settings(self.settings)
+        except Exception as e:
+            self._set_status(f"Could not save prompt setting: {e}")
+        self._set_status("Custom system prompt " + ("ON" if want else "OFF")
+                         + (" - text kept in Settings, just not sent" if not want else ""))
+        self._sync_prompt_check()
+
+    def _sync_prompt_check(self) -> None:
+        """Point the Prompt checkbox at the setting, and make its inert-in-Studio
+        state honest instead of letting a tick imply an effect that cannot happen."""
+        if self._closed:
+            return
+        try:
+            self.prompt_var.set(bool(self.settings.get("custom_system_prompt_enabled", True)))
+            studio_on = self._studio_mode() != "off"
+            self.prompt_check.configure(
+                state=("disabled" if studio_on else "normal"),
+                disabledforeground=COL["text_dim"],
+                fg=(COL["accent"] if (self.prompt_var.get() and not studio_on)
+                    else COL["text_dim"]))
+        except tk.TclError:
+            pass
+
+    def _sync_studio_check_from_mode(self, mode: str) -> None:
+        """Point the checkbox at a mode: label and colour carry which intensity is on."""
+        self.studio_var.set(mode != "off")
+        try:
+            self.studio_check.configure(
+                text=STUDIO_MODE_LABELS.get(mode, "Studio"),
+                fg=(COL["text_dim"] if mode == "off"
+                    else COL["accent"] if mode == "full" else COL["success"]))
+        except tk.TclError:
+            pass
+        # Studio on/off changes whether the Prompt toggle can do anything at all,
+        # so the two controls in mode_col are always refreshed together.
+        self._sync_prompt_check()
+
+    def _sync_studio_check(self, chat: Optional[dict]) -> None:
+        """Point the checkbox at a chat's saved Studio mode (absent/legacy -> off)."""
+        self._sync_studio_check_from_mode(chat_studio_mode(chat))
+
+    def _toggle_studio_grant(self, name: str) -> bool:
+        """Flip this chat's per-tool Studio grant. Returns True when the tool is now live.
+
+        Grants are per-chat on purpose: this Studio session may need web search, the
+        next needs nothing. A tool whose global permission is Off cannot be granted -
+        Off is a hard veto - and says so rather than silently doing nothing."""
+        chat = self.current_chat()
+        if chat is None:
+            self._set_status("🎨 Studio: tools can be granted once a chat exists "
+                             "(send a message first)")
+            return False
+        if self._perm_get(name) == "off":
+            self._set_status(f"🔐 {name}: permission is Off - set it to Ask/Allow in the "
+                             f"bar first, then Studio can grant it")
+            return False
+        grants = studio_tool_grants(chat)
+        if name in grants:
+            grants.discard(name)
+        else:
+            grants.add(name)
+        chat["studio_tools"] = sorted(grants)
+        save_chats(self.chats)
+        live = name in grants
+        self._set_status(f"🎨 Studio: {name} "
+                         + ("granted for this chat" if live else "withheld again"))
+        return live
+
+    def _refresh_perm_colors(self) -> None:
+        """Re-paint every tool chip for the current chat's Studio state.
+
+        Studio-withholding-tools must be VISIBLE: a green chip that is not in the
+        request is a lie about what the model can do. Red is the existing 'off'
+        colour, so the bar reads the way it always has - red means not available.
+        Per-tool, so a granted tool shows live while its neighbours stay red. The
+        stored permission is untouched; leaving Studio restores every colour."""
+        for _name, _cell_lab in list(self._perm_combos.items()):
+            try:
+                lab = _cell_lab[1]
+                if not lab.winfo_exists():
+                    continue
+                lab.configure(fg=self._studio_chip_fg(_name))
+            except (tk.TclError, IndexError, TypeError):
+                continue
+
 
     def _perm_get(self, name: str) -> str:
         return (self.settings.get("tool_permissions") or {}).get(name, "ask")
@@ -6242,28 +8267,52 @@ class DeskpilotApp:
         """
         cell = tk.Frame(self._perm_inner, bg=COL["bg_deep"])
         lab = tk.Label(cell, text=text, bg=COL["bg_deep"], font=F(10),
-                       fg=self._perm_color(self._perm_get(name)), cursor="hand2")
+                       fg=self._studio_chip_fg(name), cursor="hand2")
         lab.pack(anchor="w")
 
         def tip_text() -> str:
             # Built at hover time, so the description and the permission state are
             # both current (a click must never leave a stale state on screen).
             desc = self._tool_tip_text(name)
+            if studio_tool_withheld(self._studio_chat_view(), name,
+                                    self.settings.get("studio_tools_off", True)):
+                state = "WITHHELD by Studio mode (red) - click to grant it for this chat"
+            elif self._studio_active() and name in studio_tool_grants(self.current_chat()):
+                state = ("granted in Studio for this chat - click to revoke, "
+                         "or cycle its normal permission")
+            else:
+                state = PERM_LABELS.get(self._perm_get(name), "?")
             return ((desc + "\n\n") if desc else "") + (
-                f"{text} · {PERM_LABELS.get(self._perm_get(name), '?')}\n"
-                "click to cycle Allow → Ask → Off")
+                f"{text} · {state}\n"
+                "click to cycle Allow → Ask → Off"
+                + ("\nclick while red to grant it in Studio" if self._studio_active() else ""))
 
         hide_tip = self._perm_tooltip(cell, tip_text)
 
         def cycle(_e=None, name=name, lab=lab) -> None:
             hide_tip()          # a stale tooltip must never outlive the click
+            # In Studio, a red chip is a withheld tool and clicking it is the user's
+            # request to re-admit THAT tool - not a global permission change. Granted
+            # chips and non-Studio chips keep the normal Allow -> Ask -> Off cycle.
+            _off_setting = self.settings.get("studio_tools_off", True)
+            if studio_tool_withheld(self._studio_chat_view(), name, _off_setting):
+                self._toggle_studio_grant(name)
+                lab.configure(fg=self._studio_chip_fg(name))
+                return
+            if (self._studio_active() and _off_setting
+                    and name in studio_tool_grants(self.current_chat())):
+                self._toggle_studio_grant(name)     # revoke the grant
+                lab.configure(fg=self._studio_chip_fg(name))
+                return
             cur = self._perm_get(name)
             try:
                 nxt = PERM_CYCLE[(PERM_CYCLE.index(cur) + 1) % len(PERM_CYCLE)]
             except ValueError:
                 nxt = PERM_CYCLE[0]
             self.settings.setdefault("tool_permissions", {})[name] = nxt
-            lab.configure(fg=self._perm_color(nxt))
+            # Repaint from the effective state, so the colour never claims a tool is
+            # live while Studio is withholding it (and never shows red for a granted one).
+            lab.configure(fg=self._studio_chip_fg(name))
             save_settings(self.settings)
             self._set_status(f"🔐 {text}: {PERM_HINT.get(nxt, nxt)}")
 
@@ -6486,8 +8535,17 @@ class DeskpilotApp:
                 t = chat_temperature({"temperature": self._pending_temperature})
             else:
                 t = chat_temperature(chat)
-            # t is now always a float; show exactly what will be sent, never "Default"
-            self.temp_top_label.configure(text=f"\U0001F321 {t}")
+            # Studio mode forces its own temperature through sampling_kwargs, and it
+            # is merged into kwargs AFTER the per-chat value - so the override is
+            # what gets sent, and the topbar must show that, not the combo's value.
+            _ov = studio_sampling_overrides(
+                chat if chat is not None else {"studio": self._studio_mode()},
+                self.settings.get("studio_sampling", True))
+            if _ov.get("temperature"):
+                t = float(_ov["temperature"])
+            # t is now always a concrete number; show exactly what will be sent
+            self.temp_top_label.configure(text=f"\U0001F321 {t}"
+                                          + (" 🎨" if _ov.get("temperature") else ""))
         except tk.TclError:
             pass
 
@@ -6689,10 +8747,19 @@ class DeskpilotApp:
             keep_recent = int(float(self.settings.get("compaction_keep_recent", COMPACTION_KEEP_RECENT_DEFAULT)))
         except (TypeError, ValueError):
             keep_recent = COMPACTION_KEEP_RECENT_DEFAULT
-        # Clamp here too, not just on Settings-save (line ~8070): a hand-edited or
-        # corrupted settings file with keep_recent <= 0 would make _compaction_split_index
-        # index messages[n] (out of range -> IndexError). Same 2..50 bounds as the save path.
-        keep_recent = max(2, min(50, keep_recent))
+        # Clamp here too, not just on Settings-save: a hand-edited or corrupted settings
+        # file with keep_recent <= 0 would make _compaction_split_index index messages[n]
+        # (out of range -> IndexError). Bounds come from the constants, so the save path and
+        # this one cannot drift apart (v1.1.75: the ceiling used to be a literal 50 here,
+        # which silently overrode COMPACTION_KEEP_RECENT_MAX and capped the setting at 50).
+        keep_recent = max(2, min(COMPACTION_KEEP_RECENT_MAX, keep_recent))
+        # The setting is a ceiling on how much to preserve, never a floor on how much to
+        # keep: on a short history, keeping `keep_recent` verbatim would leave nothing to
+        # fold and compaction would decline forever (split < COMPACTION_MIN_OLD). Cap it at
+        # a fraction of the actual message count so a small chat can still compact.
+        _frac_cap = int(len(messages) * COMPACTION_KEEP_MAX_FRACTION)
+        if _frac_cap >= 2 and keep_recent > _frac_cap:
+            keep_recent = _frac_cap
         split = _compaction_split_index(messages, keep_recent)
         if split < COMPACTION_MIN_OLD:
             return False                       # not enough old messages to be worth compacting
@@ -6741,7 +8808,11 @@ class DeskpilotApp:
                             "under the \U0001F4E6 'Context compacted' drawers in this chat]")
             summary_text = ((summary_text + "\n\n" + "\n\n".join(reversed(kept)))
                             if summary_text else "\n\n".join(reversed(kept)))
-        compaction_number = archive_len + 1
+        # max() against the worker-side counter is the whole point: archive_len is
+        # stale whenever a previous persist is still queued, and the counter alone would
+        # restart at 1 after an app restart on a chat that already has archives.
+        compaction_number = max(self._compaction_seq.get(chat_id, 0), archive_len) + 1
+        self._compaction_seq[chat_id] = compaction_number
         marker = f"{COMPACTION_MARKER} \u2014 summary of {len(old_msgs)} earlier messages]"
         # v1.1.54: point at the archive. Without this the model has no signal that the
         # originals still exist and are readable, so it treats the summary as the whole
@@ -7107,17 +9178,25 @@ class DeskpilotApp:
                     else (SUMMARY_RETRY_TOKENS if empty_attempts == 1 else None))
             kwargs: Dict[str, Any] = dict(
                 model=model,
-                messages=[
+                messages=_stamp_last_user([
                     build_system_message(str(self.settings.get("file_workspace") or ""),
                                          str(self.settings.get("exa_api_key") or ""),
                                          str(self.settings.get("firecrawl_api_key") or ""),
                                          effective_custom_prompt(self.settings),
                                          _skills_index_text(self.settings),
                                          self._ledger_inject(chat_id),
-                                         _project_memory_text(self.settings)),
+                                         _project_memory_text(self.settings),
+                                         chat_project(chat),
+                                         # v1.1.86: the summary is what the NEXT session
+                                         # inherits, so it must be written with the
+                                         # project's settled rules in view - otherwise
+                                         # the handoff quietly drops them on the floor.
+                                         False,
+                                         _project_memory_project_text(self.settings,
+                                                                      chat_project(chat))),
                     *history,
                     {"role": "user", "content": _handoff_prompt(title)},
-                ],
+                ], build_time_note()),
                 stream=False,
                 temperature=0,      # factual summary - no sampling noise
             )
@@ -7346,13 +9425,34 @@ class DeskpilotApp:
         # default thinking level mid-task. new_chat() already consumed any welcome-state
         # _pending_* values and synced the combos from the blank chat, so re-sync after
         # the copy (the half-built test app has no combos - guard on the widget).
-        for _k in ("temperature", "thinking"):
-            if src.get(_k) not in (None, ""):
+        # v1.1.88: a handoff CONTINUES the work, so it must carry the whole per-chat
+        # working state, not just the sampling knobs. "project" was the damaging
+        # omission: the continued chat lost its project declaration, so from the very
+        # next request the active project's MEMORY.md stopped being injected - and with
+        # auto_send=True that next request fires immediately, silently, mid-task.
+        # "studio"/"studio_tools" likewise dropped the user out of Studio mode and lost
+        # the per-tool grants. new_chat() does NOT rescue this: _pending_project is only
+        # set when NO chat is active (see _set_active_project), and during a handoff one
+        # is.
+        for _k in ("temperature", "thinking", "project", "studio", "studio_tools"):
+            if src.get(_k) not in (None, "", []):
                 fresh[_k] = src[_k]
         if getattr(self, "temp_combo", None) is not None:
             self._sync_temp_combo(fresh)
             self._sync_thinking_combo(fresh)
             self._update_temp_topbar()
+        # Repaint the controls that READ the keys just copied. Without these the chat
+        # dict is right while the UI still shows Studio off and every tool chip in its
+        # old colour - a lie about what the model can do. The project bar also needs the
+        # chat marked ACTIVE, because _update_project_topbar gates on
+        # _project_active_chats: a saved field alone deliberately does not light the bar.
+        if getattr(self, "studio_check", None) is not None:
+            self._sync_studio_check(fresh)
+            self._refresh_perm_colors()
+        if fresh.get("project"):
+            if self.current_chat_id:
+                self._project_active_chats.add(self.current_chat_id)
+            self._update_project_topbar()
         if summary:
             intro = (SESSION_HANDOFF_MARKER + " The previous session reached its context limit. "
                      "Here is a summary of the work so far - continue from here:\n\n" + summary)
@@ -7473,7 +9573,7 @@ class DeskpilotApp:
             "title":   "New Chat",
             "created": datetime.now().isoformat(timespec="seconds"),
             "temperature": "",     # per-chat; blank/legacy -> TEMP_DEFAULT (always a real number, always sent)
-            "thinking":    "High",  # per-chat level; Off/Low/Medium/High -> enable_thinking / reasoning_effort
+            "thinking":    THINK_DEFAULT,  # per-chat level; Default/Off/Low/Medium/High -> enable_thinking / reasoning_effort
             "messages": [],
         }
         # Consume any welcome-state pending values: they describe the
@@ -7484,6 +9584,21 @@ class DeskpilotApp:
         if self._pending_thinking is not None:
             self.chats["chats"][cid]["thinking"] = self._pending_thinking
             self._pending_thinking = None
+        if self._pending_studio is not None:
+            # Store the MODE, not bool(mode): bool('pure') and bool('off') are both
+            # True, and True reads back as 'full' - so a welcome-screen 'pure' (or an
+            # 'off') silently became 'full' on the first send. chat_studio_mode still
+            # tolerates the legacy True values saved by the first cut of this feature.
+            self.chats["chats"][cid]["studio"] = self._pending_studio
+            self._pending_studio = None
+        if self._pending_project:
+            # A project declared before the chat existed belongs to the chat being
+            # born, exactly like the pending values above. It was declared in this
+            # session, so the chat is active and the bar keeps showing it after the
+            # welcome screen hands off.
+            self.chats["chats"][cid]["project"] = self._pending_project
+            self._pending_project = None
+            self._project_active_chats.add(cid)
         self.chats["order"].append(cid)
         save_chats(self.chats)
         self._refresh_chat_list()
@@ -7528,9 +9643,13 @@ class DeskpilotApp:
             self._pending_thinking = str(self.think_combo.get())
 
     def _sync_thinking_combo(self, chat: Optional[dict]) -> None:
-        """Point the combobox at a chat's saved thinking level (blank/legacy -> High)."""
+        """Point the combobox at a chat's saved thinking level.
+
+        Blank/legacy shows "Default", which is what the request path actually does with
+        it (sends nothing) - it used to show "High" while sending nothing, so the UI
+        claimed maximum thinking on every pre-existing chat."""
         val = str((chat or {}).get("thinking", "") or "").strip()
-        self.think_combo.set(val if val in THINK_VALUES else "High")
+        self.think_combo.set(val if val in THINK_VALUES else THINK_DEFAULT)
 
     def rename_chat(self) -> None:
         cid = self.selected_chat_id()
@@ -7624,6 +9743,9 @@ class DeskpilotApp:
             # would let the dying worker stream into whatever chat loads next;
             # leaving it set makes every render guard return False instead.
             was_current = (cid == self.current_chat_id)
+            # Its id can no longer be worked on; drop it so the session set does not
+            # accumulate ids of dead chats.
+            self._project_active_chats.discard(cid)
             self._refresh_chat_list()
             if was_current:
                 self.load_chat(self.chats["order"][0], force=True)
@@ -7736,6 +9858,11 @@ class DeskpilotApp:
                 self.chat_text.tag_delete(*leaked)
         except tk.TclError:
             pass
+        # Destroy the embedded buttons, do not merely drop the refs.
+        # delete("1.0","end") above tore the Tk windows down but left them in
+        # chat_text.children - see _destroy_code_buttons(). Chat switching hits
+        # this path far more often than the Stop rollback below.
+        self._destroy_code_buttons(self._code_buttons)
         self._code_buttons.clear()
         self._image_thumbs.clear()
         self._links.clear()
@@ -7759,10 +9886,17 @@ class DeskpilotApp:
             self._jump_to_message(cid, int(jump_to))
         self._sync_temp_combo(chat)
         self._sync_thinking_combo(chat)
+        self._sync_studio_check(chat)
+        self._refresh_perm_colors()
         self._update_temp_topbar()
+        self._update_project_topbar()
         # A real conversation is now active: welcome-state pending values are stale.
+        # Leaving _pending_studio set would let an old welcome-screen click overwrite
+        # THIS chat's stored mode the next time a chat is created.
         self._pending_temperature = None
         self._pending_thinking = None
+        self._pending_studio = None
+        self._pending_project = None
         # Restore a previously generated handoff accordion (survives chat switches;
         # _show_handoff re-persists harmlessly and refreshes the in-memory cache).
         if chat.get("handoff_summary"):
@@ -8100,6 +10234,7 @@ class DeskpilotApp:
     def _run_body_search(self, q: str) -> None:
         """The debounced half of _on_chat_search: index lookup + result rows."""
         self._search_debounce = None
+        self._note_main_activity("sidebar search (may rebuild FTS index)")
         try:
             # The query may have changed (or been cleared) during the debounce wait.
             if q != self._chat_search_query().lower():
@@ -8344,8 +10479,8 @@ class DeskpilotApp:
 
         handler = lambda e, s=sid: self._toggle_accordion(s)
         self.chat_text.tag_bind(hdr_tag, "<Button-1>", handler)
-        self._accordions[sid] = {"body_tag": body_tag, "a0": a0, "a1": a1,
-                                 "expanded": expanded}
+        self._accordions[sid] = {"body_tag": body_tag, "hdr_tag": hdr_tag,
+                                 "a0": a0, "a1": a1, "expanded": expanded}
         return sid
 
     def _toggle_accordion(self, sid: str) -> None:
@@ -8706,8 +10841,13 @@ class DeskpilotApp:
         except tk.TclError:
             pass
 
-    def _build_ctx_menu(self, w):
-        """Cut/Copy/Paste/Select All popup for a Text widget (right-click)."""
+    def _build_ctx_menu(self, w, event=None):
+        """Cut/Copy/Paste/Select All popup for a Text widget (right-click).
+
+        `event` is optional and only used to offer spell-check items, which are
+        scoped to the input box alone - the chat pane renders model output
+        (markdown, code, tool JSON) and underlining that would be pure noise.
+        """
         try:
             has_sel = bool(w.tag_ranges(tk.SEL))
         except tk.TclError:
@@ -8725,6 +10865,8 @@ class DeskpilotApp:
             self.copy_to_clipboard(txt)
             r = w.tag_ranges(tk.SEL)
             w.delete(r[0], r[1])
+            if w is self.input_text:
+                self._spell_schedule(delay=0)   # a cut is not a KeyRelease (mirrors _paste)
 
         def _copy():
             txt = _sel_text()
@@ -8744,17 +10886,22 @@ class DeskpilotApp:
             w.insert("insert", clip)
             if w is self.input_text:
                 self._see_input("insert")
+                self._spell_schedule()      # pasted text is not a KeyRelease
 
         menu.add_command(label="Cut", state=("normal" if has_sel else "disabled"), command=_cut)
         menu.add_command(label="Copy", state=("normal" if has_sel else "disabled"), command=_copy)
         menu.add_command(label="Paste", command=_paste)
         menu.add_separator()
         menu.add_command(label="Select All", command=lambda: w.tag_add("sel", "1.0", "end"))
+        # ── spell check: input box only, and only when the feature is on ──
+        if (w is self.input_text and event is not None
+                and self.settings.get("spellcheck_enabled") and SpellChecker is not None):
+            self._spell_menu_items(menu, w, event)
         return menu
 
     def _show_context_menu(self, event):
         """Right-click popup for the chat text / input box."""
-        menu = self._build_ctx_menu(event.widget)
+        menu = self._build_ctx_menu(event.widget, event)
         if menu is None:
             return
         try:
@@ -8773,6 +10920,214 @@ class DeskpilotApp:
             self.input_text.see(where)
         except (tk.TclError, AttributeError):
             pass
+
+    # ── spell check (v1.1.78) - INPUT BOX ONLY ──────────────────────────
+    #
+    # Scope is deliberate: only self.input_text is ever scanned or tagged.
+    # The chat pane holds model output (markdown, code, tool JSON) and every
+    # other Text in the app is a settings field. Measured cost of a full rescan
+    # of a ~1900-char box is 0.25 ms, so responsiveness is not the constraint -
+    # false positives are, which is why _spell_worth_checking + the saved word
+    # list carry the design and the feature ships OFF by default.
+
+    def _spell_apply_state(self) -> None:
+        """React to the Settings toggle: start checking, or wipe the underlines."""
+        if self.settings.get("spellcheck_enabled") and SpellChecker is not None:
+            self._spell_schedule()
+        else:
+            self._spell_clear()
+
+    def _spell_clear(self) -> None:
+        """Remove every spell underline from the input box (main thread)."""
+        if self._spell_after is not None:
+            try:
+                self.root.after_cancel(self._spell_after)
+            except (tk.TclError, ValueError):
+                pass
+            self._spell_after = None
+        self._spell_hits = []
+        try:
+            self.input_text.tag_remove("spell_bad", "1.0", "end")
+        except (tk.TclError, AttributeError):
+            pass
+
+    def _spell_schedule(self, delay: int = 160) -> None:
+        """Debounce a rescan. Called from KeyRelease, paste, and the toggle."""
+        if not self.settings.get("spellcheck_enabled") or SpellChecker is None:
+            return
+        self._spell_ensure_engine()
+        if self._spell_after is not None:
+            try:
+                self.root.after_cancel(self._spell_after)
+            except (tk.TclError, ValueError):
+                return
+        try:
+            self._spell_after = self.root.after(delay, self._spell_rescan)
+        except tk.TclError:
+            self._spell_after = None
+
+    def _spell_ensure_engine(self) -> None:
+        """Build the dictionary once, off the UI thread, then tag via _post.
+
+        ~23 MB and a few hundred ms - doing this on the main thread would freeze
+        the window on the first keystroke after enabling, so it never runs there.
+        """
+        if self._spell_engine is not None or self._spell_building or self._spell_failed:
+            return
+        self._spell_building = True
+
+        def _build() -> None:
+            engine = None
+            try:
+                # distance=1: measured on this machine, distance=2 costs ~2x and
+                # starts "correcting" real short words into wrong ones.
+                engine = SpellChecker(distance=1)
+            except Exception as exc:
+                # The import succeeding does NOT mean the dictionary is readable:
+                # in a frozen build the wordlist is a separate --add-data payload,
+                # so the module can be present while the data is not.
+                self._spell_error = f"{type(exc).__name__}: {exc}"
+                self._spell_failed = True     # PERMANENT - see _spell_rescan
+            self._spell_building = False
+            if engine is None:
+                return
+            self._spell_error = ""
+            self._spell_engine = engine
+            self._post(self._spell_rescan)
+
+        try:
+            threading.Thread(target=_build, daemon=True).start()
+        except Exception:
+            self._spell_building = False
+
+    def _spell_rescan(self) -> None:
+        """Re-scan the input box and re-apply the underline tag (main thread)."""
+        self._spell_after = None
+        if self._closed:
+            return
+        if not self.settings.get("spellcheck_enabled") or SpellChecker is None:
+            self._spell_clear()
+            return
+        eng = self._spell_engine
+        if eng is None:
+            # WAITING for the worker, or it failed for good. Retrying on failure
+            # is what hung the app: a frozen build without the dictionary makes
+            # every attempt fail, so an unbounded retry spawned a fresh thread
+            # and a fresh ~23 MB dictionary every 400 ms, forever. One bounded
+            # wait, then give up permanently for the session.
+            if self._spell_failed or self._spell_retries >= 20:
+                self._spell_clear()
+                return
+            self._spell_retries += 1
+            self._spell_ensure_engine()
+            if not self._closed:
+                self._spell_schedule(delay=400)
+            return
+        self._spell_retries = 0
+        try:
+            text = self.input_text.get("1.0", "end-1c")
+        except tk.TclError:
+            return
+        hits = spell_scan(text, eng, self.settings.get("spellcheck_words") or [])
+        self._spell_hits = hits
+        try:
+            self.input_text.tag_remove("spell_bad", "1.0", "end")
+            for s, e, _w in hits:
+                self.input_text.tag_add(
+                    "spell_bad", self._spell_index(text, s), self._spell_index(text, e))
+        except tk.TclError:
+            pass
+
+    @staticmethod
+    def _spell_index(text: str, offset: int) -> str:
+        """Character offset in `text` -> Tk "line.col" index.
+
+        Tk counts lines from 1 and columns from 0; the scanner works in flat
+        offsets over the same string, so this is the one conversion point.
+        """
+        line = text.count("\n", 0, offset) + 1
+        nl = text.rfind("\n", 0, offset)
+        col = offset if nl < 0 else offset - nl - 1
+        return f"{line}.{col}"
+
+    def _spell_word_at(self, event) -> Optional[tuple]:
+        """The flagged hit under a right-click, or None."""
+        try:
+            idx = str(self.input_text.index(f"@{event.x},{event.y}"))
+            line, _, col = idx.partition(".")
+            base = self.input_text.get("1.0", f"{line}.0")
+            off = len(base) + int(col)
+            text = self.input_text.get("1.0", "end-1c")
+        except (tk.TclError, ValueError):
+            return None
+        for s, e, w in self._spell_hits:
+            if s <= off < e:
+                # Confirm the hit still describes the current text. _spell_hits
+                # is only refreshed on a debounced rescan, so right-clicking
+                # straight after Send (which empties the box) would otherwise
+                # match offset 0 against a stale word and offer to "fix" it.
+                if text[s:e] == w:
+                    return (s, e, w)
+                return None
+        return None
+
+    def _spell_menu_items(self, menu: tk.Menu, w: tk.Text, event) -> None:
+        """Append suggestions / add-to-dictionary for the word under the cursor."""
+        if self._spell_engine is None:
+            # Enabled but not working - say WHY. Without this the menu reads
+            # "no misspellings found" and the real cause (dictionary missing
+            # from the bundle) is invisible.
+            menu.add_command(label="Spell check is ON but not working", state="disabled")
+            if self._spell_error:
+                menu.add_command(label=f"    {self._spell_error[:70]}", state="disabled")
+            menu.add_command(label="    Dictionary not found in this build", state="disabled")
+            return
+        hit = self._spell_word_at(event)
+        menu.add_separator()
+        if hit is None:
+            n = len(self._spell_hits)
+            menu.add_command(
+                label=(f"No misspelling under the cursor ({n} flagged)" if n
+                       else "No misspellings found"), state="disabled")
+            return
+        _s, _e, word = hit
+        menu.add_command(label=f"\u2717 {word}", state="disabled")
+        cands = spell_suggestions(word, self._spell_engine)
+        if cands:
+            for c in cands:
+                menu.add_command(label=f"    {c}",
+                                 command=lambda c=c, hit=hit: self._spell_replace(hit, c))
+        else:
+            menu.add_command(label="    (no suggestions)", state="disabled")
+        menu.add_command(label=f"    Add \u201c{word}\u201d to dictionary",
+                         command=lambda wd=word: self._spell_add_word(wd))
+
+    def _spell_replace(self, hit: tuple, new: str) -> None:
+        """Swap one flagged word for a suggestion, then rescan."""
+        s, e, _w = hit
+        try:
+            text = self.input_text.get("1.0", "end-1c")
+            self.input_text.edit_separator()      # one undo step for the swap
+            self.input_text.delete(self._spell_index(text, s), self._spell_index(text, e))
+            self.input_text.insert(self._spell_index(text, s), new)
+        except tk.TclError:
+            return
+        self._spell_schedule(delay=0)
+
+    def _spell_add_word(self, word: str) -> None:
+        """Persist a word to the user's dictionary and un-flag it immediately.
+
+        This is the item that makes the feature tolerable: the frequency list
+        does not know `phonemizer`, `mmproj` or `espeakng`, and one click here
+        fixes each of them for good.
+        """
+        words = [str(x) for x in (self.settings.get("spellcheck_words") or [])]
+        low = {x.lower() for x in words}
+        if word.lower() not in low:
+            words.append(word)
+            self.settings["spellcheck_words"] = sorted(words, key=str.lower)
+            save_settings(self.settings)
+        self._spell_schedule(delay=0)
 
     def _at_bottom(self) -> bool:
         """True when the chat view sits at (or within a hair of) the bottom."""
@@ -8815,21 +11170,101 @@ class DeskpilotApp:
         """Drain queued UI callbacks on the main thread; reschedules itself."""
         if self._closed:
             return
+        # v1.1.90: this is the app's heartbeat. It runs every 50 ms for as long as the
+        # main thread pumps events, so "beat is stale" IS "not responding" - which is
+        # what the hang watchdog measures. Stamped on ENTRY only: stamping again after
+        # the drain would hide a callback that then blocks for minutes, and that is
+        # exactly the case we want to catch.
+        self._main_beat = time.monotonic()
         while True:
             try:
                 fn = self._ui_queue.get_nowait()
             except queue.Empty:
                 break
             try:
+                self._main_activity = getattr(fn, "__qualname__", None) \
+                    or getattr(fn, "__name__", None) or type(fn).__name__
                 fn()
             except Exception:
                 import traceback
                 traceback.print_exc()
+        try:
+            self._ui_queue_depth = self._ui_queue.qsize()
+        except Exception:
+            pass
         if not self._closed:
             try:
                 self.root.after(50, self._poll_ui_queue)
             except tk.TclError:
                 pass
+
+    def _note_main_activity(self, what: str) -> None:
+        """Record what the main thread was deliberately doing (watchdog context).
+
+        Cheap and Tk-free by design: the watchdog reads this from another thread, so it
+        must be a plain attribute write. Set at the few main-thread entry points known
+        to be expensive, so a hang report says 'index rebuild' or 'save' rather than
+        leaving the stack to be guessed at.
+        """
+        try:
+            self._main_activity = what
+        except Exception:
+            pass
+
+    def _start_hang_watchdog(self) -> None:
+        """Start the daemon thread that dumps stacks when the main thread stalls.
+
+        Reads only plain attributes - never Tk, never a lock held by the main thread -
+        so it can still run while the UI is frozen.
+        """
+        if getattr(self, "_hang_watch_started", False):
+            return
+        self._hang_watch_started = True
+        self._main_beat = time.monotonic()
+        self._main_activity = "startup"
+        self._ui_queue_depth = 0
+        t = threading.Thread(target=self._hang_watch_loop, name="hang-watchdog",
+                             daemon=True)
+        try:
+            t.start()
+        except Exception:
+            pass      # diagnostics are optional; the app must start regardless
+
+    def _hang_watch_tick(self) -> bool:
+        """One look at the heartbeat. Returns True if a report was written.
+
+        Split out from the loop so it can be driven directly by a test.
+        """
+        if self._closed:
+            return False
+        beat = getattr(self, "_main_beat", None)
+        if beat is None:
+            return False
+        stalled = time.monotonic() - beat
+        if stalled < HANG_STALL_S:
+            self._hang_last_dump_at = None
+            return False
+        # Re-dump while still stalled (HANG_REREPORT_S apart): two dumps with the SAME
+        # main-thread frame mean it is genuinely stuck; different frames mean it is
+        # crawling through something rather than deadlocked.
+        last = getattr(self, "_hang_last_dump_at", None)
+        if last is not None and (time.monotonic() - last) < HANG_REREPORT_S:
+            return False
+        fp = _hang_dump(self, stalled)
+        if fp is not None:
+            self._hang_last_dump_at = time.monotonic()
+            return True
+        return False
+
+    def _hang_watch_loop(self) -> None:
+        while True:
+            try:
+                if self._closed:
+                    return
+                self._hang_watch_tick()
+            except Exception:
+                pass      # a dead watchdog must never take the app with it
+            time.sleep(HANG_WATCH_INTERVAL_S)
 
     def _set_status(self, text: str) -> None:
         if not self._closed:
@@ -8872,12 +11307,155 @@ class DeskpilotApp:
                     pass
         self._reasoning_sids.clear()
 
+    # ── per-step render mark (cheap discard for an automatic retry) ─────────
+
+    def _ui_mark_step_render(self) -> None:
+        """MAIN THREAD. Remember exactly where this step's rendering begins.
+
+        Called at the top of every model step, so a retry can remove just what the
+        failed attempt drew instead of rebuilding the whole transcript. The mark is
+        (index, registry sizes): every registry is append-only while a view is shown,
+        so the entries that existed at the mark are simply the first N, and restoring
+        means deleting the tail. O(1) to take and O(entries added) to unwind.
+
+        The index is captured as a LINE.COLUMN string, not a live Text mark: a mark
+        would survive load_chat's delete("1.0","end") and could then point past the
+        end of a shorter re-rendered chat."""
+        if self._closed:
+            return
+        try:
+            self._step_render_mark = (
+                self.chat_text.index("end-1c"),
+                len(self._code_buttons),
+                len(self._image_thumbs),
+                len(self._links),
+                len(self._accordions),
+            )
+        except tk.TclError:
+            self._step_render_mark = None
+
+    def _ui_mark_tool_phase(self) -> None:
+        """MAIN THREAD. Mark the boundary between a step's streamed text and its
+        tool-phase accordions, for the mid-phase Stop rollback (see #2).
+
+        Taken after _ui_finish_active_md has flushed the step's text, so discarding
+        back to it removes the accordions and keeps the prose - which is exactly the
+        split the history rollback makes."""
+        self._ui_mark_step_render()
+        self._tool_phase_render_mark = self._step_render_mark
+
+    def _ui_discard_tool_phase_render(self) -> None:
+        """MAIN THREAD. Drop only the current step's tool-phase rendering.
+
+        Reads the mark at call time (both this and _ui_mark_tool_phase run on the
+        same FIFO queue, in order). Unlike the retry path this deliberately has NO
+        load_chat fallback: a Stop is the worst moment to block the main thread
+        re-rendering the whole chat, and the cost of doing nothing is only that
+        phantom accordions stay visible until the next re-render."""
+        self._ui_discard_to_mark(self._tool_phase_render_mark)
+
+    def _ui_discard_step_render(self) -> bool:
+        """MAIN THREAD. Remove everything rendered since _ui_mark_step_render()."""
+        return self._ui_discard_to_mark(self._step_render_mark)
+
+    @staticmethod
+    def _destroy_code_buttons(widgets) -> None:
+        """Destroy the tk.Buttons embedded in chat_text via window_create().
+
+        Dropping the last Python reference is not enough - though not for the
+        reason it looks like. Text.delete() DOES destroy the Tk window: probing
+        `winfo exists` on every discarded button returns false and
+        chat_text.winfo_children() drops to zero, so there is no Tk window leak
+        and no OS handle leak, mapped or otherwise.
+
+        What does leak is tkinter's own bookkeeping. Misc.__init__ registers
+        every child in the PARENT's `children` dict keyed by widget path name,
+        and only Misc.destroy() removes that entry. Tk's internal teardown of a
+        window_create entry never goes through it, so the dict keeps a strong
+        reference to the Button, which keeps its `command` lambda alive, which
+        for a code block closes over the whole code string. Measured: 2000
+        discard cycles of 3 buttons left 6002 entries in chat_text.children
+        against a single live Tk window.
+
+        Safe in either order - destroy before the text delete (widget still
+        embedded) or after it (already destroyed, no error) - so callers need
+        not care where this sits relative to delete().
+        """
+        for w in widgets:
+            try:
+                w.destroy()
+            except tk.TclError:
+                pass
+
+    def _ui_discard_to_mark(self, mark) -> bool:
+        """MAIN THREAD. Roll the transcript back to a mark taken by
+        _ui_mark_step_render() (or a snapshot of the same shape).
+
+        Returns True if it did the job, False if it could not (no mark, the user
+        switched chats, or any surprise) - the caller then falls back to the full
+        reload, which is always correct, just expensive.
+
+        Why this exists: the retry path used to call load_chat(force=True), which
+        re-renders the ENTIRE chat window from history. On a long conversation that
+        is hundreds of milliseconds of Tk text inserts, tags and window_create calls
+        with the event loop blocked - it read as the app freezing, and it was charged
+        for a single failed step. Deleting the tail of one step is a handful of calls.
+        """
+        if self._closed or not self._viewing_run_chat():
+            return False
+        if not mark:
+            return False
+        idx, n_btn, n_img, n_link, n_acc = mark
+        try:
+            cur = self.chat_text.index("end-1c")
+            if self.chat_text.compare(cur, "<", idx):
+                return False          # widget got shorter than the mark: don't guess
+            # Registries first: dropping the PhotoImage refs lets Tk release the
+            # images the moment their window_create entries are deleted below.
+            # The buttons need an explicit destroy() on top of the slice, or
+            # chat_text.children keeps them alive (see _destroy_code_buttons).
+            self._destroy_code_buttons(self._code_buttons[n_btn:])
+            del self._code_buttons[n_btn:]
+            del self._image_thumbs[n_img:]
+            for key in list(self._links)[n_link:]:
+                self._links.pop(key, None)
+            for sid in list(self._accordions)[n_acc:]:
+                info = self._accordions.pop(sid, None)
+                if not info:
+                    continue
+                # BOTH tags, not just the body. The header tag carries a <Button-1>
+                # binding (tag_bind in _add_accordion); deleting only the body leaked
+                # the tag plus its bound closure for every rolled-back step, and a
+                # retry loop accumulates them.
+                for key in ("body_tag", "hdr_tag"):
+                    tag = info.get(key) or f"{sid}_{'body' if key == 'body_tag' else 'hdr'}"
+                    try:
+                        self.chat_text.tag_delete(tag)
+                    except tk.TclError:
+                        pass
+            self.chat_text.delete(idx, "end")
+            self.chat_text.insert("end", "\n")
+        except (tk.TclError, ValueError, TypeError):
+            return False
+        self._reasoning_sids.clear()
+        self._active_md = None
+        self._reasoning_sid = None
+        self._pending_tool_output = None
+        self._autoscroll()
+        return True
+
     def _ui_discard_partial_render(self) -> None:
         """Clear the partially-rendered reply so an automatic retry can re-render
-        it cleanly (no duplicated text / code buttons / links). Reuses load_chat's
-        full reset; safe mid-turn because it doesn't touch _run_chat_id or _busy.
-        Only acts when the streaming chat is actually on screen."""
+        it cleanly (no duplicated text / code buttons / links).
+
+        v1.1.74: the cheap path is _ui_discard_step_render(), which removes only the
+        current step's output. load_chat(force=True) is kept as the fallback for when
+        no usable mark exists (a retry on the first step after a chat switch, say) -
+        it re-renders the whole window, which is correct but exactly the freeze this
+        fix is about. Safe mid-turn: neither path touches _run_chat_id or _busy."""
         if self._closed or not self._viewing_run_chat():
+            return
+        if self._ui_discard_step_render():
             return
         cid = self.current_chat_id
         if cid is None:
@@ -8900,6 +11478,7 @@ class DeskpilotApp:
         self._ui_finish_active_md()
         self._reasoning_sid = None
         self._pending_tool_output = None
+        self._ui_mark_step_render()
 
     def _ui_finish_active_md(self) -> None:
         """MAIN THREAD. Flush the active markdown stream's pending partial line and
@@ -9106,6 +11685,7 @@ class DeskpilotApp:
                                  "wait for the current step or press Stop")
                 return
             self.input_text.delete("1.0", "end")
+            self._spell_clear()      # emptied box must not keep underlines or stale hits
             self._attachments.clear()
             self._render_chips()
             self._set_status(f"⚙ Queued for the next step ({n} waiting)")
@@ -9130,6 +11710,7 @@ class DeskpilotApp:
 
         # clear input area
         self.input_text.delete("1.0", "end")
+        self._spell_clear()          # emptied box must not keep underlines or stale hits
         self._attachments.clear()
         self._render_chips()
 
@@ -9405,7 +11986,8 @@ class DeskpilotApp:
         kw = dict(model=model, messages=msgs, stream=False,
                   max_tokens=EXPERT_MAX_TOKENS)
         # NO tools / tool_choice here. That is the whole safety property.
-        txt, usage, err = _probe_create(client, kw, EXPERT_TIMEOUT_S)
+        txt, usage, err = _probe_create(client, kw, EXPERT_TIMEOUT_S,
+                                        include_reasoning=True)
         # Gemini's /models lists IDs as "models/<name>" but its own chat examples
         # send the bare "<name>". Which one the endpoint accepts was not
         # verifiable here (the account was rate-limited), so try the other form
@@ -9416,7 +11998,8 @@ class DeskpilotApp:
             if alt and alt != model:
                 kw_alt = dict(kw)
                 kw_alt["model"] = alt
-                t2, u2, e2 = _probe_create(client, kw_alt, EXPERT_TIMEOUT_S)
+                t2, u2, e2 = _probe_create(client, kw_alt, EXPERT_TIMEOUT_S,
+                                           include_reasoning=True)
                 if not e2 or not _is_model_lookup_error(e2):
                     txt, usage, err = t2, u2, e2
                     model = alt
@@ -9424,7 +12007,8 @@ class DeskpilotApp:
         # Thinking-model recovery: empty content but the model clearly worked.
         if not err and not txt.strip():
             kw2 = dict(model=model, messages=msgs, stream=False)
-            txt, usage, err = _probe_create(client, kw2, EXPERT_TIMEOUT_S)
+            txt, usage, err = _probe_create(client, kw2, EXPERT_TIMEOUT_S,
+                                            include_reasoning=True)
             if not err and not txt.strip():
                 return (f"ERROR: {label} returned an empty answer twice (it may have "
                         f"spent the whole budget thinking). Narrow the question or "
@@ -9521,6 +12105,14 @@ class DeskpilotApp:
         sampling_noted = False    # the "what was sent" note fires once per user prompt
         turn_total = 0           # completion tokens accumulated this user prompt (resets per prompt)
         stream_retry_ok = True   # one automatic retry per step on a transient mid-stream drop
+        # v1.1.74 (#6): a step that produced NOTHING usable - no text, no tool call -
+        # used to be appended to the chat as an empty assistant message and reported
+        # as "(model returned an empty response)". Local servers drop a completion
+        # like this now and then for reasons that have nothing to do with the prompt,
+        # and one immediate re-issue almost always returns a real answer. One retry
+        # per step, restored when a step completes, so it can never loop.
+        empty_retry_ok = True
+        retry_uncapped = False   # set on that retry: drop an explicit cap that may have caused it
         model_fix_ok = True      # one auto-correction of a stale model name per turn
         self._ctx_used_run = 0   # gauge as of the last completed step of THIS prompt (worker-side copy;
                                  # _ctx_used is main-thread state and must not be written from here)
@@ -9541,6 +12133,19 @@ class DeskpilotApp:
         # _run_cancellable) is what stops a single long call mid-flight either way.
         turn_limit = _turn_time_limit(self.settings)
         turn_deadline = (time.monotonic() + turn_limit) if turn_limit else None
+        # v1.1.73: the date/time note is built ONCE per user prompt, not per step.
+        # This loop runs one iteration per tool call, so a turn routinely outlives
+        # a minute boundary; re-reading the clock each step would change the stamp
+        # mid-turn and throw away the engine's KV prefix cache for the whole
+        # conversation - exactly the cost this change exists to remove. A stamp
+        # that is a few minutes stale inside one turn is harmless.
+        time_note = build_time_note()
+        # v1.1.75: the two efficiency knobs are read ONCE per prompt, like turn_limit.
+        # Settings cannot change mid-turn, and a value that is constant across steps
+        # is what keeps the outgoing prefix byte-identical from step to step so the
+        # engine's KV prefix cache keeps covering it.
+        _keep_results = _tool_keep_verbatim(self.settings)
+        _nudge_every = _tool_nudge_every(self.settings)
 
         while (MAX_TOOL_STEPS == 0 or step < MAX_TOOL_STEPS) and not self._closed \
                 and not self._stop_event.is_set():
@@ -9585,25 +12190,107 @@ class DeskpilotApp:
             # already handled by the end-of-iteration gate, so this must not double-fire within a turn.
             if step == 0:
                 self._maybe_compact_context(
-                    chat_id, max(estimate_prompt_tokens(messages), self._ctx_used_last()),
+                    chat_id, max(_outgoing_prompt_tokens(messages, self.settings), self._ctx_used_last()),
                     self._ctx_window(), messages)
             # ── build request (only tools whose permission ≠ Off) ─────────
-            enabled_tools = [s for n, s in TOOL_SCHEMAS.items()
-                             if self.settings.get("tool_permissions", {}).get(n, "ask") != "off"]
+            # Studio mode (v1.1.77) withholds tool schemas for this chat; the global
+            # setting is the escape hatch, and a per-tool grant (click a red chip while
+            # in Studio) re-admits exactly that tool. THE TOOLBAR CHIPS ARE PAINTED
+            # FROM THIS SAME PREDICATE (studio_tool_withheld), so the bar and the
+            # request can never disagree; a green chip the model cannot see is a lie
+            # about capability, and a red chip the model CAN see is the same lie.
+            _chat = self.chats["chats"].get(chat_id)
+            _studio = chat_studio_mode(_chat)
+            _studio_off = self.settings.get("studio_tools_off", True)
+            # Tools are the SAME in full and pure: withheld by default, grantable one at
+            # a time. The mode changes the brief, never the tool set - so the grant list,
+            # not the mode, is what decides which tools reach the request.
+            def _keep(n) -> bool:
+                if self.settings.get("tool_permissions", {}).get(n, "ask") == "off":
+                    return False          # Off is a hard user veto, Studio cannot grant past it
+                return not studio_tool_withheld(_chat, n, _studio_off)
+            enabled_tools = [s for n, s in TOOL_SCHEMAS.items() if _keep(n)]
             # MCP tools from connected servers (namespaced mcp_<server>_<tool>).
             enabled_tools += [s for s in self._mcp_schemas()
-                              if self.settings.get("tool_permissions", {}).get(
-                                  s["function"]["name"], "ask") != "off"]
+                              if _keep(s["function"]["name"])]
             enabled_tools = enabled_tools or None
+            # True only when Studio withholds the WHOLE set - the all-red bar. With a
+            # grant present, tools are live and the guard must not fire.
+            _studio_no_tools = studio_all_tools_withheld(_chat, _studio_off)
+            # v1.1.75: the outgoing list is a COPY of the chat, and the copy is
+            # where the efficiency work happens - nothing here touches `messages`,
+            # so the saved transcript keeps every full tool result. Order matters:
+            # prepare (resolve screenshots) -> evict (stub old tool results) ->
+            # stamp (time note on the last REAL user turn) -> nudge (pure suffix,
+            # only on every Nth step). Stamping before appending the nudge keeps
+            # the date on the user's own message rather than on the note, and
+            # keeps the note a stable suffix that costs nothing on other steps.
+            # Studio mode swaps in STUDIO_SYSTEM_PROMPT and drops the operator
+            # envelope with it: the user persona, skills index and ledger all read as
+            # "be a terse operator", which is exactly what made generative output
+            # thin. None of it is deleted - it is withheld while the mode is on and
+            # returns the moment it is switched off.
+            # PROJECT MEMORY IS THE ONE EXCEPTION in 'full' (v1.1.83, user's rule):
+            # a generative session still needs to know which project it is in and
+            # what has already been decided, or it re-derives settled facts and puts
+            # new memory files in the wrong place. 'pure' keeps withholding EVERYTHING.
+            # Studio 'full' swaps in STUDIO_SYSTEM_PROMPT; Studio 'pure' returns None
+            # and is OMITTED, so the model sees the conversation with no DeskPilot brief
+            # at all - the closest this app can get to the inference engine's own chat.
+            # Nothing in this app assumes messages[0] is a system message (verified), so
+            # an empty prefix is safe. None of it is deleted - it all returns the moment
+            # Studio is switched off.
+            # v1.1.83 - Studio 'full' keeps PROJECT MEMORY. The user's rule: full
+            # removes the persona/system prompt and withholds tools by default, but
+            # the model must still know which project it is in and what has already
+            # been decided, or it re-derives settled facts and writes new memory
+            # files in the wrong place. Persona, skills index and ledger stay
+            # withheld - those are the "be a terse operator" framing that was making
+            # generative output thin. Studio 'pure' still gets NOTHING (unchanged).
+            # build_system_message('full') returns STUDIO_SYSTEM_PROMPT and ignores
+            # these arguments, so the memory rides in only via the appended block.
+            _proj = chat_project(_chat)
+            # v1.1.86 (SOW item 5 Gap 1): the active project's OWN MEMORY.md, not just
+            # the workspace index. 'off' passes it through as an argument; 'full'
+            # appends it here alongside the index; 'pure' still gets NOTHING.
+            _proj_full = _project_memory_project_text(self.settings, _proj)
+            _mem_full = ""
+            if _studio == "full":
+                _mem_full = "\n\n".join(x for x in (_project_memory_text(self.settings),
+                                                    _proj_full) if x)
+            _sysmsg = build_system_message(str(self.settings.get("file_workspace") or ""),
+                               str(self.settings.get("exa_api_key") or ""),
+                               str(self.settings.get("firecrawl_api_key") or ""),
+                               "" if _studio != "off" else effective_custom_prompt(self.settings),
+                               "" if _studio != "off" else _skills_index_text(self.settings),
+                               "" if _studio != "off" else self._ledger_inject(chat_id),
+                               "" if _studio != "off" else _project_memory_text(self.settings),
+                               # Which project this chat declared. Read-only off-thread
+                               # access, same as _chat itself two lines above.
+                               "" if _studio != "off" else _proj,
+                               studio=_studio,
+                               project_memory_full=("" if _studio != "off" else _proj_full))
+            if _sysmsg is not None and _mem_full:
+                _sysmsg = {"role": "system",
+                           "content": str(_sysmsg.get("content") or "")
+                                      + "\n\n" + _mem_full}
+            _req_msgs = _stamp_last_user(
+                ([_sysmsg] if _sysmsg is not None else [])
+              + _evict_old_tool_results(_prepare_request_messages(list(messages)),
+                                        _keep_results),
+                # Studio 'pure' means "answer from the model alone, nothing injected" -
+                # and the date/time note is injected context. 'full' and 'off' keep the
+                # stamp byte-identical to before. The handoff/summarizer path is
+                # deliberately NOT gated: it runs in operator mode and writes a record,
+                # not a reply.
+                "" if _studio == "pure" else time_note)
+            # The tool-economy paragraph is operator framing: it tells the model to
+            # batch calls and stop early. Meaningless with no tools in the request.
+            _nudge = None if _studio_no_tools else _tool_economy_nudge(step, _nudge_every)
+            if _nudge is not None:
+                _req_msgs = _req_msgs + [_nudge]
             kwargs: Dict[str, Any] = dict(model=model,
-                                messages=[build_system_message(str(self.settings.get("file_workspace") or ""),
-                                   str(self.settings.get("exa_api_key") or ""),
-                                   str(self.settings.get("firecrawl_api_key") or ""),
-                                   effective_custom_prompt(self.settings),
-                                   _skills_index_text(self.settings),
-                                   self._ledger_inject(chat_id),
-                                   _project_memory_text(self.settings))]
-                                  + _prepare_request_messages(list(messages)),
+                                messages=_req_msgs,
                                 stream=True)
             if enabled_tools:
                 kwargs["tools"] = enabled_tools
@@ -9614,12 +12301,24 @@ class DeskpilotApp:
                 mt = int(self.settings.get("max_tokens", 0) or 0)
             except (TypeError, ValueError):
                 mt = 0
-            if mt > 0:
+            if mt > 0 and not retry_uncapped:
                 kwargs["max_tokens"] = mt        # per-reply token cap (Settings -> Max Tokens)
+            # One-shot: the uncapped retry must not silently disable the cap for every
+            # later step of the turn, so consume the flag as soon as it is honoured.
+            retry_uncapped = False
             # Per-chat temperature: always sent now (blank/legacy -> TEMP_DEFAULT).
-            t = chat_temperature(self.chats["chats"].get(chat_id))
-            if t is not None:
-                kwargs["temperature"] = t
+            # Studio mode's override is applied HERE, not via sampling_kwargs: the
+            # tunables in SAMPLING_SCHEMA live in sampling_defaults, but temperature is
+            # a per-chat field on the chat dict and has its own site. One place decides
+            # the value, so the topbar, the "Sent:" note and the wire cannot disagree.
+            _t_ov = studio_sampling_overrides(self.chats["chats"].get(chat_id),
+                                              self.settings.get("studio_sampling", True))
+            if _t_ov.get("temperature"):
+                kwargs["temperature"] = float(_t_ov["temperature"])
+            else:
+                t = chat_temperature(self.chats["chats"].get(chat_id))
+                if t is not None:
+                    kwargs["temperature"] = t
             # Per-chat thinking level: Off/Low/Medium/High map to Qwen3-style server
             # extensions (enable_thinking / chat_template_kwargs.reasoning_effort - not in
             # the OpenAI schema), sent via extra_body. Blank/legacy chats send nothing
@@ -9632,11 +12331,25 @@ class DeskpilotApp:
                 _tb = chat_thinking_extra_body(self.chats["chats"].get(chat_id))
                 if _tb is not None:
                     eb.update(_tb)
-            _sw = sampling_kwargs(self.settings)
-            kwargs.update(_sw["top"])
+            _sw = sampling_kwargs(self.settings,
+                                  studio_sampling_overrides(self.chats["chats"].get(chat_id),
+                                                            self.settings.get("studio_sampling", True)))
+            # 'top' carries the SAMPLING_SCHEMA fields only (top_p, penalties, seed);
+            # temperature is NOT in that schema, so nothing here can overwrite the
+            # per-chat / Studio temperature decided above. Both dicts honour
+            # pruned_keys, so a key a strict server rejected stays out of every step.
+            kwargs.update({k: v for k, v in _sw["top"].items() if k not in pruned_keys})
             if sampling_ok:
                 eb.update({k: v for k, v in _sw["flat"].items() if k not in pruned_keys})
-            self._sampling_sent = dict(top=_sw["top"], flat=dict(eb), thinking=_tb)
+            # The note must report the WIRE, not the settings dialog. temperature is a
+            # per-chat field decided above (and Studio overrides it), so it never lands
+            # in _sw["top"] - without this the formatter fell back to
+            # chat_temperature(chat) and could print "temp 0.7" on a request that
+            # actually carried Studio's 0.9.
+            _sent_top = dict(_sw["top"])
+            if "temperature" in kwargs:
+                _sent_top["temperature"] = kwargs["temperature"]
+            self._sampling_sent = dict(top=_sent_top, flat=dict(eb), thinking=_tb)
             kwargs["extra_body"] = eb
 
             if turn_deadline is not None and time.monotonic() > turn_deadline:
@@ -9657,6 +12370,10 @@ class DeskpilotApp:
 
             _cap = "" if MAX_TOOL_STEPS == 0 else f"/{MAX_TOOL_STEPS}"
             self._post(lambda s=f"🤖 Thinking… (step {step + 1}{_cap})": self._set_status(s))
+            # v1.1.76: opt-in dump of the payload as it will actually go out - i.e.
+            # AFTER eviction/nudge/stamping and after any server-rejection retry has
+            # pruned kwargs, so what lands on disk is what the server is handed.
+            _debug_dump_request(kwargs, step, chat_id)
             try:
                 stream = client.chat.completions.create(**kwargs)
                 # One note per user prompt recording the sampling parameters that actually left the
@@ -9680,10 +12397,14 @@ class DeskpilotApp:
                     thinking_ok = False           # server rejects the extension -> retry: kwargs is
                     continue                        # rebuilt at the top of every step and gated by
                                                     # this flag (the old in-place pop was inert)
-                if sampling_ok and any(k in low_msg for k in SAMPLING_FLAT_KEYS):
+                if sampling_ok and any(k in low_msg for k in SAMPLING_ALL_KEYS):
                     # Strict server (real OpenAI, many proxies): drop ONLY the offending sampler
-                    # extension key and retry, so one rejected field cannot silently kill the rest.
-                    hit = [k for k in SAMPLING_FLAT_KEYS if k in low_msg]
+                    # key and retry, so one rejected field cannot silently kill the rest.
+                    # v1.1.77: widened to SAMPLING_ALL_KEYS - `seed` rides in 'top', not
+                    # extra_body, and a server that does not know it must lose the seed,
+                    # not the request. kwargs is rebuilt at the top of every step and
+                    # filtered by pruned_keys, so no in-place mutation is needed here.
+                    hit = [k for k in SAMPLING_ALL_KEYS if k in low_msg]
                     dropped = False
                     for k in hit:
                         if k not in pruned_keys:
@@ -9915,6 +12636,27 @@ class DeskpilotApp:
                     "function": {"name": s["name"], "arguments": args_raw},
                 })
 
+            # ── nothing usable came back → retry this step once (v1.1.74, #6) ──
+            # Deliberately AFTER tool_calls is finalised: a streamed tool call IS an
+            # answer (the model chose to act rather than talk), so only a step with no
+            # text AND no tool call counts as empty. Reasoning-only output counts as
+            # empty too - the drawer is transient and the persisted message would be
+            # "", so the user keeps nothing either way.
+            # NOTE on the cap: unlike the summary ladder, this loop only sends
+            # max_tokens when Settings -> Max Tokens is non-zero (0 = server default,
+            # which is the shipped setting), so there is usually no cap to raise and
+            # the retry is a plain re-issue. When a cap IS set, drop it for the retry:
+            # "spent the whole budget on thinking" is a real cause of empty content.
+            if (empty_retry_ok and not tool_calls and not full_content.strip()
+                    and not self._closed and not self._stop_event.is_set()):
+                empty_retry_ok = False
+                retry_uncapped = True
+                buf_c = buf_r = ""          # so finally's flush posts nothing more
+                self._post(self._ui_discard_partial_render)
+                self._post(lambda: self.render_note(
+                    "\u26a1 Empty response - retrying this step once\u2026"))
+                continue
+
             # ── FLUSH the streamed text before anything else renders ────────
             # v1.1.60: MarkdownStream holds the final line in .pending until
             # finish() is called. Without this, a step that ends in a tool call
@@ -9938,6 +12680,14 @@ class DeskpilotApp:
 
             # ── tool phase: record assistant msg, execute each call ───────
             tool_phase_start = len(messages)   # rollback point if the user stops mid-phase
+            # v1.1.74 (#2): a second mark, taken AFTER the streamed text was flushed
+            # and BEFORE any accordion is drawn. Stopping mid-phase rolls the tool
+            # calls back out of history, so only the accordions become phantom - the
+            # conversational text is being deliberately kept (below) and must stay on
+            # screen. POSTED, never called inline: it reads the Text widget, and the
+            # worker must not touch Tcl. FIFO ordering guarantees it runs after the
+            # _ui_finish_active_md flush above and before the first accordion below.
+            self._post(self._ui_mark_tool_phase)
             messages.append({"role": "assistant", "content": full_content or None,
                              "tool_calls": tool_calls,
                              "ts": datetime.now().isoformat(timespec="seconds")})
@@ -9946,6 +12696,28 @@ class DeskpilotApp:
                 if self._closed or self._stop_event.is_set():
                     break
                 name = tc["function"]["name"]
+                # Studio mode (v1.1.77): withholding the schemas is not a wall. A local
+                # model can emit a tool call for a tool it was never offered - it has
+                # seen these names in every previous turn of this chat - and dispatch
+                # below gates only on tool_permissions, so it would RUN. Refuse it here,
+                # in the same shape as the malformed-arguments path, and tell the model
+                # plainly so it stops trying. This is the enforcement the red chips
+                # promise: red means the tool will not run, not merely that it was hidden.
+                # Checked PER TOOL, so a Studio chat that granted one tool still refuses
+                # every tool it did not grant.
+                if studio_tool_withheld(_chat, name, _studio_off):
+                    self._post(lambda n=name: self._ui_tool_call_accordion(n, {"_studio_blocked": True}))
+                    err = (f"ERROR: Tool '{name}' was NOT executed - this chat is in Studio "
+                           f"mode, where tools are withheld. Produce the artifact directly in "
+                           f"your reply instead of calling tools. (The user can switch tools "
+                           f"back on: uncheck Studio, or Settings -> Sampling -> \"Studio mode: "
+                           f"withhold every tool schema\".)")
+                    messages.append({"role": "tool", "tool_call_id": tc["id"],
+                                     "name": name, "content": err})
+                    self._post(lambda n=name, r=err: self._ui_tool_output_accordion(n, r))
+                    self._post(lambda: self._set_status(
+                        "🎨 Studio mode: tool call blocked (tools are withheld)"))
+                    continue
                 args_raw_dispatch = tc["function"].get("arguments") or "{}"
                 args, args_err = parse_tool_arguments(args_raw_dispatch)
                 if args_err:
@@ -9965,7 +12737,7 @@ class DeskpilotApp:
                                f"e.g. {{\"question\": \"...\"}}.")
                     messages.append({"role": "tool", "tool_call_id": tc["id"],
                                      "name": name, "content": err})
-                    self._post(lambda n=name, r=err: self._ui_tool_output_accordion(n, err))
+                    self._post(lambda n=name, r=err: self._ui_tool_output_accordion(n, r))
                     continue
                 self._post(lambda n=name, a=args: self._ui_tool_call_accordion(n, a))
                 self._post(lambda s=f"🛠 Running {name}…": self._set_status(s))
@@ -10002,17 +12774,41 @@ class DeskpilotApp:
                             f"\U0001F5BC Image from {n} queued for visual analysis"))
 
             if self._stop_event.is_set():
-                # Stopped mid-tool-phase: roll back the assistant tool_calls
-                # message and any tool results added this step (a tool_call
-                # without its result would be rejected by strict servers), then
-                # end the turn with what was already persisted.
+                # Stopped mid-tool-phase: roll back the assistant tool_calls message
+                # and any tool results added this step (a tool_call without its
+                # result would be rejected by strict servers).
+                #
+                # v1.1.74 (#2) part 1 - THE DATA LOSS. The rolled-back message
+                # carried `content: full_content`, so every word the model streamed
+                # before deciding to call a tool was deleted from history and saved
+                # that way: the user stopped a long turn and silently lost its
+                # entire visible reasoning. Keep it as a plain assistant message,
+                # exactly as the mid-STREAM stop path above already does - safe for
+                # strict servers because the tool_calls message goes with it, so no
+                # tool_call is left without its result.
+                #
+                # part 2 - THE SCREEN. _ui_sync_messages only updates the list and
+                # throttles the save; it never repaints. The accordions drawn during
+                # the rolled-back phase are now phantom, but the text is genuinely in
+                # history, so it must stay. Discard to the TOOL-PHASE mark (taken
+                # after the text flush), not the step mark - that removes precisely
+                # what was rolled back. Deliberately NOT _ui_discard_partial_render:
+                # its fallback is load_chat(force=True), and a Stop is the worst
+                # moment to block the main thread re-rendering the whole chat.
+                # Returning False just leaves the accordions on screen - cosmetic,
+                # and the next re-render corrects it.
                 del messages[tool_phase_start:]
+                if full_content.strip():
+                    messages.append({"role": "assistant", "content": full_content,
+                                     "ts": datetime.now().isoformat(timespec="seconds")})
                 self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
+                self._post(self._ui_discard_tool_phase_render)
                 self._post(self._ui_turn_stopped)
                 return
 
             self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
             stream_retry_ok = True   # a completed step restores the one-retry budget
+            empty_retry_ok = True    # ditto for the empty-response retry
 
             # ── mid-turn context gate ────────────────────────────────────────
             # Deliberately checked AFTER the tool phase: the tool results just appended
@@ -10027,7 +12823,7 @@ class DeskpilotApp:
             # step late is exactly the failure this feature exists to prevent. The estimate is
             # only ever a lower bound here, and _begin_midturn_handoff() still refuses to act
             # when the server reports no context size (no guessing).
-            _gate_used = max(int(tot or 0), estimate_prompt_tokens(messages))
+            _gate_used = max(int(tot or 0), _outgoing_prompt_tokens(messages, self.settings))
             # ── context compaction (C5): try to free space IN PLACE before forking ──
             # If the gauge crossed the compaction threshold and there is enough old history,
             # summarize it in place and CONTINUE the turn - no fork, no button, no user
@@ -10366,6 +13162,87 @@ class DeskpilotApp:
             stdout=b"".join(sink["out"]).decode("utf-8", "replace"),
             stderr=b"".join(sink["err"]).decode("utf-8", "replace"))
 
+    def _project_for_path(self, value) -> str:
+        """Project slug owning `value`, or '' if it is not inside a project folder.
+
+        Only <workspace>/projects/<slug>/... counts. The workspace-root MEMORY.md
+        (the index) and loose scratch files at the root deliberately return '', so
+        tidying the index is never mistaken for working in the project it names.
+        """
+        if not isinstance(value, str) or not value.strip():
+            return ""
+        try:
+            root = projects_root().resolve()
+            p = Path(value.strip()).expanduser()
+            p = (p if p.is_absolute() else default_workspace_root() / p).resolve()
+            rel = p.relative_to(root)
+        except (ValueError, OSError, RuntimeError):
+            return ""
+        parts = rel.parts
+        if len(parts) < 2:
+            return ""                      # the projects/ folder itself
+        slug = parts[0]
+        return slug if slug not in (".", "..", "history", "skills") else ""
+
+    def _note_project_activity(self, name: str, args: dict) -> None:
+        """Infer the project being worked on from what the tools actually touch.
+
+        Why this exists: the top bar used to depend on the model calling
+        set_project(), and a model that got straight to work never does - so the
+        bar sat on whatever was declared last (or nothing) while real work
+        happened elsewhere, sometimes for many turns. File traffic is the honest
+        signal: opening, searching or editing a file under projects/<slug>/ IS
+        working in that project, whoever decided to open it.
+
+        run_shell is deliberately NOT scanned. This very session is the proof:
+        the work is on deskpilot.py, but the shell commands all invoke
+        projects/Price-Stock_Montor/.venv/Scripts/python.exe, because that venv
+        happens to have the playwright install. Scanning commands would attribute
+        this session to the wrong project on every call. A command line is a
+        place a path can appear for reasons unrelated to whose code is being
+        changed; a file-tool `path` argument is the object of the work.
+
+        Recency wins with no threshold. The complaint this addresses was latency
+        ("many turns in"), so the first qualifying call must move the bar at once;
+        hysteresis would reintroduce exactly that. Writes and reads count equally
+        because the project-memory convention makes reading a project's MEMORY.md
+        the first act of working in it.
+
+        Runs on the tool worker thread, so the repaint is posted to the main
+        thread. Nothing is written to disk here: the per-turn save persists it.
+        """
+        if name not in PROJECT_ACTIVITY_TOOLS or not isinstance(args, dict):
+            return
+        slug = ""
+        for key in PROJECT_ACTIVITY_KEYS:
+            slug = self._project_for_path(args.get(key))
+            if slug:
+                break
+        if not slug:
+            return
+        try:
+            # v1.1.88: attribute the activity to the chat RUNNING this turn, never to
+            # whatever is on screen. load_chat() has no _busy guard - switching chats
+            # mid-turn is supported, which is why _viewing_run_chat() exists - so
+            # current_chat_id can be a different chat by the time this runs, and the
+            # posted _set_active_project would have written THIS chat's project onto
+            # THAT one. Reading current_chat() here was also a worker-thread read of
+            # chat state (invariant #4).
+            cid = self._run_chat_id or self.current_chat_id
+            chat = (self.chats.get("chats") or {}).get(cid) if cid else None
+            current = (chat_project(chat) if isinstance(chat, dict)
+                       else "") or self._pending_project
+        except (AttributeError, RuntimeError):
+            return
+        # Skip the post only when the bar is ALREADY lit for this slug. Matching the
+        # stored field is not enough: a chat reopened from history has the right
+        # project saved but a dark bar, and returning here would leave it dark no
+        # matter how much work happened in it.
+        if project_key(current) == project_key(slug) and \
+                (cid is None or cid in self._project_active_chats):
+            return
+        self._post(lambda s=slug, c=cid: self._set_active_project(s, chat_id=c))
+
     def _execute_tool(self, name: str, args: dict, images_out: Optional[list] = None) -> str:
         """Run one tool. Returns its text result.
 
@@ -10377,6 +13254,14 @@ class DeskpilotApp:
         perm = self.settings.get("tool_permissions", {}).get(name, "ask")
         if perm == "off":
             return f"ERROR: Tool '{name}' is disabled by the user (permission set to Off)."
+        # Placed after the Off check on purpose: a disabled tool performs no work,
+        # so it must not claim a project. A denied-by-modal call still counts,
+        # which is the right way to be wrong - the model did turn its attention
+        # to that project, and the bar is about attention, not achievement.
+        try:
+            self._note_project_activity(name, args)
+        except Exception:
+            pass                           # a cosmetic feature never breaks a turn
         if perm == "ask" and not self._ask_permission_modal(name, args):
             return f"ERROR: User denied permission to run '{name}'."
         if name.startswith("mcp_") and name not in TOOL_SCHEMAS:
@@ -10719,7 +13604,106 @@ class DeskpilotApp:
             except OSError:
                 pass
 
-    def _tool_run_shell(self, command: str = "", timeout: Any = None) -> str:
+    # ── run_shell: the cmd.exe quoting escape hatch (v1.1.83) ───────────────
+
+    # Shaped like a cmd.exe quoting/parse failure. Used only to APPEND a hint to
+    # an already-failing result, never to change what was executed.
+    _SHELL_QUOTE_FAIL_RE = re.compile(
+        r"is not recognized|syntax is incorrect|unterminated|"
+        r"was unexpected at this time|invalid command",
+        re.IGNORECASE)
+
+    def _shell_script_argv(self, command: str):
+        """Write `command` to a temp .cmd; return (argv, path) or (None, reason).
+
+        Measured on this machine rather than assumed:
+          * the path MUST be wrapped in double quotes here: the command line is
+            handed to CreateProcess verbatim, so a temp dir containing a space (a
+            profile like C:/Users/John Smith/...) would otherwise be cut at the
+            space and cmd reports a "not recognized" error naming the truncated
+            prefix. v1.1.83 said the opposite - keep it bare - which was correct
+            ONLY while the command was passed as a LIST and list2cmdline did the
+            quoting; under the verbatim transport that advice is wrong, and it
+            silently broke on spaced paths.
+          * '@echo off' is required or the batch file ECHOES every line back, and
+            the model reads its own script back as program output.
+        """
+        if "%" in (tempfile.gettempdir() or ""):
+            return None, "temp dir path contains '%'"
+        body = "@echo off\r\n" + command.replace("\r\n", "\n").replace("\n", "\r\n") + "\r\n"
+        f = None
+        try:
+            f = tempfile.NamedTemporaryFile(
+                prefix="deskpilot-shell-", suffix=".cmd", delete=False)
+            f.write(body.encode("utf-8", "replace"))
+            f.close()
+        except OSError as e:
+            if f is not None:
+                try:
+                    os.unlink(f.name)
+                except OSError:
+                    pass
+            return None, str(e)
+        return ('"%s" /c "%s"' % (os.environ.get("ComSpec") or "cmd.exe", f.name),
+                f.name)
+
+    def _shell_wants_script(self, command: str) -> bool:
+        """True when cmd.exe provably cannot run this inline, so it is worth the
+        extra file write.
+
+        Deliberately NARROW, because a batch file is a different dialect, not a
+        strictly better transport: inside a .cmd, '%' is a variable marker (so a
+        literal '%' must be written '%%') and a FOR loop needs '%%i' where inline
+        wants '%i'. Rerouting a command that already works inline would BREAK it,
+        so anything containing '%' is left alone and only the two shapes that are
+        known-broken inline are rerouted:
+          1. a NEWLINE - inline runs only the first line and still exits 0, i.e.
+             silent truncation that reads as success (measured: 'echo one\necho
+             two' returns rc=0 with one line of output);
+          2. a command STARTING with a double quote - cmd strips one matched pair
+             of outer quotes, so '"python" -c "..."' fails rc=1.
+        """
+        if not command:
+            return False
+        if "%" in command:
+            return False          # batch would reinterpret it; leave inline
+        if "\n" in command:
+            # A newline INSIDE a quoted argument is not a command separator - it
+            # belongs to the program, and no transport can preserve it. The caller
+            # refuses that shape BEFORE reaching here (under the verbatim transport
+            # it fails silently, so there would be nothing to detect); this guard
+            # stays as belt-and-braces so a future caller cannot reroute one into a
+            # batch, where each line would run as its own command.
+            if self._newline_inside_quotes(command):
+                return False
+            return True
+        if command.lstrip()[:1] == '"':
+            return True
+        return False
+
+    def _newline_inside_quotes(self, command: str) -> bool:
+        """True when a newline sits inside a double-quoted argument.
+
+        `python -c "line1 <NL> line2"` means the newline belongs to PYTHON, not
+        to the shell - it is data inside one argument, not a command separator.
+        No transport can preserve it: measured, the .cmd ran each line as its own
+        command (`lbl='X'` became a command, "'lbl' is not recognized") and the
+        batch STILL exited 0, turning a loud inline SyntaxError into a silent
+        success with garbage output. So this shape is left inline to fail loudly,
+        and the hint below names the fix that actually works (write a .py file).
+
+        Unbalanced quotes simply leave the flag set, which is the safe answer.
+        """
+        quoted = False
+        for ch in command:
+            if ch == '"':
+                quoted = not quoted
+            elif ch == "\n" and quoted:
+                return True
+        return False
+
+    def _tool_run_shell(self, command: str = "", timeout: Any = None,
+                        use_script_file: Any = None) -> str:
         """Run ONE shell command line, stateless (SOW #6).
 
         SECURITY POSTURE - read before changing anything here. This is
@@ -10756,20 +13740,67 @@ class DeskpilotApp:
             limit = float(SHELL_TIMEOUT)
         limit = min(limit, float(SHELL_TIMEOUT_MAX))
 
+        script_path = None
+        # Must be initialised: on the ordinary Windows path (no reroute) nothing
+        # else assigns it before the `if argv is None` fallback below.
+        argv = None
+        inline_truncated = False
         if os.name == "nt":
-            # cmd.exe parses the command line itself; passing it as ONE list
-            # element avoids Python doing a second, different quoting pass.
-            # ⚠️ cmd.exe /c strips a matched pair of OUTER quotes, so a command
-            # that begins with " needs the `cmd /c "..."` form handled by the
-            # caller; documented in the tool description rather than patched here.
-            argv = [os.environ.get("ComSpec") or "cmd.exe", "/c", command]
+            # v1.1.85: the command line goes to CreateProcess VERBATIM - a STRING,
+            # not a list. As a list, subprocess.list2cmdline() re-quotes it and
+            # escapes every inner '"' as \", a convention cmd.exe does not
+            # implement. Measured on this machine: `python -c "print(2+2)"` reached
+            # python mangled, opened a REPL on the closed stdin and exited 0 with
+            # NO output - a silent no-op on the most common command shape there is,
+            # reported as success. `echo "a b"` printed literal \"a b\". The string
+            # form also makes genuinely broken quoting fail LOUDLY (rc=1) instead of
+            # silently returning rc=0. cmd still parses the command itself, so no
+            # second shell is involved and nothing is split on spaces here.
+            #
+            # v1.1.83 closed a false comment (the outer-quote caveat was claimed to
+            # be "documented in the tool description" and was not); the description
+            # now states the rules, and the shapes cmd provably cannot handle are
+            # either refused up front or run from a temp .cmd.
+            if self._newline_inside_quotes(command):
+                # cmd truncates its input at the first newline, so a newline inside
+                # a quoted argument cannot reach the program by ANY transport - and
+                # under the string form it fails SILENTLY (rc=0, empty output), so
+                # there is no failure to detect afterwards. Refuse before running
+                # rather than report a success that never happened.
+                return ("ERROR: cmd.exe cannot pass a NEWLINE inside a quoted "
+                        "argument to a program - it truncates its input at the first "
+                        "newline, and a batch file would run each line as its own "
+                        "command, so use_script_file would not help either. Write the "
+                        "code to a .py file with write_local_file and run that file "
+                        "instead.")
+            run_as_script = _as_bool(use_script_file) or self._shell_wants_script(command)
+            if run_as_script:
+                argv, script_path = self._shell_script_argv(command)
+                if argv is None:
+                    # Could not build the script; fall through to inline rather
+                    # than fail the call outright.
+                    script_path, argv = None, None
+            if argv is None:
+                argv = '"%s" /c %s' % (os.environ.get("ComSpec") or "cmd.exe",
+                                       command)
+                # Inline + a newline == cmd ran line 1 only (a quoted newline was
+                # refused above, so any newline here is a separator). Set here, not
+                # from _shell_wants_script, so the fallback above counts too.
+                inline_truncated = "\n" in command
         else:
             argv = ["/bin/sh", "-c", command]
 
         try:
-            p = self._run_cancellable(argv, limit,
-                                      abort=self._abort_requested,
-                                      cwd=self._subprocess_cwd())
+            try:
+                p = self._run_cancellable(argv, limit,
+                                          abort=self._abort_requested,
+                                          cwd=self._subprocess_cwd())
+            finally:
+                if script_path:
+                    try:
+                        os.unlink(script_path)
+                    except OSError:
+                        pass      # temp file; a failed cleanup must not fail the call
         except FileNotFoundError as e:
             return f"ERROR: Shell executable not found ({e})."
         except Exception as e:
@@ -10807,9 +13838,43 @@ class DeskpilotApp:
         body = "\n".join(parts) or "(no output)"
         rc = p.returncode
         if rc == 0:
+            # A batch file's exit code is its LAST line's, so in a rerouted
+            # multi-line command a failing middle line still reports rc=0. The
+            # stderr text is already above, but without a marker that reads as
+            # success - which is the exact failure class this whole feature
+            # exists to remove. Only fires on the script path with stderr.
+            if script_path and err.strip():
+                body += ("\n\n[Note: exit code 0 came from the LAST line only - a "
+                         "batch file does not propagate earlier failures. Check the "
+                         "stderr above before treating this as a success.]")
+            elif inline_truncated:
+                # The one shape the reroute could not take (a '%' in the command,
+                # which batch would reinterpret) still loses every line after the
+                # first when run inline, and cmd reports that as success. Certain,
+                # not a guess: measured, `echo one\necho two` inline prints only
+                # "one" with rc=0. Say so rather than let it read as done.
+                body += ("\n\n[WARNING: this ran inline, so cmd executed ONLY THE "
+                         "FIRST LINE and reported success - the remaining lines did "
+                         "not run. It was kept inline because it contains '%', which "
+                         "a batch file would reinterpret as a variable. Rewrite it as "
+                         "a .cmd file with write_local_file (doubling any literal '%' "
+                         "to '%%') and run that file, or split it into one call per "
+                         "line.]")
             return body
         # The exit code must be visible: a silent non-zero exit is how a failed
         # build or a missing binary gets read as success.
+        #
+        # A failure that LOOKS like cmd ate the quotes gets one pointer at the
+        # escape hatch. This only appends to an already-failing result; it never
+        # changes what ran - guessing at the model's intent would be worse than
+        # telling it what the tool can do.
+        if os.name == "nt" and not script_path \
+                and self._SHELL_QUOTE_FAIL_RE.search(err or ""):
+            body += ("\n\n[This looks like a cmd.exe quoting failure, not a failing "
+                     "program. Re-issue with use_script_file=true, or write the code "
+                     "to a .py file and run that. Do not keep re-quoting inline: cmd "
+                     "strips one matched pair of outer quotes, so a command that "
+                     "STARTS with a quote cannot work inline.]")
         return f"{body}\n\n[exit code {rc}]"
 
     def _safe_path(self, raw_path: str) -> Path:
@@ -10827,6 +13892,21 @@ class DeskpilotApp:
         bad = _traversal_component(expanded)
         if bad is not None:
             raise PermissionError(f"path traversal blocked ('..' not allowed): {raw!r}")
+        # v1.1.89: a RELATIVE path is anchored to the workspace, not to os.getcwd().
+        # Path("rel").resolve() resolves against the process CWD, and a GUI app started
+        # from a Start-Menu or Desktop shortcut has a CWD the user never chose - often
+        # C:\Windows\System32 or the install folder. Every relative path then resolved
+        # OUTSIDE the configured File Workspace and was refused as "outside the allowed
+        # file workspace", while the tool schemas actively encourage relative paths
+        # ("prefer paths relative to it"). It only worked when the app happened to be
+        # launched from inside the workspace, which is why it survived testing here.
+        # It also disagreed with _project_for_path(), which already anchors to
+        # default_workspace_root() - so the same relative path could name a project to
+        # the top bar while the file tool refused to open it. The traversal check above
+        # still runs on the RAW string, before any joining, so this cannot smuggle a
+        # '..' past it. Absolute paths are untouched.
+        if not os.path.isabs(expanded):
+            expanded = str(default_workspace_root() / expanded)
         pth = Path(expanded).resolve()
         p_str = str(pth).lower()
         hit = _forbidden_dir_hit(p_str)
@@ -11745,7 +14825,7 @@ class DeskpilotApp:
         dirs = _skill_dirs(self.settings)
         if not dirs:
             return ("No skills folder exists yet. Create one at "
-                    f"{USER_WORKSPACE_ROOT / SKILLS_SUBDIR} with a <skill name>/{SKILL_FILE_NAME} "
+                    f"{default_workspace_root() / SKILLS_SUBDIR} with a <skill name>/{SKILL_FILE_NAME} "
                     "inside it, or point Settings -> Skills folder at an existing one.")
         skills = _discover_skills(self.settings)
         lines = ["Skill folders scanned (highest priority first):"]
@@ -11800,11 +14880,15 @@ class DeskpilotApp:
         q = str(query or "").strip()
         if not q:
             return "ERROR: search_chats needs a query."
+        # `limit` is LLM-supplied: clamp it, and honour it on BOTH paths. Each branch
+        # used to hardcode SEARCH_MAX_SNIPPETS, so a request for 3 hits silently got 12
+        # and _search_limit() was dead code from here.
+        _lim = _search_limit(limit)
         if not self._ensure_search_index():
-            hits = _search_group_by_chat(_search_chats_scan(self.chats, q, SEARCH_MAX_SNIPPETS))
+            hits = _search_group_by_chat(_search_chats_scan(self.chats, q, _lim))
             note = " (no FTS index available - plain substring scan)"
         else:
-            hits = _search_group_by_chat(search_chats(self.chats, q, SEARCH_MAX_SNIPPETS))
+            hits = _search_group_by_chat(search_chats(self.chats, q, _lim))
             note = ""
         if not hits:
             return f"No chat history matches {q!r}."
@@ -11841,7 +14925,9 @@ class DeskpilotApp:
         messages with a summary, and a summary is a lossy view of what actually happened.
         This makes the originals reachable by the agent, not just by the user reading the
         📦 drawer in the UI."""
-        cid = str(chat_id or "").strip() or str(self.current_chat_id or "")
+        # v1.1.88: defaults to the running chat, not the visible one (see _tool_remember).
+        cid = (str(chat_id or "").strip()
+               or str(self._run_chat_id or self.current_chat_id or ""))
         chat = (self.chats.get("chats") or {}).get(cid)
         if not isinstance(chat, dict):
             return (f"ERROR: no chat with id {cid!r}. Omit chat_id to read the current "
@@ -11944,7 +15030,13 @@ class DeskpilotApp:
             return (f"ERROR: that is {len(body)} chars, over the {LEDGER_ENTRY_MAX_CHARS}-char "
                     f"limit. Split it into separate remember() calls, one fact each - nothing "
                     f"was written.")
-        cid = "" if _as_bool(global_) else str(self.current_chat_id or "")
+        # v1.1.88: default to the chat RUNNING this turn. A ledger note is append-only
+        # and permanent, so writing it to whatever chat the user switched to is worse
+        # than a wrong chat title: it is silent, unrecoverable, and it pollutes a chat
+        # that never made the claim. (NB: clicking + New Chat does NOT leave
+        # current_chat_id empty - new_chat() calls load_chat(), which sets it - so the
+        # old code silently succeeded into the brand-new chat instead of erroring.)
+        cid = "" if _as_bool(global_) else str(self._run_chat_id or self.current_chat_id or "")
         if not cid and not _as_bool(global_):
             return "ERROR: no current chat to attach this note to."
         entry = _ledger_append(cid, body, tags, source="model")
@@ -11963,7 +15055,10 @@ class DeskpilotApp:
                           limit: int = LEDGER_PAGE_DEFAULT, offset: int = 0) -> str:
         """Page through a ledger, newest first, optionally filtered."""
         want_star = str(chat_id or "").strip() == "*"
-        cid = "" if want_star else (str(chat_id or "").strip() or str(self.current_chat_id or ""))
+        # v1.1.88: an omitted chat_id means "the chat I am running in", not "whatever is
+        # on screen" - see _tool_remember for why that distinction matters mid-turn.
+        cid = "" if want_star else (str(chat_id or "").strip()
+                                    or str(self._run_chat_id or self.current_chat_id or ""))
         if not want_star and not cid:
             return "ERROR: no current chat. Pass chat_id, or \"*\" for the global ledger."
         entries = _ledger_read_raw(cid)
@@ -12005,6 +15100,250 @@ class DeskpilotApp:
         else:
             lines.append("\nEnd of ledger.")
         return "\n".join(lines)
+
+    def _tool_set_project(self, name: str = "", description: str = "",
+                          entry_point: str = "", rename_from: str = "",
+                          force_new: bool = False) -> str:
+        """Declare the active project for the current chat.
+
+        Runs on the WORKER thread, so it must not touch self.chats (invariant #4) -
+        the chat field is written by a posted callback on the main thread. Everything
+        it does to disk (folder, memory stub, index row) is workspace state rather
+        than app state, so that part is done inline and reported back.
+        """
+        name = str(name or "").strip()
+        if not name:
+            return "ERROR: name is required (a project name or existing folder)."
+        canonical, path, existed = resolve_project(name)
+        if not canonical:
+            return (f"ERROR: {name!r} is not a usable project name "
+                    f"(max {PROJECT_SLUG_MAX} chars, no '..').")
+        # Defence in depth against escaping <workspace>/projects/. project_key
+        # already rejects '..', and `path` is built by joining onto the root, so
+        # this should never fire - but it creates folders, so it checks. Both
+        # sides are resolved: comparing a resolved root against an unresolved path
+        # would report a legitimate path as an escape.
+        root = projects_root()
+        try:
+            path.resolve().relative_to(root.resolve())
+        except ValueError:
+            return f"ERROR: {name!r} resolves outside the projects folder."
+
+        old = project_key(rename_from)
+
+        # A near-miss name is far more often a typo than a new project, and the
+        # costs are asymmetric: adopting the real name costs one re-call, while a
+        # near-duplicate splits one project's memory across two folders that both
+        # look authoritative afterwards. This exact thing happened 2026-10-16 -
+        # 'Price-Stock_Monitor' created a second Sentinel project beside the real
+        # 'Price-Stock_Montor'. So propose rather than guess; close_project()
+        # documents why no similarity threshold can separate a typo from a
+        # deliberate new name on its own. Skipped while renaming, where a fresh
+        # non-existent name is the normal case.
+        if not existed and not old and not _as_bool(force_new):
+            near = close_project(name)
+            if near:
+                opts = "; ".join(f"{n!r} ({ratio:.0%} similar)"
+                                 for n, ratio in near)
+                return (f"NOT SET: {name!r} is not an existing project, but "
+                        f"{opts}. If you meant one of those, call set_project "
+                        f"again with that exact name. If "
+                        f"{project_key(name)!r} really is a new project, call "
+                        f"again with force_new=true.")
+
+        renamed = False
+        if old and old != project_key(canonical):
+            src = resolve_project(old)[1] if project_key(old) else None
+            if src is None or not src.is_dir():
+                return f"ERROR: rename_from={rename_from!r} does not match a project folder."
+            if path.exists():
+                return f"ERROR: cannot rename {old!r} -> {canonical!r}: {canonical} already exists."
+            try:
+                src.rename(path)
+                renamed = True
+            except OSError as e:
+                # Almost always a lock: the user has a file open in an editor, or an
+                # agent process is running with that cwd. Say so rather than retry.
+                return f"ERROR: rename failed: {e}"
+
+        created_folder = False
+        if not existed and not renamed:
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                created_folder = True
+            except OSError as e:
+                return f"ERROR: could not create {path}: {e}"
+
+        mem = project_memory_path(canonical)
+        made_stub = False
+        if not mem.exists():
+            stub = (f"# {canonical} — Project Memory\n\n"
+                    f"**What it is:** {str(description or '').strip() or 'TODO: one line.'}\n\n"
+                    f"**Entry point:** {entry_point or 'TODO'}\n\n"
+                    f"## Current state\n\n- Created {datetime.now():%Y-%m-%d} by DeskPilot.\n\n"
+                    f"## Rules settled here\n\n- (none yet)\n\n"
+                    f"## Notes\n\n- Session status belongs in the app ledger, not here.\n"
+                    f"- If this file outgrows ~15 KB, SPLIT it: move detail to a "
+                    f"sibling file (HARDWARE.md, RULES.md, history/<topic>.md) and "
+                    f"leave a row here saying what lives where. Never delete or "
+                    f"compress a fact to hit a size target - that loses it.\n")
+            try:
+                mem.write_text(stub.replace("\n", "\r\n"), encoding="utf-8", newline="")
+                made_stub = True
+            except OSError as e:
+                # Not fatal: the project is still set and visible. Report it so the
+                # model can write the file itself instead of assuming one exists.
+                return f"WARNING: project set to {canonical!r} but MEMORY.md failed: {e}"
+
+        # Index row: written by the app, not by the model, because a table row is a
+        # mechanical insert and code does it identically every time.
+        idx_path = project_memory_file(self.settings)
+        index_note = ""
+        try:
+            raw = idx_path.read_bytes()
+            crlf = b"\r\n" in raw
+            text = raw.decode("utf-8", "replace").replace("\r\n", "\n")
+            new_text, action = index_upsert_project(
+                text, canonical, description, entry_point,
+                resolve_project(rename_from)[0] if rename_from else "")
+            if action in ("created", "renamed"):
+                if crlf:
+                    new_text = new_text.replace("\n", "\r\n")
+                idx_path.write_bytes(new_text.encode("utf-8"))
+                index_note = f" Index row {action}."
+            elif action == "no-table":
+                index_note = (" ⚠ the workspace index has no project table to add a "
+                              f"row to - add `| `projects/{canonical}/` | … |` manually.")
+        except OSError as e:
+            index_note = f" ⚠ index row failed: {e}"
+
+        # Chat field + top bar: main thread only.
+        # v1.1.88: bind the chat that RAN this tool, for the same reason as
+        # _note_project_activity - a background turn must not retitle the chat the
+        # user happens to be looking at.
+        _own_cid = self._run_chat_id or self.current_chat_id
+        self._post(lambda c=canonical, o=(old if renamed else ""), k=_own_cid:
+                   self._set_active_project(c, o, chat_id=k))
+
+        bits = [f"Active project: {canonical}"]
+        if renamed:
+            bits.append(f"renamed folder from {old}")
+        elif created_folder:
+            bits.append(f"created {PROJECT_MEMORY_SUBDIR}/{canonical}/")
+        elif existed:
+            bits.append("existing project")
+        if made_stub:
+            bits.append(f"wrote {PROJECT_MEMORY_SUBDIR}/{canonical}/{PROJECT_MEMORY_NAME}")
+        bits.append(f"memory at {PROJECT_MEMORY_SUBDIR}/{canonical}/{PROJECT_MEMORY_NAME}")
+        return " · ".join(bits) + index_note
+
+    def _set_active_project(self, name: str, renamed_from: str = "",
+                            chat_id: Optional[str] = None) -> None:
+        """MAIN THREAD. Store the project on a chat and repaint the label.
+
+        chat_id: the chat this declaration belongs to. Defaults to the one on screen.
+        A worker-thread caller MUST pass the id of the chat running its turn
+        (self._run_chat_id), because the user may have switched chats between the
+        _post and this callback draining - and then the project of the running chat
+        would be written onto an unrelated one.
+
+        The repaint is deliberately NOT scoped to chat_id: _update_project_topbar()
+        reads current_chat_id itself, so updating a background chat's field leaves the
+        visible bar alone, and load_chat() repaints when the user switches back. Both
+        halves matter - painting the background chat's project while Chat B is on screen
+        would be its own bug.
+
+        renamed_from: when a rename just moved the folder, every OTHER chat still
+        holding the old name is repointed in the same pass. Without this the rename
+        would strand them on a folder that no longer exists, and their next request
+        would inject a path to a MEMORY.md that is not there.
+        """
+        target_cid = chat_id or self.current_chat_id
+        chat = (self.chats.get("chats") or {}).get(target_cid) if target_cid else None
+        if chat is None:
+            # Welcome screen: no chat to write to, so remember it for the chat that
+            # is about to be created. Only here - setting it unconditionally would
+            # make every later "New Chat" inherit the last project used, which is a
+            # surprising side effect of merely having worked somewhere earlier. And
+            # only when NO id was given: a named-but-missing chat (deleted mid-turn)
+            # must not leak its project into the next unrelated New Chat.
+            if not target_cid:
+                self._pending_project = name
+                self._update_project_topbar()
+            return
+        changed = False
+        if renamed_from:
+            want = project_key(renamed_from)
+            for c in (self.chats.get("chats") or {}).values():
+                if isinstance(c, dict) and project_key(c.get("project") or "") == want:
+                    c["project"] = name
+                    changed = True
+        if chat.get("project") != name:
+            chat["project"] = name
+            changed = True
+        if changed:
+            save_chats(self.chats)
+        # Reaching this method IS the activity signal: it is called by set_project()
+        # and by _note_project_activity(), i.e. a declaration or real file traffic.
+        # Marked on the TARGET chat, not the visible one - the top bar gates on this
+        # set, so adding the wrong id would light the wrong chat's bar.
+        if target_cid:
+            self._project_active_chats.add(target_cid)
+        self._update_project_topbar()
+
+    def _update_project_topbar(self) -> None:
+        """Top bar shows the project being WORKED ON, or NOTHING.
+
+        Blank by default, on purpose (changed 2026-10-16 at the user's request).
+        The previous behaviour painted a dim "no project" on every chat, which
+        read as a status but was really the absence of one - it occupied the same
+        visual slot as a real project, so the bar was never empty and a user
+        could not tell "working on nothing" from "working on something" without
+        reading the words. The label now appears only when there is a project,
+        which makes presence itself the signal.
+
+        The earlier justification for always showing something - that a model
+        which forgot to declare would otherwise be invisible - no longer holds,
+        because the app now infers the project from what the tools actually touch
+        (see _note_project_activity) instead of depending on a declaration.
+
+        "Has a project" means ACTIVE this session, not "has the field set". The
+        second cut of this rule still lit up on merely clicking a past conversation,
+        because every chat that ever declared a project has it saved forever, so
+        browsing history looked identical to working. Reading an old chat is not
+        working in it, so the name is gated on _project_active_chats: a chat joins
+        that set when set_project() names it or a file tool touches its folder, and
+        the set is in-memory, so a fresh app session starts dark.
+        """
+        lbl = getattr(self, "project_top_label", None)
+        if lbl is None:
+            return
+        try:
+            cid = self.current_chat_id
+            if cid is None:
+                # Welcome screen: no chat to gate on. _pending_project is only ever
+                # set by a set_project() call made in this session, so it is active
+                # by construction - gating it would blank the bar during the exact
+                # turn that declares the project, before new_chat() hands off.
+                name = self._pending_project or ""
+            elif cid in self._project_active_chats:
+                name = chat_project(self.current_chat())
+            else:
+                name = ""
+            # The label stays packed and simply goes empty. pack_forget() was the
+            # first attempt and is wrong: re-packing appends to the END of the
+            # pack order, so a label that reappears would land on the far side of
+            # the status/speed/context/temperature group and reshuffle the bar.
+            # An empty label costs its 12 px pad and nothing else.
+            # fg must be configured on every paint, not just at creation: the label
+            # is built dim (its empty state), so a project declared later would
+            # otherwise render in the same dim grey as the status/speed labels and
+            # never turn green. Both keys go in one call so a partial repaint is
+            # impossible.
+            lbl.configure(text=(f"\U0001F4C1 {name}" if name else ""),
+                          fg=(COL["success"] if name else COL["text_dim"]))
+        except tk.TclError:
+            pass
 
     def _tool_set_clipboard(self, text: str = "") -> str:
         """Put text on the system clipboard. Tk access is main-thread only, so this
@@ -12399,6 +15738,7 @@ class DeskpilotApp:
             prefix = "" if not existing else (" " if not existing.endswith((" ", "\n")) else "")
             self.input_text.insert("end-1c", prefix + text)
             self._see_input("end")      # keep the newest dictated phrase visible
+            self._spell_schedule()      # dictation arrives with no KeyRelease
             self._mic_phrases += 1
             self._set_status(self._mic_status())
         except tk.TclError:
@@ -12677,15 +16017,19 @@ class DeskpilotApp:
             ("Handoff re-arm % (grow this much more before summarizing again; 0 = every step)", "handoff_rearm_pct"),
             ("Handoff notes folder (blank = app working folder; one file per handoff)", "handoff_notes_dir"),
             ("Compaction threshold % (summarize old messages in-place at this usage; keep <= Handoff threshold so it fires first; 0 = off)", "compaction_threshold"),
-            ("Compaction keep-recent (most recent messages kept verbatim when compacting)", "compaction_keep_recent"),
+            ("Compaction keep-recent (most recent messages kept verbatim when compacting; 2-200)", "compaction_keep_recent"),
+            ("Tool results kept verbatim (newest N tool outputs re-sent in full; older ones become short stubs. 0 = off, nothing is deleted from the chat)", "tool_keep_verbatim"),
+            ("Tool-economy nudge every N steps (advisory note to the model inside a long tool loop; 0 = off, it never ends a turn)", "tool_nudge_every"),
             ("Chat render window (messages shown per chat view; older ones behind 'Load earlier messages'; 0 = show all)", "chat_render_window"),
             ("Ledger in system prompt (chars of append-only notes injected each request; 0 = off, read_ledger() still reaches them)", "ledger_inject_chars"),
             ("Project memory index (chars of the workspace MEMORY.md injected each request; 0 = off)", "project_memory_chars"),
             ("Project memory file (blank = <workspace>/MEMORY.md)", "project_memory_file"),
+            ("Active project memory (chars of the ACTIVE project's own MEMORY.md injected each request; 0 = off)", "project_memory_project_chars"),
             ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
             ("Allow Local Network (fetch_url)", "allow_local_network"),
+            ("Spell Check (input box)", "spellcheck_enabled"),
             ("MCP Servers (stdio subprocesses; tools appear in the permission bar)", "mcp_servers"),
             ("Skills folder (extra folder scanned for SKILL.md skills; blank = <workspace>/skills only)", "skills_dir"),
             # Consultant (ask_expert). Independent of the three rows above: the
@@ -12698,7 +16042,10 @@ class DeskpilotApp:
         model_combo: Optional[ttk.Combobox] = None
         expert_combo: Optional[ttk.Combobox] = None
         local_net_var: Optional[tk.BooleanVar] = None
+        spell_var: Optional[tk.BooleanVar] = None
         _note_var: Optional[tk.BooleanVar] = None
+        _studio_tools_var: Optional[tk.BooleanVar] = None
+        _studio_samp_var: Optional[tk.BooleanVar] = None
         custom_prompt_text: Optional[tk.Text] = None
         cp_enabled_var: Optional[tk.BooleanVar] = None
         for i, (label, key) in enumerate(rows):
@@ -12745,6 +16092,27 @@ class DeskpilotApp:
                                activebackground=COL["bg_main"], activeforeground=COL["text"],
                                selectcolor=COL["bg_deep"], font=F(9)) \
                     .grid(row=len(SAMPLING_SCHEMA), column=0, columnspan=2, sticky="w", pady=(4, 0))
+                # Studio mode (v1.1.77): the two switches that decide HOW MUCH the per-chat
+                # checkbox strips. They live here, beside the samplers Studio overrides,
+                # because that is where a user looking for "why is Studio doing this" lands.
+                _row_st = len(SAMPLING_SCHEMA) + 1
+                _studio_tools_var = tk.BooleanVar(
+                    value=bool(self.settings.get("studio_tools_off", True)))
+                tk.Checkbutton(samp_frame,
+                               text="Studio mode: withhold tool schemas (chips turn red). Click a red chip "
+                                    "to grant that tool for this chat. Uncheck to keep all tools available",
+                               variable=_studio_tools_var, bg=COL["bg_main"], fg=COL["text_dim"],
+                               activebackground=COL["bg_main"], activeforeground=COL["text"],
+                               selectcolor=COL["bg_deep"], font=F(9)) \
+                    .grid(row=_row_st, column=0, columnspan=2, sticky="w", pady=(4, 0))
+                _studio_samp_var = tk.BooleanVar(
+                    value=bool(self.settings.get("studio_sampling", True)))
+                tk.Checkbutton(samp_frame,
+                               text=f"Studio mode: loosen sampling (top_k 80, temperature {STUDIO_TEMPERATURE})",
+                               variable=_studio_samp_var, bg=COL["bg_main"], fg=COL["text_dim"],
+                               activebackground=COL["bg_main"], activeforeground=COL["text"],
+                               selectcolor=COL["bg_deep"], font=F(9)) \
+                    .grid(row=_row_st + 1, column=0, columnspan=2, sticky="w", pady=(0, 0))
                 # Tier 3 (v1.1.10): behavioural probe for the six keys above. It reports EVIDENCE from tiny
                 # bounded requests into a read-only box - it writes NOTHING to chat history, chats.json or
                 # settings, and lives inside this sub-frame, so the dialog's own plain-Entry count is unchanged.
@@ -12753,8 +16121,8 @@ class DeskpilotApp:
                    cursor="hand2", command=lambda: self._verify_sampling(verify_btn, verify_out))
                 verify_out = tk.Text(samp_frame, width=58, height=6, wrap="word", state="disabled",
                    bg=COL["bg_deep"], fg=COL["text_dim"], insertbackground=COL["text"], relief="flat", font=F(9))
-                verify_btn.grid(row=len(SAMPLING_SCHEMA) + 1, column=0, sticky="w", pady=(6, 0))
-                verify_out.grid(row=len(SAMPLING_SCHEMA) + 2, column=0, columnspan=2, sticky="ew", pady=(4, 0))
+                verify_btn.grid(row=len(SAMPLING_SCHEMA) + 3, column=0, sticky="w", pady=(6, 0))
+                verify_out.grid(row=len(SAMPLING_SCHEMA) + 4, column=0, columnspan=2, sticky="ew", pady=(4, 0))
                 continue
             if key == "model_name":
                 # Editable combobox: dropdown of live server models + previously
@@ -12829,6 +16197,36 @@ class DeskpilotApp:
                                activebackground=COL["bg_main"], activeforeground=COL["text"],
                                selectcolor=COL["bg_deep"], font=F(11)) \
                     .grid(row=i, column=1, sticky="w", pady=6, padx=(0, 8))
+                continue
+            if key == "spellcheck_enabled":
+                # Input box ONLY - model output is markdown and code, and no other
+                # surface here is the user's prose. Off by default, and unavailable
+                # without pyspellchecker (say so rather than show a dead checkbox).
+                spell_var = tk.BooleanVar(value=bool(self.settings.get("spellcheck_enabled", False)))
+                if SpellChecker is None:
+                    _sp_txt = ("Underline suspected misspellings while you type  "
+                               "(needs: pip install pyspellchecker \u2014 not installed)")
+                else:
+                    _n = len(self.settings.get("spellcheck_words") or [])
+                    _sp_txt = ("Underline suspected misspellings in the message box "
+                               "(right-click an underlined word to fix it)")
+                    if _n:
+                        _sp_txt += f" - saved word list: {_n} word{_n == 1 and '' or 's'}"
+                    else:
+                        _sp_txt += " - your saved word list is empty"
+                _sp_cb = tk.Checkbutton(inner, text=_sp_txt, variable=spell_var,
+                                        bg=COL["bg_main"], fg=COL["text"] if SpellChecker else COL["text_dim"],
+                                        activebackground=COL["bg_main"], activeforeground=COL["text"],
+                                        selectcolor=COL["bg_deep"], font=F(11),
+                                        state=("normal" if SpellChecker else "disabled"))
+                _sp_cb.grid(row=i, column=1, sticky="w", pady=6, padx=(0, 8))
+                if SpellChecker is not None:
+                    def _spell_toggle(_v=spell_var) -> None:
+                        """Apply live - no dialog close/reopen needed to see it work."""
+                        self.settings["spellcheck_enabled"] = bool(_v.get())
+                        save_settings(self.settings)
+                        self._spell_apply_state()
+                    _sp_cb.configure(command=_spell_toggle)
                 continue
             # P7: the two folder-picker rows get their sub-frame HERE (at their row
             # position in the loop) so the dialog's child order stays exactly the row
@@ -12919,7 +16317,7 @@ class DeskpilotApp:
         def _browse_skills() -> None:
             cur = entries["skills_dir"].get().strip()
             d = filedialog.askdirectory(parent=top, title="Choose the extra skills folder",
-                                        initialdir=(cur or str(USER_WORKSPACE_ROOT / SKILLS_SUBDIR)))
+                                        initialdir=(cur or str(default_workspace_root() / SKILLS_SUBDIR)))
             if d:
                 entries["skills_dir"].delete(0, "end")
                 entries["skills_dir"].insert(0, d)
@@ -13248,7 +16646,7 @@ class DeskpilotApp:
                         f"{APP_NAME} - Skills folder",
                         "That folder cannot be used for skills:\n\n"
                         f"{e}\n\nLeave the field blank to scan only the app defaults: "
-                        f"{USER_WORKSPACE_ROOT / SKILLS_SUBDIR}")
+                        f"{default_workspace_root() / SKILLS_SUBDIR}")
                     return
             # Custom System Prompt: multi-line text box (not a plain entry).
             # Validate BEFORE mutating self.settings so an over-limit prompt's early
@@ -13267,6 +16665,8 @@ class DeskpilotApp:
                 self.settings["custom_system_prompt_enabled"] = bool(cp_enabled_var.get())
             if local_net_var is not None:
                 self.settings["allow_local_network"] = bool(local_net_var.get())
+            if spell_var is not None:
+                self.settings["spellcheck_enabled"] = bool(spell_var.get())
             # Model Name comes from the combobox (editable - free typing still works),
             # then resolved to the exact server ID: a display name or an id missing its
             # namespace prefix would otherwise 404 at chat time.
@@ -13337,12 +16737,30 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 ct = COMPACTION_THRESHOLD_DEFAULT
             self.settings["compaction_threshold"] = max(0, min(95, ct))
-            # Compaction keep-recent: message count, clamped to 2..50 (invalid -> default).
+            # Compaction keep-recent: message count, clamped to 2..COMPACTION_KEEP_RECENT_MAX
+            # (invalid -> default). The ceiling was raised from 50 in v1.1.75 so a user on a
+            # 512K window can keep a whole long agentic turn verbatim.
             try:
                 ck = int(float(self.settings.get("compaction_keep_recent", COMPACTION_KEEP_RECENT_DEFAULT)))
             except (TypeError, ValueError):
                 ck = COMPACTION_KEEP_RECENT_DEFAULT
-            self.settings["compaction_keep_recent"] = max(2, min(50, ck))
+            self.settings["compaction_keep_recent"] = max(2, min(COMPACTION_KEEP_RECENT_MAX, ck))
+            # Tool-result eviction window (v1.1.75): count of newest tool results re-sent in
+            # full. 0 = OFF (every result stays in the request, the pre-v1.1.75 behaviour).
+            # _tool_keep_verbatim() clamps again at read time, so a hand-edited settings file
+            # cannot make a request carry an unbounded window.
+            try:
+                _tk = int(float(self.settings.get("tool_keep_verbatim", TOOL_KEEP_VERBATIM_DEFAULT)))
+            except (TypeError, ValueError):
+                _tk = TOOL_KEEP_VERBATIM_DEFAULT
+            self.settings["tool_keep_verbatim"] = max(0, min(TOOL_KEEP_VERBATIM_MAX, _tk))
+            # Tool-economy nudge interval (v1.1.75): advisory only, never ends a turn.
+            # 0 = OFF. Same clamp-again-at-read-time rule.
+            try:
+                _tn = int(float(self.settings.get("tool_nudge_every", TOOL_NUDGE_EVERY_DEFAULT)))
+            except (TypeError, ValueError):
+                _tn = TOOL_NUDGE_EVERY_DEFAULT
+            self.settings["tool_nudge_every"] = max(0, min(TOOL_NUDGE_EVERY_MAX, _tn))
             # Chat render window: message count, clamped to 0..2000 (invalid -> default).
             try:
                 _rw = int(float(self.settings.get("chat_render_window", CHAT_RENDER_WINDOW_DEFAULT)))
@@ -13367,6 +16785,16 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 _pm = PROJECT_MEMORY_DEFAULT
             self.settings["project_memory_chars"] = max(0, min(PROJECT_MEMORY_MAX, _pm))
+            # Active project memory budget: same clamp shape, and 0 = OFF. Clamped again
+            # at read time, so a hand-edited settings file cannot make every request
+            # carry an unbounded project memory.
+            try:
+                _pmp = int(float(self.settings.get("project_memory_project_chars",
+                                                   PROJECT_MEMORY_PROJECT_DEFAULT)))
+            except (TypeError, ValueError):
+                _pmp = PROJECT_MEMORY_PROJECT_DEFAULT
+            self.settings["project_memory_project_chars"] = max(
+                0, min(PROJECT_MEMORY_PROJECT_MAX, _pmp))
             # Sampling: coerce + clamp each field; blank/garbage -> "" (key omitted from requests).
             _samp: Dict[str, Any] = {}
             for _sk, _sl, _lo, _hi, _si, _st, _so in SAMPLING_SCHEMA:
@@ -13379,6 +16807,19 @@ class DeskpilotApp:
                 self.settings.pop(_sk, None)
             if _note_var is not None:
                 self.settings["show_sampling_note"] = bool(_note_var.get())
+            if _studio_tools_var is not None:
+                self.settings["studio_tools_off"] = bool(_studio_tools_var.get())
+            if _studio_samp_var is not None:
+                self.settings["studio_sampling"] = bool(_studio_samp_var.get())
+            # Studio may have just stopped withholding tools (or started): the bar must
+            # match the request the next send will build, not the one from before the save.
+            if hasattr(self, "studio_check"):
+                self._refresh_perm_colors()
+            # The dialog has its own "Enable" checkbox for the custom prompt; the
+            # toolbar now shows the same setting, so a save must re-sync it or the
+            # two controls visibly disagree until the next chat switch.
+            if hasattr(self, "prompt_check"):
+                self._sync_prompt_check()
             # MCP servers may have been added/removed in the dialog: reconnect
             # everything so the permission bar matches the saved configuration.
             self._mcp_connect_all()
@@ -13929,19 +17370,41 @@ class DeskpilotApp:
                      bg=COL["bg_main"], fg=COL["text_dim"], font=F(10), width=22,
                      anchor="w").pack(side="left")
             enum = spec.get("enum")
+            # Store the schema type VERBATIM. This used to rewrite "boolean" to
+            # "bool" here while submit() below still tested kind == "boolean", so
+            # every boolean answer fell through to the string branch and was sent
+            # to the MCP server as "true" instead of true - which strict servers
+            # reject as a schema violation. Keeping one spelling on both sides is
+            # the fix; a `kind in ("bool", "boolean")` patch would leave the two
+            # vocabularies in the file to drift apart again.
+            kind = str(spec.get("type") or "string")
             if isinstance(enum, list) and enum:
                 vals = [str(v) for v in enum]
                 combo = ttk.Combobox(row, values=vals, state="readonly", width=28)
                 combo.set(vals[0])
                 combo.pack(side="left", fill="x", expand=True)
                 fields.append((key, "enum", combo))
+            elif kind == "boolean":
+                # v1.1.88: a real checkbox. submit() only ever calls .get() on the
+                # third element of `fields`, and a Tk Variable HAS .get(), so the
+                # IntVar itself is stored - no adapter widget needed.
+                # An IntVar rather than a BooleanVar because submit() stringifies
+                # before comparing: BooleanVar.get() returns a bool and str(True)
+                # is "True", which the lower-cased truth list below happens to
+                # accept - but the int form keeps ONE spelling ("0"/"1") for every
+                # widget type, so the two cannot drift.
+                # Unticked yields 0 -> "0" -> False. That also removes a trap the
+                # Entry had: a REQUIRED boolean left blank was a validation error,
+                # so the user had to type the word "true" to say yes.
+                var = tk.IntVar(master=top)
+                ttk.Checkbutton(row, variable=var).pack(side="left")
+                fields.append((key, "boolean", var))
             else:
                 ent = tk.Entry(row, bg=COL["bg_raised"], fg=COL["text"],
                                insertbackground=COL["text"], relief="flat", width=30,
                                font=F(11))
                 ent.pack(side="left", fill="x", expand=True)
-                kind = str(spec.get("type") or "string")
-                fields.append((key, "bool" if kind == "boolean" else kind, ent))
+                fields.append((key, kind, ent))
             if desc:
                 tk.Label(top, text=desc, bg=COL["bg_main"], fg=COL["text_dim"],
                          font=F(9), wraplength=460, justify="left").pack(padx=18, anchor="w")
@@ -14242,7 +17705,7 @@ class DeskpilotApp:
                 messagebox.showwarning(f"{APP_NAME} - MCP Server",
                                        f"Maximum of {MCP_MAX_SERVERS} servers.", parent=d)
                 return
-            args = ents["args"].get().strip().split()
+            args = _parse_args_list(ents["args"].get())
             env = _parse_env_pairs(ents["env"].get())
             servers.append({"name": name, "command": command, "args": args, "env": env})
             self.settings["mcp_servers"] = servers
@@ -14474,6 +17937,7 @@ class DeskpilotApp:
         if self._closed:
             return
         self._closed = True
+        self._note_main_activity("on_close (saving settings + chats)")
         try:
             self.settings["window_geometry"] = self.root.geometry()
             if self._sidebar_visible:
