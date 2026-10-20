@@ -25,7 +25,7 @@ Studio, Ollama, or a hosted API key. Deskpilot is the client; it does not ship a
 Grab the newest **`DeskPilot-Setup-<version>.exe`** from the project's GitHub
 **Releases** page — <https://github.com/shuhdonk/DeskPilot/releases/latest> — and
 pick the `.exe` under **Assets**. (The installer is a release asset, not a file in
-the source tree: a 128 MB binary in the repo would have to ride on Git LFS, whose
+the source tree: a ~136 MB binary in the repo would have to ride on Git LFS, whose
 free tier caps out at ~10 GiB of download bandwidth a month. Release assets carry
 no such limit.) It is a normal Windows installer
 
@@ -133,6 +133,10 @@ Click **🎤** and read the **amber status text in the top bar**:
 
 - `🎤 Listening via local Whisper (GPU)…` ← working as well as it gets
 - `🎤 Listening via local Whisper (CPU)…` ← cuBLAS not found; A4b was skipped or the folder is not next to the exe
+- `🎤 Listening via local Whisper…` ← **no device in brackets means the model is still
+  loading, not that something failed.** First use downloads ~1.5 GB (GPU) or ~140 MB
+  (CPU), so this is normal for the first minute or two; the `(GPU)` / `(CPU)` label
+  appears once it is ready.
 
 ## A6 — Uninstall
 
@@ -191,7 +195,7 @@ done). Needed by the ONNX/GPU libraries.
 ## Step 4 — Install the Python packages (PowerShell, one line)
 
 ```powershell
-py -3.12 -m pip install --upgrade pip; py -3.12 -m pip install openai pypdf Pillow "kokoro-onnx>=0.6.1" sounddevice SpeechRecognition PyAudio "faster-whisper>=1.0" "av<19" numpy nvidia-cublas-cu12 pyinstaller
+py -3.12 -m pip install --upgrade pip; py -3.12 -m pip install openai pypdf Pillow "kokoro-onnx>=0.6.1" sounddevice SpeechRecognition PyAudio "faster-whisper>=1.0" "av<19" numpy pyspellchecker nvidia-cublas-cu12 pyinstaller
 ```
 
 Takes a few minutes. Notes:
@@ -208,6 +212,10 @@ Takes a few minutes. Notes:
   form is used throughout because it works even when bare `pip` is not on PATH. If
   you ever get "No module named pip", run `py -3.12 -m ensurepip --upgrade` and
   repeat this step.
+- **`pyspellchecker`** powers the **Spell Check** setting (it underlines suspected
+  misspellings as you type). Optional and off by default: without it the checkbox in
+  Settings is greyed out and tells you what to install. The **installer (Route A)
+  already bundles it** - this only matters when installing by hand.
 
 ## Step 5 — Put the app file in its folder
 
@@ -289,6 +297,7 @@ Then check dictation with **A5** above.
 | `pip` / `pyinstaller` "not recognized as the name of a cmdlet" | That Python's Scripts folder is not on PATH. Use the module form: `py -3.12 -m pip ...`, `py -3.12 -m PyInstaller ...`. |
 | Step 6 shows a red error about a missing module | `py -3.12 -m pip install <that-name>` then re-run Step 6. |
 | Mic does nothing / error when pressing 🎤 | PyAudio is missing — it is **not** pulled in automatically. `py -3.12 -m pip install PyAudio` (Route B). |
+| **Spell Check** in Settings is greyed out | `pyspellchecker` is missing (Route B only — the installer bundles it). `py -3.12 -m pip install pyspellchecker`, then restart. |
 | Dictation is slow / status shows **(CPU)** on an NVIDIA machine | cuBLAS is not reachable. Route A: A4b. Route B: re-run Step 4 (needs `nvidia-cublas-cu12`), and for a compiled exe the Step 7 copy step so `nvidia\cublas\bin\` is **in the same folder as the exe**. |
 | Status shows **(GPU)** but dictation errors on the first phrase | Usually an old GPU driver — ctranslate2 needs **CUDA 12** support. Update the NVIDIA driver; you do *not* need the CUDA Toolkit itself. |
 | Dictation stuck on "Loading local Whisper model…" | First use downloads the model — ~1.5 GB (GPU) or ~140 MB (CPU). Needs internet; the first click can take a minute. |
@@ -304,5 +313,11 @@ Then check dictation with **A5** above.
 ## Where your data lives
 
 Everything Deskpilot writes — settings, chat history, downloaded models,
-generated images, checkpoints — is in **`%LOCALAPPDATA%\Deskpilot`**. It survives
-uninstalling, and it is the folder to copy if you move machines.
+generated images, checkpoints, the `ledger\` notes folder — is in
+**`%LOCALAPPDATA%\Deskpilot`**. It survives uninstalling, and it is the folder to
+copy if you move machines.
+
+If the app ever freezes, check **`%LOCALAPPDATA%\Deskpilot\hang_reports\`** first.
+A watchdog writes a stack dump there whenever the interface stops responding for
+more than a few seconds, which turns "it hung again" into something you can
+actually read. An empty folder means no hang was ever recorded.

@@ -54,7 +54,7 @@ git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot
 ### Step 3 — Python packages (terminal, one line)
 
 ```bash
-cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy nvidia-cublas-cu12 nvidia-cudnn-cu12
+cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy pyspellchecker nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
 (Creates an isolated **3.13** environment and installs everything the app can use. Takes a few minutes — PyAudio builds from source here, so expect a minute of compiler output; that's normal. No `source .../activate` needed - the commands call the venv's own pip directly, so this works in bash, zsh **and fish** (CachyOS's default shell). If you'd rather activate the env for your prompt: `source .venv/bin/activate.fish` in fish, or `source .venv/bin/activate` in bash/zsh.)
@@ -103,6 +103,7 @@ Click the **🎤** button and look at the **amber status text in the top bar** (
 
 - `🎤 Listening via local Whisper (GPU)…` ← **GPU is working.** Best accuracy and speed.
 - `🎤 Listening via local Whisper (CPU)…` ← the GPU libraries were not found; dictation still works, just slower and less accurate.
+- `🎤 Listening via local Whisper…` ← **no device in brackets means the model is still loading**, not a failure. First use downloads ~1.5 GB (GPU) or ~140 MB (CPU); the label appears once it is ready.
 
 If it says **(CPU)** in upper right on an NVIDIA machine, run this to see what the app sees:
 
@@ -143,7 +144,7 @@ git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot
 ### Step 3 — Python packages (terminal, one line)
 
 ```bash
-cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy nvidia-cublas-cu12 nvidia-cudnn-cu12
+cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy pyspellchecker nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
 (Creates an isolated 3.13 environment and installs everything the app can use. Takes a few minutes — PyAudio builds from source here, so expect a minute of compiler output; that's normal. No `source .../activate` needed - the commands call the venv's own pip directly, which works in bash (Fedora's default) and fish alike.)
@@ -188,7 +189,7 @@ First run: Settings → Server URL → **Test Connection** → Model name → Sa
 
 ### Step 7 — Check that GPU dictation is active (30 seconds)
 
-Same as the Arch section: click **🎤** and read the amber top-bar status — `local Whisper (GPU)` vs `local Whisper (CPU)`. Diagnostic one-liner if it says CPU:
+Same as the Arch section: click **🎤** and read the amber top-bar status — `local Whisper (GPU)` vs `local Whisper (CPU)`; with **no bracket at all** the model is still downloading on first use, which is normal. Diagnostic one-liner if it says CPU:
 
 ```bash
 cd ~/Deskpilot && .venv/bin/python -c "import ctranslate2 as c; print('CUDA GPUs visible:', c.get_cuda_device_count())"
@@ -228,6 +229,7 @@ On Linux everything Deskpilot writes sits **next to the script**, in `~/Deskpilo
 ```
 deskpilot_settings.json     deskpilot_chats.json      generated_images/
 whisper_models/             kokoro_models/            checkpoints/  ledger/
+hang_reports/
 ```
 
 ⚠️ **Deleting `~/Deskpilot` deletes your chat history** — there is no separate app-data folder to fall back on, unlike Windows (`%LOCALAPPDATA%\Deskpilot`). That is also the folder to copy if you move machines. The startup banner prints the exact paths.
