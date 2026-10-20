@@ -30,7 +30,7 @@ There is no package to install, no build step, no web browser, no telemetry, no 
 
 - **Reversible file edits:** each turn snapshots the original bytes of every file it touches (`write_local_file` / `edit_local_file`), so ↺ **Revert turn** undoes the whole turn at once — no more one-`.bak`-deep roulette when the agent edits real code.
 
-- **Mid-run steering:** send a message while a turn is still working and it lands at the next step boundary instead of waiting for the turn to finish.
+- **Mid-run steering:** send a message while a turn is still working, type your message and hit enter and it lands at the next step boundary instead of waiting for the turn to finish.
 
 - **Agent Skills:** reusable procedures in the open [Agent Skills](https://agentskills.io) format — a folder with a `SKILL.md`. Only each skill's name and description cost context; the instructions load on demand via `load_skill`. Point Settings at an existing skill collection to use it as-is.
 
