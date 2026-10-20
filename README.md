@@ -2,6 +2,8 @@
 
 ![Deskpilot Interface](assets/DeskPilot.jpg)
 
+![Deskpilot Interface](assets/DeskPilot2.jpg)
+
 ![Deskpilot Settings](assets/DeskPilot-Settings1.jpg)
 
 ![Deskpilot Settings](assets/DeskPilot-Settings2.jpg)
