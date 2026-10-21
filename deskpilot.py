@@ -1423,7 +1423,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.90"
+VERSION    = "1.1.92"
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
@@ -2821,6 +2821,7 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "server_url":        "http://localhost:11434/v1",
     "api_key":           "gemma-local",
     "model_name":        "gemma3",
+    "context_window_override": 0,   # manual context window; 0 = discover from the server
     "model_history":     [],   # previously used model names, newest first (Model Name dropdown)
     "searxng_url":       "",    # blank = auto-derive from server_url host, port 8080
     "exa_api_key":       "",    # Exa API key for the exa_search tool; blank = tool disabled
@@ -4075,37 +4076,407 @@ def fetch_model_ids(server_url: str, api_key: str = "", timeout: int = 8) -> Lis
             if m.get("id")]
 
 
+# Admin endpoints that report the serving window, tried only when /models says
+# nothing. Paths are relative to the ORIGIN, not the configured base: llama.cpp
+# serves /props at the root while OpenAI clients are configured with a /v1
+# suffix, so joining onto server_url would 404 on exactly the servers we need.
+CTX_PROBE_ENDPOINTS: Tuple[Tuple[str, str], ...] = (
+    ("llama.cpp /props",         "/props"),
+    ("llama-swap /engines",      "/api/v1/engines"),
+    ("SGLang /server_info",      "/server_info"),
+    ("TGI /info",                "/info"),
+    ("Ollama /api/ps",           "/api/ps"),
+    ("LM Studio /api/v1/models", "/api/v1/models"),
+    ("KoboldCpp /stats",         "/stats"),
+)
+CTX_PROBE_TTL = 900.0     # a server's window only changes when it restarts
+CTX_PROBE_BUDGET = 6.0    # total seconds across ALL endpoints in one sweep
+_CTX_PROBE_CACHE: Dict[str, tuple] = {}
+
+
+def _loaded_name_from_payload(obj: Any, _depth: int = 0) -> str:
+    """Best-effort name of the resident model from an admin endpoint.
+    /props carries model_path, /health carries model, llama-swap carries model,
+    and Ollama's /api/ps lists each loaded model under "name".
+
+    "name" is honoured ONLY inside an array: a server's own top-level "name" is
+    the server's name (e.g. "llama.cpp server"), and reporting that as the loaded
+    model would be worse than reporting nothing."""
+    if _depth > 5:
+        return ""
+    if isinstance(obj, dict):
+        for k in ("model", "model_name", "load_model", "model_path"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.strip():
+                return _clean_model_name(v)
+        for v in obj.values():
+            got = _loaded_name_from_payload(v, _depth + 1)
+            if got:
+                return got
+    elif isinstance(obj, list):
+        for item in obj[:64]:
+            if isinstance(item, dict):
+                for k in ("name", "model", "model_name"):
+                    v = item.get(k)
+                    if isinstance(v, str) and v.strip():
+                        return _clean_model_name(v)
+            got = _loaded_name_from_payload(item, _depth + 1)
+            if got:
+                return got
+    return ""
+
+
+def _clean_model_name(v: str) -> str:
+    """A path like D:\\models\\qwen.gguf names the file, not the served model;
+    keep the basename so it can still be compared loosely."""
+    return str(v).strip().replace("\\", "/").rsplit("/", 1)[-1]
+
+
+def probe_server_context(server_url: str, api_key: str = "", timeout: float = 2.5,
+                         want_model: str = "") -> Dict[str, Any]:
+    """Ask the engine's own admin endpoints for the serving window and the
+    resident model, for servers that put neither on /v1/models.
+
+    Returns {"window": int, "loaded_name": str, "source": str}. window 0 means
+    "this server tells us nothing" and callers MUST treat the window as unknown -
+    never as unlimited.
+
+    `want_model` matters: LM Studio's /api/v1/models lists EVERY installed model,
+    so a list payload is only trusted when it holds one entry or one entry matches
+    the model actually configured. Taking max() across an install of twenty models
+    would report the biggest window on disk rather than the one being served, and
+    an over-reported window means the gauge under-reads and compaction never fires.
+
+    Only ever contacts the server the user already configured (the same host the
+    app sends chat to), so this adds no new network destination. Results are
+    cached per origin for CTX_PROBE_TTL so a server with none of these endpoints
+    costs one bounded sweep, not a sweep per send. The cache is deliberately
+    lock-free: a race at worst repeats a read-only GET.
+    """
+    empty = {"window": 0, "loaded_name": "", "source": ""}
+    base = (server_url or "").strip()
+    if not base:
+        return empty
+    try:
+        parsed = urllib.parse.urlparse(base)
+        origin = "%s://%s" % (parsed.scheme, parsed.netloc)
+    except ValueError:
+        return empty
+    if not parsed.netloc or parsed.scheme not in ("http", "https"):
+        return empty
+
+    now = time.time()
+    hit = _CTX_PROBE_CACHE.get(origin)
+    if hit and (now - hit[0]) < CTX_PROBE_TTL:
+        return {"window": hit[1], "loaded_name": hit[2], "source": hit[3]}
+
+    hdr = {"User-Agent": "Deskpilot/" + VERSION, "Accept": "application/json"}
+    if api_key:
+        hdr["Authorization"] = "Bearer " + api_key.strip()
+    want = (want_model or "").strip().lower()
+    deadline = now + CTX_PROBE_BUDGET
+    window, name, source = 0, "", ""
+    for label, path in CTX_PROBE_ENDPOINTS:
+        if time.time() >= deadline:
+            break
+        try:
+            req = urllib.request.Request(origin + path, headers=hdr)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                obj = json.loads(r.read(400000).decode("utf-8", "replace"))
+        except Exception:
+            continue
+        if not window:
+            n = _window_from_admin_payload(obj, want)
+            if n:
+                window, source = n, label
+        if not name:
+            name = _loaded_name_from_payload(obj)
+        if window and name:
+            break
+    _CTX_PROBE_CACHE[origin] = (now, window, name, source)
+    return {"window": window, "loaded_name": name, "source": source}
+
+
+def _window_from_admin_payload(obj: Any, want: str = "") -> int:
+    """Window from one admin-endpoint payload, honouring which model is asked for.
+
+    Dict payloads describe the serving process, so any figure in them is the
+    window in use. List payloads are a catalogue, so they are only trusted when
+    they hold a single entry or an entry that matches the configured model."""
+    if isinstance(obj, dict):
+        data = obj.get("data")
+        if isinstance(data, list) and data:
+            return _window_from_admin_payload(data, want)
+        return context_length_from_object(obj)
+    if not isinstance(obj, list) or not obj:
+        return 0
+    if len(obj) == 1:
+        return context_length_from_object(obj[0])
+    if want:
+        for e in obj:
+            if not isinstance(e, dict):
+                continue
+            ids = {str(e.get(k, "")).strip().lower() for k in ("id", "model", "name")}
+            if want in ids or any(i and (i.startswith(want) or want.startswith(i))
+                                  for i in ids):
+                n = context_length_from_object(e)
+                if n:
+                    return n
+    # A catalogue we cannot disambiguate: report nothing rather than the largest.
+    return 0
+
+
+# The server's own refusal is the most authoritative source there is, and it is
+# free: we already have the text. Every engine words it differently but almost
+# all of them print the number they were configured with.
+CTX_ERROR_PATTERNS: Tuple[str, ...] = (
+    r"maximum context length(?:\s+is)?\s*[:=]?\s*([\d,]{3,9})",
+    r"max(?:imum)? context (?:size|window)(?:\s+is)?\s*[:=(]?\s*([\d,]{3,9})",
+    r"available context size\s*\(?\s*([\d,]{3,9})\s*\)?",
+    r"context (?:window|size)\s*(?:of|is)?\s*[:=]?\s*([\d,]{3,9})\s*(?:tokens|)",
+    r"n_ctx\s*(?:=|is)\s*([\d,]{3,9})",
+    r"max(?:imum)?_?(?:total_)?tokens\s*(?:=|is|:)\s*([\d,]{3,9})",
+    r"model'?s context (?:length|window)\s*(?:is|of)?\s*([\d,]{3,9})",
+)
+
+
+def window_from_error_text(msg: Any) -> int:
+    """Pull the real context window out of a server's overflow refusal, or 0.
+
+    Plausibility-bounded (128 .. 64M) because these patterns run over free-form
+    text: an unbounded match could turn "you sent 3 tokens" into a window of 3
+    and make the app compact after every message."""
+    low = str(msg or "").lower()
+    if not low:
+        return 0
+    for pat in CTX_ERROR_PATTERNS:
+        m = re.search(pat, low)
+        if not m:
+            continue
+        try:
+            n = int(m.group(1).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        if 128 <= n <= 64_000_000:
+            return n
+    return 0
+
+
+# ── Context-window discovery ──────────────────────────────────────────────
+# Every engine reports the serving window under a different key, nested in a
+# different container, and several do not report it on /models AT ALL (llama.cpp
+# uses /props, Ollama /api/ps + /api/show, SGLang /server_info, TGI /info). When
+# a new engine shows a blank gauge the fix is normally ONE entry in the tuples
+# below - not a new special case in a caller. Dialect table + evidence:
+#   projects/deskpilot/history/context-window-dialects.md
+#
+# ORDER IS A TRUST RANKING, not an accident. The gauge must show the SERVING
+# window. A *training* length (n_ctx_train, max_position_embeddings, rope
+# sequences) is usually LARGER, and over-reporting is the dangerous direction:
+# the gauge under-reads usage, compaction never fires, and the server just
+# refuses the request. Those keys are deliberately absent. Under-reporting only
+# makes the app compact early, which is merely conservative.
+CTX_WINDOW_KEYS: Tuple[str, ...] = (
+    "n_ctx",                  # llama.cpp /props; Radiance; llama-swap passthrough
+    "max_model_len",          # vLLM, Radiance, SGLang's OpenAI layer
+    "context_length",         # Unsloth Desktop, LM Studio, Ollama /api/show
+    "max_context_length",     # Unsloth Desktop, llama-swap /api/v1/engines
+    "native_context_length",  # Unsloth Desktop (pre-quantisation)
+    "context_window",         # OpenRouter and some proxies
+    "max_total_tokens",       # TGI /info, SGLang /server_info
+    "max_input_tokens",       # TGI /info (input-only: a lower bound, still usable)
+    "model_max_length",       # transformers-derived servers
+    "num_ctx",                # Ollama Modelfile parameters
+)
+
+# Containers the numbers hide in, walked before their contents.
+CTX_CONTAINER_KEYS: Tuple[str, ...] = (
+    "meta", "metadata", "details", "additional_information", "model_card",
+    "default_generation_settings", "generation_config", "parameters",
+    "internal_states", "engines", "models", "model", "data", "slots",
+)
+
+# How a server spells "resident and will answer now". Checked as WHOLE words after
+# CTX_UNLOADED_WORDS, so "loading" can never match "loaded".
+CTX_LOADED_WORDS = frozenset({
+    "loaded", "running", "ready", "in memory", "warm", "active", "serving",
+    "online", "resident",
+})
+CTX_UNLOADED_WORDS = frozenset({
+    "not loaded", "unloaded", "stopped", "idle", "offloaded", "sleeping",
+    "pending", "loading", "queued", "error", "empty", "none",
+})
+
+
+def _ctx_override(settings: dict) -> int:
+    """The manual context-window override, or 0 for "discover it yourself".
+
+    Read through this one function so every caller applies the same clamp; a
+    hand-edited settings file with a nonsense value must not become the gauge
+    denominator, because that denominator decides when compaction fires."""
+    try:
+        n = int(float((settings or {}).get("context_window_override", 0) or 0))
+    except (TypeError, ValueError):
+        return 0
+    return n if 128 <= n <= 64_000_000 else 0
+
+
+def _ctx_int(v: Any) -> int:
+    """Coerce a reported token count, or 0. Booleans are rejected on purpose:
+    JSON true is an int in Python and would otherwise read as a window of 1.
+    Comma groupings are accepted because some servers format the number for
+    display ("262,144") and still mean the same window."""
+    if isinstance(v, bool) or v is None:
+        return 0
+    if isinstance(v, str):
+        v = v.replace(",", "").strip()
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
+
+
+def context_length_from_object(obj: Any, _depth: int = 0) -> int:
+    """Best SERVING-window figure anywhere inside a server payload.
+
+    Shallowest nesting wins, then CTX_WINDOW_KEYS trust order, so an authoritative
+    top-level key beats a deeply nested one. Depth- and width-capped: a hostile or
+    merely enormous server blob cannot make this walk for long.
+
+    For a LIST this returns the largest figure found, which is correct for the
+    single-server admin endpoints it is used on (/props, /server_info) and is NOT
+    how a specific model's window is resolved - that goes through
+    _entry_context_length() on the matched /models entry."""
+    if _depth > 6 or not isinstance(obj, (dict, list)):
+        return 0
+    if isinstance(obj, list):
+        best = 0
+        for item in obj[:64]:
+            n = context_length_from_object(item, _depth + 1)
+            if n > best:
+                best = n
+        return best
+    for key in CTX_WINDOW_KEYS:
+        if key in obj:
+            n = _ctx_int(obj.get(key))
+            if n:
+                return n
+    best = 0
+    for key in CTX_CONTAINER_KEYS:
+        if key in obj:
+            n = context_length_from_object(obj[key], _depth + 1)
+            if n > best:
+                best = n
+    return best
+
+
+def _ctx_state_is_known(value: Any) -> bool:
+    """True when `value` is a state the server actually stated (a recognised word
+    or a boolean), so an absent or meaningless key is not read as 'not loaded'."""
+    if isinstance(value, dict):
+        value = (value.get("value") or value.get("state")
+                 or value.get("status") or value.get("name"))
+    if isinstance(value, bool):
+        return True
+    if not isinstance(value, str):
+        return False
+    word = " ".join(value.strip().lower().replace("_", " ").replace("-", " ").split())
+    return bool(word) and (word in CTX_LOADED_WORDS or word in CTX_UNLOADED_WORDS
+                           or any(root in word for root in ("load", "run", "warm",
+                                                            "resident", "sleep", "offload")))
+
+
+def _ctx_state_is_loaded(value: Any) -> bool:
+    """Normalise the many ways a server spells model state.
+
+    An unrecognised word is False. Guessing "loaded" from vocabulary we have not
+    seen is exactly how a gauge starts lying, and a lie here is worse than a
+    blank: the app would compact against a window it invented."""
+    if isinstance(value, dict):
+        value = (value.get("value") or value.get("state")
+                 or value.get("status") or value.get("name"))
+    if isinstance(value, bool):
+        return value
+    if not isinstance(value, str):
+        return False
+    word = value.strip().lower().replace("_", " ").replace("-", " ")
+    word = " ".join(word.split())
+    if not word:
+        return False
+    if word in CTX_UNLOADED_WORDS:
+        return False
+    if word in CTX_LOADED_WORDS:
+        return True
+    # Phrases like "loaded on gpu" or "resident in vram": the negative words are
+    # already ruled out above, so a bare positive root is safe to accept.
+    return any(root in word for root in ("load", "run", "warm", "resident"))
+
+
+def _nested_loaded_signal(obj: Any, _depth: int = 0):
+    """Find an EXPLICIT loaded signal inside a nested container, or None.
+
+    llama-swap puts engine state at additional_information.engines[].state, so a
+    top-level-only check misses it. This still requires the server to state it -
+    it searches for the known keys, never infers residency from vocabulary it has
+    not seen. Returns (found_bool, is_loaded) so a caller can tell "nested answer
+    is False" from "no nested answer at all".
+    """
+    if _depth > 5 or not isinstance(obj, (dict, list)):
+        return (False, False)
+    if isinstance(obj, list):
+        for item in obj[:64]:
+            found, val = _nested_loaded_signal(item, _depth + 1)
+            if found:
+                return (found, val)
+        return (False, False)
+    for flag in ("loaded", "is_loaded", "currently_loaded", "serving"):
+        if isinstance(obj.get(flag), bool):
+            return (True, obj[flag])
+    for flag in ("status", "state"):
+        if flag in obj and _ctx_state_is_known(obj[flag]):
+            return (True, _ctx_state_is_loaded(obj[flag]))
+    for key in CTX_CONTAINER_KEYS:
+        if key in obj:
+            found, val = _nested_loaded_signal(obj[key], _depth + 1)
+            if found:
+                return (found, val)
+    return (False, False)
+
+
 def _entry_context_length(entry) -> int:
     """Context-window size from a /models entry, across server dialects.
-
-    Unsloth Desktop sends a top-level context_length; Strata nests it as
-    meta.n_ctx. Returns 0 when the server reports no window (LM Studio, Ollama)."""
+    Returns 0 when the server reports no window (plain OpenAI, older Ollama)."""
     if not isinstance(entry, dict):
         return 0
-    for key in ("context_length", "max_context_length", "native_context_length"):
-        v = entry.get(key)
-        if v:
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                pass
-    meta = entry.get("meta")
-    if isinstance(meta, dict):
-        v = meta.get("n_ctx") or meta.get("context_length")
-        if v:
-            try:
-                return int(v)
-            except (TypeError, ValueError):
-                pass
-    return 0
+    return context_length_from_object(entry)
 
 
 def _entry_is_loaded(entry) -> bool:
     """Whether a /models entry is a model currently resident on the server.
 
-    Unsloth Desktop sends a top-level loaded=True boolean; Strata instead nests
-    the state as status.value == "loaded". Servers that report neither return
-    False, so callers treat the loaded model as unknown rather than guessing."""
+    Unsloth sends loaded=True; Strata nests status.value; llama-swap and LM Studio
+    use state. Radiance/vLLM send none of these but their /models lists ONLY what
+    is being served, so for that dialect (marked by max_model_len) presence IS the
+    signal. Servers that report nothing return False so callers treat the loaded
+    model as unknown rather than guessing - that negative case is the important
+    one, because LM Studio and Ollama list every installed model, not just the
+    resident one."""
+    if not isinstance(entry, dict):
+        return False
+    for flag in ("loaded", "is_loaded", "currently_loaded", "serving"):
+        v = entry.get(flag)
+        if isinstance(v, bool):
+            return v
+    for flag in ("status", "state"):
+        if flag in entry and _ctx_state_is_known(entry[flag]):
+            return _ctx_state_is_loaded(entry[flag])
+    found, val = _nested_loaded_signal(entry)
+    if found:
+        return val
+    if entry.get("max_model_len") and entry.get("id"):
+        return True
+    return False
     if not isinstance(entry, dict):
         return False
     if entry.get("loaded"):
@@ -4115,6 +4486,8 @@ def _entry_is_loaded(entry) -> bool:
         return str(status.get("value", "")).strip().lower() == "loaded"
     if isinstance(status, str):
         return status.strip().lower() == "loaded"
+    if entry.get("max_model_len") and entry.get("id"):
+        return True
     return False
 
 
@@ -7302,7 +7675,9 @@ class DeskpilotApp:
         self._tool_phase_render_mark: Optional[tuple] = None
         self._supports_usage_opts = True
         self._ctx_used = 0          # last known prompt_tokens for the active session (set on main thread)
-        self._ctx_total = 0         # context window size from /models metadata (main thread)
+        self._ctx_total = 0         # context window size, resolved from /models / probe / override
+        self._ctx_source = ""       # which layer produced _ctx_total (shown in the gauge tooltip)
+        self._ctx_learned = 0       # window recovered from a server's own refusal (this session)
         self._handoff_inflight: set = set()        # chats with a summary worker running RIGHT NOW
         self._handoff_lock = threading.Lock()      # guards the set above (worker + main thread)
         self._last_handoff: Dict[str, str] = {}    # chat_id -> last rendered handoff summary text
@@ -8549,10 +8924,18 @@ class DeskpilotApp:
         except tk.TclError:
             pass
 
-    def _update_ctx_topbar(self, entries: List[dict]) -> None:
-        """Top-bar context readout (e.g. 'RULER 256K') from /models metadata.
-        Prefers the configured model_name; falls back to the single loaded model.
-        Servers that don't report context_length (LM Studio, Ollama) leave it blank."""
+    def _update_ctx_topbar(self, entries: List[dict],
+                           probe: Optional[Dict[str, Any]] = None) -> None:
+        """Top-bar context readout (e.g. 'RULER 256K'), resolved in layers.
+
+        Order is deliberate: a manual override always wins (the user knows their
+        server), then the matched /models entry, then the admin-endpoint probe the
+        caller already ran. `probe` is passed in rather than fetched here because
+        this runs on the MAIN thread and the probe does network I/O.
+
+        A window of 0 means UNKNOWN and the readout stays blank. It must never be
+        defaulted to something plausible: the gauge drives compaction, and an
+        invented window silently changes when the app decides to summarise."""
         try:
             want = (self.settings.get("model_name") or "").strip()
             entry = None
@@ -8564,8 +8947,42 @@ class DeskpilotApp:
                 loaded = [m for m in entries if _entry_is_loaded(m)]
                 if len(loaded) == 1:
                     entry = loaded[0]
-            self._ctx_total = _entry_context_length(entry)
+            # Manual override first and unconditionally: it exists precisely for
+            # the case where auto-detection reports a number the user knows to be
+            # wrong (a model whose native length is 262K served with -c 32K).
+            total, source = _ctx_override(self.settings), "manual override"
+            if not total:
+                total, source = _entry_context_length(entry), "/models"
+            if not total and probe:
+                n = int(probe.get("window") or 0)
+                if n:
+                    total, source = n, probe.get("source") or "server admin endpoint"
+            if not total:
+                total, source = self._ctx_learned, "learned from server refusal"
+            self._ctx_total = total
+            self._ctx_source = source if total else ""
             self._update_ctx_usage_label()
+        except tk.TclError:
+            pass
+
+    def _note_ctx_learned(self, window: int) -> None:
+        """MAIN THREAD. The server just told us its real window by refusing a
+        request that was too large. Adopt it so the gauge stops being blank (or
+        wrong) for the rest of the session, and say where the number came from.
+
+        Only ever adopts the number the server printed: a refusal proves the
+        window is exactly that, so it overrides a larger /models figure. That is
+        the llama-swap case - a model whose native length is 262K served with
+        -c 8192. /models describes the model; the refusal describes the process.
+        """
+        try:
+            if not window or int(self._ctx_total or 0) == int(window):
+                return
+            self._ctx_total = int(window)
+            self._ctx_source = "learned from server refusal"
+            self._update_ctx_usage_label()
+            self._set_status("Context window set to %s - reported by the server when it "
+                             "refused an oversized request" % (_fmt_ctx(window) or window))
         except tk.TclError:
             pass
 
@@ -9515,15 +9932,27 @@ class DeskpilotApp:
         """Background-fetch {server_url}/models and refresh the top-bar context
         readout. Non-blocking; called on startup, after settings changes, and at the
         start of every send (so a server-side context change is picked up without a
-        Deskpilot restart)."""
+        Deskpilot restart).
+
+        When /models reports no window, the engine's own admin endpoints are probed
+        on the SAME worker thread - never the main thread - and the result is
+        carried into the same _post so the gauge is updated once, not twice."""
         url = (self.settings.get("server_url") or "").strip()
         if not url:
             return
         key = (self.settings.get("api_key") or "").strip()
+        want = (self.settings.get("model_name") or "").strip()
+        if _ctx_override(self.settings):
+            # A manual override is authoritative; no need to ask the server.
+            self._post(lambda: self._update_ctx_topbar([]))
+            return
 
         def _worker():
             info = fetch_model_info(url, key)
-            self._post(lambda: self._update_ctx_topbar(info))
+            probe = None
+            if not any(_entry_context_length(m) for m in info):
+                probe = probe_server_context(url, key, want_model=want)
+            self._post(lambda: self._update_ctx_topbar(info, probe))
 
         threading.Thread(target=_worker, daemon=True).start()
 
@@ -12457,6 +12886,15 @@ class DeskpilotApp:
                 # The server itself says the window is full, so trust that over the
                 # char-based estimate (which lags behind tool output it has not seen).
                 _ctx_win = self._ctx_window()
+                # The refusal itself usually names the real window, and it is the
+                # most authoritative source available - free, and already in hand.
+                # Adopting it fixes the gauge for the rest of the session instead of
+                # leaving a blank readout on a server that told us the number.
+                _err_win = window_from_error_text(msg)
+                if _err_win and _err_win != _ctx_win:
+                    self._ctx_learned = _err_win
+                    _ctx_win = _err_win
+                    self._post(lambda n=_err_win: self._note_ctx_learned(n))
                 _used_est = max(int(self._ctx_used_run or 0),
                                 estimate_prompt_tokens(kwargs["messages"]), _ctx_win)
                 if is_context_overflow_error(msg) and self._begin_midturn_handoff(
@@ -16007,6 +16445,8 @@ class DeskpilotApp:
             ("Server URL (OpenAI-compatible base)", "server_url"),
             ("API Key",                             "api_key"),
             ("Model Name",                          "model_name"),
+            ("Context window override (0 = auto-detect from the server)",
+                                                    "context_window_override"),
             ("SearXNG URL (blank = LLM server IP :8080)", "searxng_url"),
             ("UI Font Size (8-20, default 12)",     "ui_font_size"),
             ("Max Tokens per reply (0 = server default)", "max_tokens"),
@@ -16711,6 +17151,14 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 mt = 0
             self.settings["max_tokens"] = max(0, min(262144, mt))
+            # Context window override: 0 restores auto-detection. Clamped to a
+            # plausible range so a typo cannot make the gauge meaningless - and
+            # therefore cannot move when compaction decides to fire.
+            try:
+                cwo = int(float(str(entries["context_window_override"].get()).strip() or 0))
+            except (TypeError, ValueError):
+                cwo = 0
+            self.settings["context_window_override"] = max(0, min(64_000_000, cwo))
             # Turn time limit: seconds, clamped 0..TURN_TIME_LIMIT_MAX. 0 (the default) means
             # NO LIMIT - a turn runs until it finishes or the user presses Stop.
             try:
