@@ -43,23 +43,45 @@ git clone https://aur.archlinux.org/python313.git /tmp/py313 && cd /tmp/py313 &&
 
 ### Step 2 — Get the app onto this machine (terminal)
 
-Easiest: clone it from GitHub:
+Easiest — one line, no git needed:
 
 ```bash
-git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot
+mkdir -p ~/Deskpilot/next && h=https://raw.githubusercontent.com/shuhdonk/DeskPilot/main && for f in deskpilot.py next/settings_window.py next/settings_schema.py next/settings_ui.html; do curl -fL "$h/$f" -o ~/Deskpilot/$f; done && ls -la ~/Deskpilot ~/Deskpilot/next
 ```
 
-(No internet? Copy `deskpilot.py` over via USB / scp, then run `mkdir -p ~/Deskpilot && cp /tmp/deskpilot.py ~/Deskpilot/` instead.)
+You should end up with exactly these four files, `deskpilot.py` around 1.2 MB:
+
+```
+~/Deskpilot/deskpilot.py
+~/Deskpilot/next/settings_window.py
+~/Deskpilot/next/settings_schema.py
+~/Deskpilot/next/settings_ui.html
+```
+
+Prefer git? `git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot` gets the
+same four files. Bringing your own copy? Then copy `deskpilot.py` **and** the whole
+`next` folder.
+
+(No internet on that machine? Copy the files over by USB / scp into the same layout.)
+
+⚠️ **`next/` is not optional if you want the modern dark Settings window** — those
+three files are what it is built from. They are loaded at runtime as *data*, so
+nothing imports them and no build tool can discover them for you. Missing? Settings
+opens the classic dialog, with no error. A `curl` above that printed **404** means the
+file is not published yet — grab it from <https://github.com/shuhdonk/DeskPilot> by
+hand.
 
 ### Step 3 — Python packages (terminal, one line)
 
 ```bash
-cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy pyspellchecker nvidia-cublas-cu12 nvidia-cudnn-cu12
+cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy pyspellchecker "pywebview[qt]" nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
 (Creates an isolated **3.13** environment and installs everything the app can use. Takes a few minutes — PyAudio builds from source here, so expect a minute of compiler output; that's normal. No `source .../activate` needed - the commands call the venv's own pip directly, so this works in bash, zsh **and fish** (CachyOS's default shell). If you'd rather activate the env for your prompt: `source .venv/bin/activate.fish` in fish, or `source .venv/bin/activate` in bash/zsh.)
 
 (⚠️ **`"av<19"` is not optional.** faster-whisper calls `av.open(metadata_errors=...)`, which PyAV **19 removed**, and faster-whisper itself puts no upper bound on `av`. Without the pin you get av 19 and dictation dies with `TypeError: open() got an unexpected keyword argument 'metadata_errors'`. The pinned 18.x ships `cp311-abi3` manylinux wheels, so it installs cleanly on 3.12/3.13 with no compiling.)
+
+(`pywebview[qt]` = the modern dark **Settings window** with the left-hand section list. On Linux pywebview cannot pick a browser engine by itself — you have to choose GTK or Qt — and `[qt]` pulls in PyQt6 plus its bundled QtWebEngine, which is the option that needs no system packages and suits KDE. Skip it and everything still works; Settings opens the classic Tk dialog instead. It is also needed for a compiled exe to bundle the window — PyInstaller can only bundle what is already installed.)
 
 (`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` = the GPU libraries for dictation, **~1.3 GB of downloads** (554 MB + 731 MB for x86_64) — Step 3 will look stalled for a while, that is normal. Deskpilot finds and loads them by itself from the venv; you do not have to set `LD_LIBRARY_PATH`. No NVIDIA GPU? Drop those two names from the line.)
 
@@ -79,7 +101,17 @@ mkdir -p ~/Deskpilot/kokoro_models && cd ~/Deskpilot/kokoro_models && curl -L -O
 cd ~/Deskpilot && .venv/bin/python deskpilot.py
 ```
 
-The Deskpilot window should open. Close it when you see it.
+The Deskpilot window should open. Now click **⚙ Settings** at the bottom left and
+check which window you get:
+
+- **Dark window with a list of sections down the left side** → correct, you have the
+  modern Settings. Close it and continue.
+- **Tall grey dialog, every setting on one long page** → the classic fallback. The app
+  works fine, but one of the two halves is missing: `pywebview[qt]` (Step 3) or
+  `~/Deskpilot/next/` (Step 2). Re-run that step. The exact reason is in
+  `~/Deskpilot/settings_window.log`.
+
+Close the app when you are done.
 
 ### Step 6 — Run it from now on
 
@@ -133,23 +165,45 @@ sudo dnf install -y python3.13 python3.13-tkinter python3.13-devel portaudio-dev
 
 ### Step 2 — Get the app onto this machine (terminal)
 
-Easiest: clone it from GitHub:
+Easiest — one line, no git needed:
 
 ```bash
-git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot
+mkdir -p ~/Deskpilot/next && h=https://raw.githubusercontent.com/shuhdonk/DeskPilot/main && for f in deskpilot.py next/settings_window.py next/settings_schema.py next/settings_ui.html; do curl -fL "$h/$f" -o ~/Deskpilot/$f; done && ls -la ~/Deskpilot ~/Deskpilot/next
 ```
 
-(No internet? Copy `deskpilot.py` over via USB / scp, then run `mkdir -p ~/Deskpilot && cp /tmp/deskpilot.py ~/Deskpilot/` instead.)
+You should end up with exactly these four files, `deskpilot.py` around 1.2 MB:
+
+```
+~/Deskpilot/deskpilot.py
+~/Deskpilot/next/settings_window.py
+~/Deskpilot/next/settings_schema.py
+~/Deskpilot/next/settings_ui.html
+```
+
+Prefer git? `git clone https://github.com/shuhdonk/DeskPilot.git ~/Deskpilot` gets the
+same four files. Bringing your own copy? Then copy `deskpilot.py` **and** the whole
+`next` folder.
+
+(No internet on that machine? Copy the files over by USB / scp into the same layout.)
+
+⚠️ **`next/` is not optional if you want the modern dark Settings window** — those
+three files are what it is built from. They are loaded at runtime as *data*, so
+nothing imports them and no build tool can discover them for you. Missing? Settings
+opens the classic dialog, with no error. A `curl` above that printed **404** means the
+file is not published yet — grab it from <https://github.com/shuhdonk/DeskPilot> by
+hand.
 
 ### Step 3 — Python packages (terminal, one line)
 
 ```bash
-cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy pyspellchecker nvidia-cublas-cu12 nvidia-cudnn-cu12
+cd ~/Deskpilot && python3.13 -m venv .venv && .venv/bin/pip install --upgrade pip && .venv/bin/pip install openai pypdf Pillow kokoro-onnx sounddevice SpeechRecognition PyAudio faster-whisper "av<19" numpy pyspellchecker "pywebview[qt]" nvidia-cublas-cu12 nvidia-cudnn-cu12
 ```
 
 (Creates an isolated 3.13 environment and installs everything the app can use. Takes a few minutes — PyAudio builds from source here, so expect a minute of compiler output; that's normal. No `source .../activate` needed - the commands call the venv's own pip directly, which works in bash (Fedora's default) and fish alike.)
 
 (⚠️ **`"av<19"` is not optional.** faster-whisper calls `av.open(metadata_errors=...)`, which PyAV **19 removed**, and faster-whisper itself puts no upper bound on `av`. Without the pin you get av 19 and dictation dies with `TypeError: open() got an unexpected keyword argument 'metadata_errors'`. The pinned 18.x ships `cp311-abi3` manylinux wheels, so it installs cleanly on 3.13 with no compiling.)
+
+(`pywebview[qt]` = the modern dark **Settings window** with the left-hand section list. On Linux pywebview cannot pick a browser engine by itself — you have to choose GTK or Qt — and `[qt]` pulls in PyQt6 plus its bundled QtWebEngine, which needs no extra system packages and suits KDE. Skip it and everything still works; Settings opens the classic Tk dialog instead.)
 
 (`nvidia-cublas-cu12` + `nvidia-cudnn-cu12` = the GPU libraries for dictation, **~1.3 GB of downloads** (554 MB + 731 MB for x86_64) — Step 3 will look stalled for a while, that is normal. Deskpilot finds and loads them by itself from the venv; you do not have to set `LD_LIBRARY_PATH`. No NVIDIA GPU? Drop those two names from the line.)
 
@@ -169,7 +223,17 @@ mkdir -p ~/Deskpilot/kokoro_models && cd ~/Deskpilot/kokoro_models && curl -L -O
 cd ~/Deskpilot && .venv/bin/python deskpilot.py
 ```
 
-The Deskpilot window should open. Close it when you see it.
+The Deskpilot window should open. Now click **⚙ Settings** at the bottom left and
+check which window you get:
+
+- **Dark window with a list of sections down the left side** → correct, you have the
+  modern Settings. Close it and continue.
+- **Tall grey dialog, every setting on one long page** → the classic fallback. The app
+  works fine, but one of the two halves is missing: `pywebview[qt]` (Step 3) or
+  `~/Deskpilot/next/` (Step 2). Re-run that step. The exact reason is in
+  `~/Deskpilot/settings_window.log`.
+
+Close the app when you are done.
 
 ### Step 6 — Run it from now on
 
@@ -210,6 +274,8 @@ cd ~/Deskpilot && .venv/bin/python -c "import ctranslate2 as c; print('CUDA GPUs
 | "The virtual environment was not created successfully because ensurepip is not available" | Arch/CachyOS Python builds do not bundle pip. Install it: `sudo pacman -S --needed python-pip`, then re-run Step 3. If `python3.13` still cannot find it, create the venv without pip and bootstrap it: `python3.13 -m venv --without-pip .venv && curl -L -sS https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py && .venv/bin/python /tmp/get-pip.py` then re-run the install part of Step 3. |
 | tkinter import error / "Python is not built with Tk support" | Arch/CachyOS: `sudo pacman -S --needed tk` (it is the optional dependency that enables tkinter for the `python313` package). Fedora: `sudo dnf install -y python3.13-tkinter` (and make sure you're using the venv's python, which inherits it). |
 | TTS button says "model files not found" | Step 4 — both files must be in `~/Deskpilot/kokoro_models/`. |
+| **Settings opens the classic grey dialog** instead of the dark one with a left-hand section list | The modern window needs both halves: the `pywebview[qt]` package (Step 3) **and** the `next/` folder sitting beside `deskpilot.py` (Step 2). Check with `ls ~/Deskpilot/next` — it should list `settings_window.py`, `settings_schema.py`, `settings_ui.html`. Either half missing and Settings falls back to the classic dialog, with no error. The reason is written to `~/Deskpilot/settings_window.log` — on Linux the data folder is the one holding `deskpilot.py`, so it lands next to the script. It is a short file. |
+| Settings window opens blank, or the app logs a QtWebEngine error | QtWebEngine needs a couple of system libraries that are usually already present on KDE: Fedora `sudo dnf install -y qt5-qtbase gui-no-widgets 2>/dev/null; sudo dnf install -y mesa-libgbm alsa-lib`; Arch `sudo pacman -S --needed mesa libxkbcommon`. On NVIDIA + Wayland, if the window is blank, launch once with `QTWEBENGINE_DISABLE_SANDBOX=1` to confirm the GPU sandbox is the cause. The classic dialog remains a working fallback either way. |
 | Dictation stuck on "Loading local Whisper model…" | First use needs internet — one-time download: **~1.5 GB** (GPU) or **~140 MB** (CPU). Big download, so the first mic click can take a minute. |
 | Mic status says **(CPU)** but you have an NVIDIA GPU | Run the Step 7 diagnostic. If it prints `CUDA GPUs visible: 0`, the driver is missing or is CUDA 11-era — ctranslate2 needs **CUDA 12** support, so update the NVIDIA driver package (`nvidia` / `nvidia-driver`). If it prints ≥1 but the app still says CPU, the pip GPU libraries are missing — re-run Step 3 including `nvidia-cublas-cu12 nvidia-cudnn-cu12`. |
 | `RuntimeError: Library libcublas.so.12 is not found or cannot be loaded` | Step 3's GPU libraries are missing or were dropped. Re-run the Step 3 pip line with `nvidia-cublas-cu12 nvidia-cudnn-cu12` included. |

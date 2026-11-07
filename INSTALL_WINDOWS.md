@@ -195,7 +195,7 @@ done). Needed by the ONNX/GPU libraries.
 ## Step 4 — Install the Python packages (PowerShell, one line)
 
 ```powershell
-py -3.12 -m pip install --upgrade pip; py -3.12 -m pip install openai pypdf Pillow "kokoro-onnx>=0.6.1" sounddevice SpeechRecognition PyAudio "faster-whisper>=1.0" "av<19" numpy pyspellchecker nvidia-cublas-cu12 pyinstaller
+py -3.12 -m pip install --upgrade pip; py -3.12 -m pip install openai pypdf Pillow "kokoro-onnx>=0.6.1" sounddevice SpeechRecognition PyAudio "faster-whisper>=1.0" "av<19" numpy pyspellchecker pywebview pythonnet nvidia-cublas-cu12 pyinstaller
 ```
 
 Takes a few minutes. Notes:
@@ -212,14 +212,41 @@ Takes a few minutes. Notes:
   form is used throughout because it works even when bare `pip` is not on PATH. If
   you ever get "No module named pip", run `py -3.12 -m ensurepip --upgrade` and
   repeat this step.
+- **`pywebview` + `pythonnet`** are the modern dark **Settings window** (the one with
+  the left-hand section list). Install them into the *same* Python you build with —
+  PyInstaller can only bundle what that interpreter already has. Skip them and
+  everything still works; Settings opens the classic dialog instead.
 - **`pyspellchecker`** powers the **Spell Check** setting (it underlines suspected
   misspellings as you type). Optional and off by default: without it the checkbox in
   Settings is greyed out and tells you what to install. The **installer (Route A)
   already bundles it** - this only matters when installing by hand.
 
-## Step 5 — Put the app file in its folder
+## Step 5 — Download the app files (PowerShell, one line)
 
-Create `C:\Deskpilot` and copy `deskpilot.py` into it.
+```powershell
+New-Item -ItemType Directory -Force C:\Deskpilot\next | Out-Null; $h="https://raw.githubusercontent.com/shuhdonk/DeskPilot/main"; foreach($f in @("deskpilot.py","next/settings_window.py","next/settings_schema.py","next/settings_ui.html")){ Invoke-WebRequest -UseBasicParsing "$h/$f" -OutFile "C:\Deskpilot\$($f.Replace("/","\"))" }; Get-ChildItem C:\Deskpilot -Recurse -File | Select-Object FullName,Length
+```
+
+You should end up with exactly these four files, none of them tiny:
+
+```
+C:\Deskpilot\deskpilot.py                 (~1.2 MB)
+C:\Deskpilot\next\settings_window.py
+C:\Deskpilot\next\settings_schema.py
+C:\Deskpilot\next\settings_ui.html
+```
+
+Prefer git? `git clone https://github.com/shuhdonk/DeskPilot.git C:\Deskpilot` gets the
+same four files. Bringing your own copy? Then copy `deskpilot.py` **and** the whole
+`next` folder — both halves are needed.
+
+⚠️ **`next\` is not optional if you want the modern Settings window.** It holds the
+three files that window is built from, and they are *data* — the app loads them at
+runtime, so nothing in `deskpilot.py` imports them and no build tool can discover
+them for you. Missing? Settings quietly opens the classic dialog. Nothing errors.
+
+If a line above failed with a 404, the file is not published yet — grab it from
+<https://github.com/shuhdonk/DeskPilot> by hand instead.
 
 ## Step 6 — Test that it runs (PowerShell)
 
@@ -227,9 +254,21 @@ Create `C:\Deskpilot` and copy `deskpilot.py` into it.
 py -3.12 C:\Deskpilot\deskpilot.py
 ```
 
-The Deskpilot window should open. Close it. Then add the optional extras from
-**A4** above as wanted — when running from the script, cuBLAS is found
-automatically in Step 4's packages, so **A4b is not needed for Route B**.
+The Deskpilot window should open. Now click **⚙ Settings** at the bottom left and
+check which window you get:
+
+- **Dark window with a list of sections down the left side** (Connection, Sampling,
+  Conversation, Workspace, Tools & keys, Skills, MCP servers, System prompt,
+  Appearance) → correct, you have the modern Settings.
+- **Tall grey dialog, every setting on one long page** → the classic fallback. The app
+  works fine either way, but one of the two halves is missing: `pywebview` +
+  `pythonnet` (Step 4), or the `next` folder in Step 5. Re-run that step. The exact
+  reason is written to `%LOCALAPPDATA%\Deskpilot\settings_window.log` — it is a short
+  file.
+
+Close the app. Then add the optional extras from **A4** above as wanted — when running
+from the script, cuBLAS is found automatically in Step 4's packages, so **A4b is not
+needed for Route B**.
 
 ## Step 7 — Optional: compile your own exe
 
@@ -237,7 +276,7 @@ Recommended build (a folder — starts faster, and everything stays together):
 
 ```powershell
 cd C:\Deskpilot
-py -3.12 -m PyInstaller --noconfirm --clean --windowed --name DeskPilot --collect-all kokoro_onnx --collect-all faster_whisper --collect-all phonemizer --collect-all espeakng_loader --hidden-import pypdf --hidden-import PIL.ImageGrab --hidden-import sounddevice --hidden-import speech_recognition --hidden-import pyaudio --hidden-import numpy deskpilot.py
+py -3.12 -m PyInstaller --noconfirm --clean --windowed --name DeskPilot --collect-all kokoro_onnx --collect-all faster_whisper --collect-all phonemizer --collect-all espeakng_loader --collect-all webview --collect-all pythonnet --hidden-import clr --add-data "next;next" --hidden-import pypdf --hidden-import PIL.ImageGrab --hidden-import sounddevice --hidden-import speech_recognition --hidden-import pyaudio --hidden-import numpy deskpilot.py
 ```
 
 Your app is then at **`C:\Deskpilot\dist\DeskPilot\DeskPilot.exe`**. Takes a few
@@ -245,6 +284,14 @@ minutes.
 
 ⚠️ **`--collect-all phonemizer --collect-all espeakng_loader` are required.** A
 build without them produces an exe whose text-to-speech silently does not work.
+
+⚠️ **`--collect-all webview --collect-all pythonnet --hidden-import clr` and
+`--add-data "next;next"` are required for the modern Settings window.** Use
+`--collect-all`, not `--collect-data`: pywebview loads its browser backend at runtime
+and ships `.js`/`.dll` payload, and `pythonnet` leaves `clr.__spec__` as `None`, so
+static analysis finds neither. A build without them succeeds and shows the classic
+dialog — there is no error to warn you. (`--add-data "next;next"` copies the whole
+folder, so keep only those three files in it.)
 
 If you prefer a single file, add `--onefile`; it re-extracts to a temp folder on
 every launch, so it starts more slowly.
@@ -303,6 +350,8 @@ Then check dictation with **A5** above.
 | Dictation stuck on "Loading local Whisper model…" | First use downloads the model — ~1.5 GB (GPU) or ~140 MB (CPU). Needs internet; the first click can take a minute. |
 | 🔊 speaks nothing / "model files not found" | A4a — both files must be in `%LOCALAPPDATA%\Deskpilot\kokoro_models\`. |
 | 🔊 works from the script but not in a compiled exe | You built without `--collect-all phonemizer --collect-all espeakng_loader` (Step 7). Rebuild with them. |
+| **Settings opens the classic dialog** instead of the dark one with the left-hand section list | Three causes, in order of likelihood: (1) `pywebview` / `pythonnet` were not installed in the Python that built the exe (Step 4) — PyInstaller can only bundle what is already installed; (2) the build omitted `--collect-all webview --collect-all pythonnet --hidden-import clr` (Step 7); (3) `next\` was missing at build time (Step 5). The exact reason is written to `%LOCALAPPDATA%\Deskpilot\settings_window.log` — open it, it is short. |
+| Settings window opens blank, or never appears | Needs the **WebView2 Runtime**, which Windows 10/11 normally already has (it ships with Edge). Get it from <https://developer.microsoft.com/en-us/microsoft-edge/webview2/>, then restart Deskpilot. Until then you get the classic dialog, which is fully functional. |
 | **Dictation broke after a `pip install --upgrade`** | `av` 19 removed an API faster-whisper needs. Pin it: `py -3.12 -m pip install "av<19"` |
 | Exe is slow to start / "unknown publisher" | Normal for an unsigned build. A `--onefile` exe also re-extracts to temp on every launch — the folder build in Step 7 starts faster. |
 | No NVIDIA GPU at all | Skip A4b / `nvidia-cublas-cu12`. Dictation runs on the CPU automatically and the status shows **(CPU)**. |

@@ -1,0 +1,1078 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>DeskPilot Settings</title>
+<style>
+  :root {
+    --bg: #16181d; --bg-nav: #1c1f26; --bg-card: #21252e; --bg-input: #2a2f3a;
+    --border: #333947; --border-soft: #2b3038;
+    --text: #e6e9ef; --text-dim: #9aa3b2; --text-mute: #6b7484;
+    --accent: #3b82f6; --accent-dim: #2563eb;
+    --ok: #22c55e; --danger: #ef4444; --warn: #f59e0b;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    background: var(--bg); color: var(--text);
+    font: 13px/1.45 "Segoe UI", system-ui, -apple-system, sans-serif;
+    overflow: hidden;
+  }
+  #app { display: flex; height: 100vh; }
+
+  /* ── nav ───────────────────────────────────────────────────── */
+  nav {
+    width: 220px; flex: 0 0 220px; display: flex; flex-direction: column;
+    background: var(--bg-nav); border-right: 1px solid var(--border);
+  }
+  .nav-title {
+    padding: 16px 18px 10px; font-size: 12px; font-weight: 600;
+    letter-spacing: .08em; text-transform: uppercase; color: var(--text-mute);
+  }
+  #search {
+    margin: 0 14px 12px; padding: 7px 10px; border-radius: 6px;
+    background: var(--bg-input); border: 1px solid var(--border);
+    color: var(--text); font-size: 12px; outline: none;
+  }
+  #search:focus { border-color: var(--accent); }
+  #navlist { flex: 1; overflow-y: auto; padding: 0 10px 10px; }
+  .nav-item {
+    display: flex; align-items: center; justify-content: space-between;
+    width: 100%; padding: 8px 10px; margin-bottom: 3px; border-radius: 6px;
+    background: none; border: none; color: var(--text-dim);
+    font: inherit; font-size: 12.5px; text-align: left; cursor: pointer;
+  }
+  .nav-item:hover { background: #262a33; color: var(--text); }
+  .nav-item.active { background: var(--accent-dim); color: #fff; }
+  .nav-item .dot { width: 6px; height: 6px; border-radius: 50%; background: transparent; }
+  .nav-item.has-error .dot { background: var(--danger); }
+  .navfoot {
+    padding: 10px 18px 14px; font-size: 11px; color: var(--text-mute);
+    border-top: 1px solid var(--border-soft);
+  }
+
+  /* ── main ──────────────────────────────────────────────────── */
+  main { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+  #content { flex: 1; overflow-y: auto; padding: 24px 30px 30px; }
+  .sec-head { margin-bottom: 20px; }
+  .sec-head h1 { margin: 0 0 4px; font-size: 19px; font-weight: 600; }
+  .sec-head p { margin: 0; font-size: 12.5px; color: var(--text-dim); }
+
+  .field {
+    max-width: 620px; margin-bottom: 16px; padding: 12px 14px;
+    background: var(--bg-card); border: 1px solid var(--border-soft);
+    border-radius: 8px;
+  }
+  .field label { display: block; font-size: 12.5px; font-weight: 600; margin-bottom: 6px; }
+  .field label .unit { font-weight: 400; color: var(--text-mute); margin-left: 6px; }
+  .field input[type=text], .field input[type=password], .field textarea {
+    width: 100%; padding: 8px 10px; border-radius: 6px;
+    background: var(--bg-input); border: 1px solid var(--border);
+    color: var(--text); font: inherit; font-size: 13px; outline: none;
+  }
+  .field textarea { min-height: 90px; resize: vertical; }
+  .field input:focus, .field textarea:focus { border-color: var(--accent); }
+  .field input.err, .field textarea.err { border-color: var(--danger); }
+  .field .help { margin-top: 6px; font-size: 11.5px; color: var(--text-mute); }
+  .field-error { margin-top: 6px; font-size: 11.5px; color: var(--danger); }
+  /* Server feedback under a refreshable name field (which models are loaded, etc).
+     Dimmer than .help because it is transient server state, not a permanent hint. */
+  .model-note { margin-top: 6px; font-size: 11.5px; color: var(--text-dim); }
+
+  .toggle-row { display: flex; align-items: center; }
+  .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
+  .switch input { opacity: 0; width: 0; height: 0; }
+  .slider {
+    position: absolute; inset: 0; background: #3a404c; border-radius: 11px;
+    transition: background .15s; cursor: pointer;
+  }
+  .slider::before {
+    content: ""; position: absolute; width: 16px; height: 16px; left: 3px; top: 3px;
+    background: #e6e9ef; border-radius: 50%; transition: transform .15s;
+  }
+  .switch input:checked + .slider { background: var(--accent); }
+  .switch input:checked + .slider::before { transform: translateX(18px); }
+
+  .path-row { display: flex; gap: 8px; }
+  .path-row input { flex: 1; }
+  .btn {
+    padding: 7px 12px; border-radius: 6px; border: 1px solid var(--border);
+    background: var(--bg-input); color: var(--text); font: inherit;
+    font-size: 12px; cursor: pointer; white-space: nowrap;
+  }
+  .btn:hover { background: #333947; }
+  .btn.primary { background: var(--accent-dim); border-color: var(--accent-dim); color: #fff; }
+  .btn.primary:hover { background: var(--accent); }
+  .btn.danger { color: var(--danger); border-color: #4a2b2b; }
+  .btn:disabled { opacity: .45; cursor: default; }
+
+  .reveal {
+    background: none; border: none; color: var(--text-mute);
+    cursor: pointer; font-size: 11.5px; padding: 0; margin-top: 5px;
+  }
+  .reveal:hover { color: var(--accent); }
+
+  /* ── footer ───────────────────────────────────────────────── */
+  footer {
+    display: flex; align-items: center; gap: 10px;
+    padding: 12px 28px; border-top: 1px solid var(--border);
+    background: var(--bg-nav);
+  }
+  #status { flex: 1; font-size: 12px; color: var(--text-dim); min-height: 16px; }
+  #status.ok { color: var(--ok); }
+  #status.bad { color: var(--danger); }
+
+  /* search results mode */
+  .hidden { display: none; }
+  .search-hit { margin-bottom: 16px; max-width: 620px; }
+  .search-hit .where {
+    font-size: 11px; color: var(--text-mute);
+    text-transform: uppercase; letter-spacing: .06em; margin-bottom: 3px;
+  }
+
+  /* ── panels (skills / mcp) ────────────────────────────────── */
+  .panel { max-width: 760px; }
+  .panel-toolbar {
+    display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+    flex-wrap: wrap;
+  }
+  .panel-toolbar .grow { flex: 1; }
+  .panel-toolbar input[type=text] {
+    flex: 1; min-width: 140px; padding: 7px 10px; border-radius: 6px;
+    background: var(--bg-input); border: 1px solid var(--border);
+    color: var(--text); font: inherit; font-size: 12.5px; outline: none;
+  }
+  .panel-toolbar input[type=text]:focus { border-color: var(--accent); }
+  .hint { font-size: 11.5px; color: var(--text-mute); margin-bottom: 12px; }
+  .hint.warn { color: var(--warn); }
+
+  /* system prompt editor */
+  .prompt-tabs { display: flex; gap: 6px; margin-bottom: 10px; }
+  .prompt-tabs button {
+    background: var(--bg-card); color: var(--text-dim); border: 1px solid var(--border);
+    border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer;
+  }
+  .prompt-tabs button.on { background: var(--bg-input); color: var(--text);
+                           border-color: var(--accent); }
+  textarea.prompt-body {
+    width: 100%; min-height: 380px; resize: vertical;
+    background: var(--bg-input); color: var(--text); border: 1px solid var(--border);
+    border-radius: 8px; padding: 10px 12px; font: 12px/1.5 Consolas, monospace;
+    /* pre-wrap, not pre: this is markdown prose, not code. With `pre` every long
+       line (the workspace path, the memory index rows) ran off the right edge
+       behind a horizontal scrollbar. `anywhere` so an unbroken path still breaks
+       rather than forcing the box wide. */
+    white-space: pre-wrap; overflow-wrap: anywhere; overflow-y: auto;
+  }
+  textarea.prompt-body:focus { outline: none; border-color: var(--accent); }
+  textarea.prompt-body[readonly] { color: var(--text-dim); background: var(--bg-card); }
+  /* modal overlay - used by the Add skills catalog picker */
+  .modal-scrim {
+    position: fixed; inset: 0; z-index: 50;
+    background: rgba(8, 9, 12, .62);
+    display: flex; align-items: center; justify-content: center;
+    padding: 24px;
+  }
+  .modal {
+    background: var(--bg); border: 1px solid var(--border); border-radius: 10px;
+    width: min(880px, 100%); max-height: 100%; overflow-y: auto;
+    padding: 18px 20px; box-shadow: 0 18px 48px rgba(0, 0, 0, .5);
+  }
+  .prompt-foot { display: flex; align-items: center; gap: 10px; margin-top: 10px;
+                 font-size: 11.5px; color: var(--text-mute); }
+  .prompt-msg { margin-top: 10px; font-size: 12px; white-space: pre-wrap;
+                border-left: 3px solid var(--border); padding: 6px 10px; }
+  .prompt-msg.ok  { border-left-color: var(--ok); color: var(--text-dim); }
+  .prompt-msg.bad { border-left-color: var(--danger); color: var(--warn); }
+
+  .row {
+    display: flex; align-items: flex-start; gap: 10px;
+    padding: 10px 12px; margin-bottom: 8px;
+    background: var(--bg-card); border: 1px solid var(--border-soft);
+    border-radius: 8px;
+  }
+  .row .body { flex: 1; min-width: 0; }
+  .row .name { font-size: 12.5px; font-weight: 600; }
+  .row .desc { font-size: 11.5px; color: var(--text-dim); margin-top: 2px; }
+  .row .meta { font-size: 11px; color: var(--text-mute); margin-top: 4px;
+               font-family: ui-monospace, Consolas, monospace; word-break: break-all; }
+  .row .actions { display: flex; gap: 6px; align-items: center; }
+  .tag {
+    font-size: 10.5px; padding: 2px 7px; border-radius: 10px;
+    background: #2b3038; color: var(--text-dim); white-space: nowrap;
+  }
+  .tag.ok { background: #1c3b2a; color: var(--ok); }
+  .tag.off { background: #3a2b2b; color: var(--warn); }
+
+  .empty {
+    padding: 18px; border: 1px dashed var(--border); border-radius: 8px;
+    color: var(--text-mute); font-size: 12.5px; text-align: center;
+  }
+
+  /* add-server form */
+  .form-grid { display: grid; gap: 10px; margin-bottom: 12px; }
+  .form-grid .field { margin: 0; }
+  .form-actions { display: flex; gap: 8px; }
+
+  .scroll-list { max-height: 420px; overflow-y: auto; padding-right: 4px; }
+</style>
+</head>
+<body>
+<div id="app">
+  <nav>
+    <div class="nav-title">Settings</div>
+    <input id="search" type="text" placeholder="Filter settings…" autocomplete="off">
+    <div id="navlist"></div>
+    <div class="navfoot" id="navfoot"></div>
+  </nav>
+  <main>
+    <div id="content"></div>
+    <footer>
+      <span id="status"></span>
+      <button class="btn" id="btn-test">Test connection</button>
+      <button class="btn" id="btn-cancel">Cancel</button>
+      <button class="btn primary" id="btn-save">Save</button>
+    </footer>
+  </main>
+</div>
+
+<script>
+const PAYLOAD = __PAYLOAD__;
+
+const state = {
+  sections: PAYLOAD.sections,
+  values: { ...PAYLOAD.values },
+  errors: {},
+  /* Live /models results per refreshable field: {ids, loaded, note}. Populated by
+     refreshField(); the open-time silent pass fills model_name so a stale name is
+     auto-corrected to the single loaded model, as the Tk dialog did. */
+  models: {},
+  active: PAYLOAD.sections[0].id,
+  filter: "",
+  // panel caches, so switching nav tabs does not re-download anything
+  skills: null,
+  skillsFolders: [],
+  catalog: null,
+  catalogLive: false,
+  mcp: null,
+  mcpMax: 8,
+  // The prompt editor keeps its buffer in state, NOT in the DOM: switching nav
+  // tabs must not lose an edit in progress. `disk` is the baseline the app
+  // compares against on save (the lost-update guard), `buf` is what is typed.
+  prompt: null,
+  promptBuf: null,
+  promptDisk: "",
+  promptView: "file",
+  promptMsg: null,
+};
+
+const el = (id) => document.getElementById(id);
+const content = el("content");
+
+/* ── nav ──────────────────────────────────────────────────── */
+function renderNav() {
+  const nav = el("navlist");
+  nav.innerHTML = "";
+  for (const sec of state.sections) {
+    const b = document.createElement("button");
+    b.className = "nav-item" + (sec.id === state.active ? " active" : "")
+                + (hasSectionError(sec) ? " has-error" : "");
+    b.innerHTML = `<span>${escapeHtml(sec.title)}</span><span class="dot"></span>`;
+    b.onclick = () => { state.active = sec.id; state.filter = ""; el("search").value = ""; render(); };
+    nav.appendChild(b);
+  }
+  el("navfoot").textContent = state.sections.length + " sections";
+}
+
+function hasSectionError(sec) {
+  return (sec.fields || []).some(f => state.errors[f.key]);
+}
+
+/* ── field rendering ──────────────────────────────────────── */
+function fieldEl(f) {
+  const wrap = document.createElement("div");
+  wrap.className = "field";
+  wrap.dataset.key = f.key;
+
+  const isBool = f.type === "bool";
+
+  const label = document.createElement("label");
+  label.textContent = f.label;
+  if (f.unit) {
+    const u = document.createElement("span");
+    u.className = "unit";
+    u.textContent = "(" + f.unit + ")";
+    label.appendChild(u);
+  }
+  wrap.appendChild(label);
+
+  if (isBool) {
+    const row = document.createElement("div");
+    row.className = "toggle-row";
+    const sw = document.createElement("label");
+    sw.className = "switch";
+    const cb = document.createElement("input");
+    cb.type = "checkbox";
+    cb.checked = truthy(state.values[f.key]);
+    cb.onchange = () => { state.values[f.key] = cb.checked; clearError(f.key); };
+    const sl = document.createElement("span");
+    sl.className = "slider";
+    sw.appendChild(cb); sw.appendChild(sl);
+    row.appendChild(sw);
+    wrap.appendChild(row);
+  } else if (f.type === "path") {
+    const row = document.createElement("div");
+    row.className = "path-row";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.value = state.values[f.key] ?? "";
+    inp.oninput = () => { state.values[f.key] = inp.value; clearError(f.key); };
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.textContent = "Browse…";
+    b.onclick = async () => {
+      const picked = await window.pywebview.api.pick_folder(f.label, inp.value || "");
+      if (picked) { inp.value = picked; state.values[f.key] = picked; }
+    };
+    row.appendChild(inp); row.appendChild(b);
+    wrap.appendChild(row);
+    inp.classList.toggle("err", !!state.errors[f.key]);
+  } else if (f.multiline) {
+    const ta = document.createElement("textarea");
+    ta.value = state.values[f.key] ?? "";
+    ta.oninput = () => { state.values[f.key] = ta.value; clearError(f.key); };
+    ta.classList.toggle("err", !!state.errors[f.key]);
+    wrap.appendChild(ta);
+  } else if (f.refresh) {
+    /* Server-backed name field: editable text (free typing still works, exactly like
+       the Tk editable combobox) plus a datalist of live ids merged with saved
+       history, a Refresh button, and the "loaded on server" note. The exact ID
+       matters - a display name or a missing namespace prefix saves fine and then
+       404s at chat time. */
+    const m = state.models[f.key] || { ids: [], loaded: [], note: "" };
+    const hist = (PAYLOAD.suggest && PAYLOAD.suggest[f.key]) || [];
+    const opts = m.ids.concat(hist.filter(h => m.ids.indexOf(h) < 0));
+
+    const row = document.createElement("div");
+    row.className = "path-row";
+    const inp = document.createElement("input");
+    inp.type = "text";
+    inp.value = state.values[f.key] ?? "";
+    inp.setAttribute("list", "dl-" + f.key);
+    inp.oninput = () => { state.values[f.key] = inp.value; clearError(f.key); };
+    inp.classList.toggle("err", !!state.errors[f.key]);
+
+    const dl = document.createElement("datalist");
+    dl.id = "dl-" + f.key;
+    opts.forEach(o => {
+      const op = document.createElement("option");
+      op.value = o;
+      dl.appendChild(op);
+    });
+
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.textContent = f.refresh === "expert_models" ? "List models" : "Refresh models";
+    b.onclick = () => refreshField(f, inp, false);
+    row.appendChild(inp); row.appendChild(b);
+
+    // "Use loaded model": the reliable fix when you do not know the exact ID.
+    if (f.refresh === "models") {
+      const ub = document.createElement("button");
+      ub.className = "btn";
+      ub.textContent = "Use loaded model";
+      ub.disabled = m.loaded.length !== 1;
+      ub.onclick = () => {
+        if (m.loaded.length === 1) {
+          inp.value = m.loaded[0];
+          state.values[f.key] = m.loaded[0];
+          clearError(f.key);
+          setStatus("Model Name set to loaded model: " + m.loaded[0], "ok");
+        }
+      };
+      row.appendChild(ub);
+    }
+    wrap.appendChild(row);
+    wrap.appendChild(dl);
+
+    if (m.note) {
+      const n = document.createElement("div");
+      n.className = "model-note";
+      n.textContent = m.note;
+      wrap.appendChild(n);
+    }
+  } else {
+    const inp = document.createElement("input");
+    inp.type = f.type === "password" ? "password" : "text";
+    inp.value = state.values[f.key] ?? "";
+    inp.oninput = () => { state.values[f.key] = inp.value; clearError(f.key); };
+    inp.classList.toggle("err", !!state.errors[f.key]);
+    wrap.appendChild(inp);
+
+    if (f.type === "password") {
+      const r = document.createElement("button");
+      r.className = "reveal";
+      r.textContent = "show";
+      r.onclick = () => {
+        if (inp.type === "password") { inp.type = "text"; r.textContent = "hide"; }
+        else { inp.type = "password"; r.textContent = "show"; }
+      };
+      wrap.appendChild(r);
+    }
+  }
+
+  const h = document.createElement("div");
+  h.className = "help";
+  h.textContent = f.help || "";
+  wrap.appendChild(h);
+
+  if (state.errors[f.key]) {
+    const e = document.createElement("div");
+    e.className = "field-error";
+    e.textContent = state.errors[f.key];
+    wrap.appendChild(e);
+  }
+  return wrap;
+}
+
+function truthy(v) {
+  if (typeof v === "boolean") return v;
+  return ["1", "true", "yes", "on"].includes(String(v).toLowerCase());
+}
+
+function clearError(key) {
+  if (!state.errors[key]) return;
+  delete state.errors[key];
+  renderNav();
+  const wrap = content.querySelector(`[data-key="${key}"]`);
+  if (wrap) {
+    wrap.querySelectorAll(".err").forEach(n => n.classList.remove("err"));
+    const e = wrap.querySelector(".field-error");
+    if (e) e.remove();
+  }
+}
+
+/* ── main render ──────────────────────────────────────────── */
+function render() {
+  renderNav();
+  content.innerHTML = "";
+
+  if (state.filter) {
+    const q = state.filter.toLowerCase();
+    let hits = 0;
+    for (const sec of state.sections) {
+      const matched = (sec.fields || []).filter(f =>
+        (f.label + " " + (f.help || "") + " " + f.key).toLowerCase().includes(q));
+      if (!matched.length) continue;
+      const head = document.createElement("div");
+      head.className = "sec-head";
+      head.innerHTML = `<h1>${escapeHtml(sec.title)}</h1>
+        <p>${escapeHtml(sec.subtitle || "")}</p>`;
+      content.appendChild(head);
+      for (const f of matched) {
+        const h = document.createElement("div");
+        h.className = "search-hit";
+        h.appendChild(fieldEl(f));
+        content.appendChild(h);
+        hits++;
+      }
+    }
+    if (!hits) {
+      content.innerHTML = `<div class="sec-head"><h1>No matches</h1>
+        <p>Nothing matches “${escapeHtml(state.filter)}”.</p></div>`;
+    }
+    return;
+  }
+
+  const sec = state.sections.find(s => s.id === state.active);
+  if (!sec) return;
+  const head = document.createElement("div");
+  head.className = "sec-head";
+  head.innerHTML = `<h1>${escapeHtml(sec.title)}</h1>
+    <p>${escapeHtml(sec.subtitle || "")}</p>`;
+  content.appendChild(head);
+
+  if (sec.kind === "skills") { renderSkillsPanel(); return; }
+  if (sec.kind === "mcp")    { renderMcpPanel();    return; }
+  if (sec.kind === "prompt") { renderPromptPanel(); return; }
+
+  for (const f of (sec.fields || [])) content.appendChild(fieldEl(f));
+}
+
+/* ── skills panel ─────────────────────────────────────────── */
+async function renderSkillsPanel() {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  content.appendChild(panel);
+  panel.innerHTML = `<div class="empty">Scanning skill folders…</div>`;
+
+  if (!state.skills) {
+    const res = await window.pywebview.api.skills_list();
+    if (!res.ok) { panel.innerHTML = `<div class="empty">${escapeHtml(res.message || "Scan failed")}</div>`; return; }
+    state.skills = res.skills;
+    state.skillsFolders = res.folders || [];
+  }
+
+  panel.innerHTML = "";
+  const folders = state.skillsFolders.map(f =>
+    `<div class="meta">${escapeHtml(f)}</div>`).join("");
+  panel.insertAdjacentHTML("beforeend", `
+    <div class="hint">
+      Scanned: ${state.skillsFolders.length} folder(s)
+      ${folders ? `<div>${folders}</div>` : ""}
+    </div>
+    <div class="hint warn">
+      Installing a skill does NOT enable it. Nothing is injected into the prompt
+      and no skill code runs until you tick it below.
+    </div>`);
+
+  // installed list
+  const bar = document.createElement("div");
+  bar.className = "panel-toolbar";
+  bar.innerHTML = `
+    <input id="skill-filter" type="text" placeholder="Filter installed skills…" autocomplete="off">
+    <button class="btn" id="skill-reload">Rescan</button>
+    <button class="btn primary" id="skill-add">Add skill…</button>`;
+  panel.appendChild(bar);
+
+  const list = document.createElement("div");
+  list.className = "scroll-list";
+  list.id = "skill-list";
+  panel.appendChild(list);
+
+  const drawList = () => {
+    const q = (el("skill-filter").value || "").toLowerCase();
+    const rows = state.skills.filter(s =>
+      !q || (s.name + " " + s.description).toLowerCase().includes(q));
+    list.innerHTML = "";
+    if (!rows.length) {
+      list.innerHTML = `<div class="empty">No installed skills${q ? " match “" + escapeHtml(q) + "”" : ""}.</div>`;
+      return;
+    }
+    for (const s of rows) {
+      const row = document.createElement("div");
+      row.className = "row";
+      const tags = [
+        s.enabled ? `<span class="tag ok">enabled</span>` : `<span class="tag off">disabled</span>`,
+        s.supported ? "" : `<span class="tag">not on this OS</span>`,
+        s.platforms ? `<span class="tag">${escapeHtml(s.platforms)}</span>` : "",
+      ].join("");
+      row.innerHTML = `
+        <div class="body">
+          <div class="name">${escapeHtml(s.name)}</div>
+          <div class="desc">${escapeHtml(s.description || "")}</div>
+          <div class="meta">${escapeHtml(s.dir || "")}</div>
+        </div>
+        <div class="actions">
+          ${tags}
+          <label class="switch">
+            <input type="checkbox" ${s.enabled ? "checked" : ""} ${s.supported ? "" : "disabled"}>
+            <span class="slider"></span>
+          </label>
+        </div>`;
+      const cb = row.querySelector("input[type=checkbox]");
+      cb.onchange = async () => {
+        const res = await window.pywebview.api.skills_toggle(s.name, cb.checked);
+        if (!res.ok) { cb.checked = !cb.checked; setStatus(res.message || "Could not save", "bad"); return; }
+        s.enabled = cb.checked;
+        setStatus(cb.checked ? `Enabled ${s.name}` : `Disabled ${s.name}`, "ok");
+        drawList();
+      };
+      list.appendChild(row);
+    }
+  };
+  drawList();
+
+  el("skill-filter").oninput = drawList;
+  el("skill-reload").onclick = async () => {
+    state.skills = null;
+    setStatus("Rescanning…");
+    render();
+  };
+  el("skill-add").onclick = () => renderCatalogPanel();
+}
+
+/* catalog picker (replaces the old Tk Add Skill dialog).
+   A MODAL, not another section: it used to append itself to the skills panel, so
+   pressing "Add skills" pushed the list you were looking at down the page. */
+async function renderCatalogPanel() {
+  const scrim = document.createElement("div");
+  scrim.className = "modal-scrim";
+  scrim.id = "catalog-scrim";
+  const close = () => {
+    scrim.remove();
+    document.removeEventListener("keydown", onKey);
+  };
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  // click the backdrop (not the card) to dismiss
+  scrim.addEventListener("click", (e) => { if (e.target === scrim) close(); });
+  document.body.appendChild(scrim);
+
+  const wrap = document.createElement("div");
+  wrap.className = "modal";
+  wrap.id = "catalog-panel";
+  scrim.appendChild(wrap);
+  wrap.innerHTML = `<div class="empty">Loading catalog…</div>`;
+
+  if (!state.catalog) {
+    const res = await window.pywebview.api.skills_catalog(false);
+    state.catalog = res.records || [];
+    state.catalogLive = !!res.live;
+  }
+
+  wrap.innerHTML = `
+    <div class="sec-head" style="margin-bottom:12px">
+      <h1 style="font-size:15px">Add skills</h1>
+      <p>Offline bundled catalog${state.catalogLive ? " (live from GitHub)" : ""}.
+         Installed skills start disabled.</p>
+    </div>
+    <div class="panel-toolbar">
+      <input id="cat-filter" type="text" placeholder="Filter catalog…" autocomplete="off">
+      <button class="btn" id="cat-refresh">Refresh from GitHub</button>
+      <button class="btn primary" id="cat-install">Install selected</button>
+      <button class="btn" id="cat-close">Close</button>
+    </div>
+    <div class="scroll-list" id="cat-list"></div>`;
+
+  const list = el("cat-list");
+  const drawCat = () => {
+    const q = (el("cat-filter").value || "").toLowerCase();
+    const rows = state.catalog.filter(r =>
+      !q || (r.name + " " + r.description + " " + r.category).toLowerCase().includes(q));
+    list.innerHTML = "";
+    if (!rows.length) { list.innerHTML = `<div class="empty">No catalog entries match.</div>`; return; }
+    for (const r of rows) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `
+        <input type="checkbox" data-name="${escapeHtml(r.name)}">
+        <div class="body">
+          <div class="name">${escapeHtml(r.name)}</div>
+          <div class="desc">${escapeHtml(r.description || "")}</div>
+          <div class="meta">${escapeHtml(r.category || "")} · ${escapeHtml(r.folder || "")}</div>
+        </div>`;
+      list.appendChild(row);
+    }
+  };
+  drawCat();
+  el("cat-filter").oninput = drawCat;
+
+  el("cat-refresh").onclick = async () => {
+    setStatus("Fetching live catalog…");
+    const res = await window.pywebview.api.skills_catalog(true);
+    state.catalog = res.records || [];
+    state.catalogLive = !!res.live;
+    setStatus(res.live ? "Live catalog loaded" : "GitHub unreachable — offline catalog kept",
+              res.live ? "ok" : "bad");
+    drawCat();
+  };
+
+  el("cat-install").onclick = async () => {
+    const names = [...list.querySelectorAll("input[type=checkbox]")]
+      .filter(c => c.checked).map(c => c.dataset.name);
+    if (!names.length) { setStatus("Select at least one skill.", "bad"); return; }
+    setStatus(`Installing ${names.length} skill(s)…`);
+    const res = await window.pywebview.api.skills_install(names);
+    const failed = (res.results || []).filter(r => !r.ok);
+    setStatus(failed.length
+      ? `${res.installed} installed, ${failed.length} failed — ${failed[0].message}`
+      : `${res.installed} skill(s) installed (still disabled)`,
+      failed.length ? "bad" : "ok");
+    state.skills = null;
+    close();
+    render();
+  };
+
+  el("cat-close").onclick = close;
+}
+
+/* ── MCP panel ────────────────────────────────────────────── */
+async function renderMcpPanel() {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  content.appendChild(panel);
+  panel.innerHTML = `<div class="empty">Loading servers…</div>`;
+
+  if (!state.mcp) {
+    const res = await window.pywebview.api.mcp_list();
+    if (!res.ok) { panel.innerHTML = `<div class="empty">${escapeHtml(res.message || "Failed")}</div>`; return; }
+    state.mcp = res.servers || [];
+    state.mcpMax = res.max || 8;
+  }
+
+  panel.innerHTML = `
+    <div class="hint">
+      Stdio MCP servers only. Each server runs as a local subprocess with your
+      user privileges; its tools appear in the permission bar defaulting to
+      Ask Permission. ${state.mcp.length} of ${state.mcpMax} used.
+    </div>
+    <div id="mcp-list"></div>
+    <div class="sec-head" style="margin:18px 0 10px">
+      <h1 style="font-size:15px">Add a server</h1>
+    </div>
+    <div class="form-grid">
+      <div class="field">
+        <label>Name</label>
+        <input id="mcp-name" type="text" placeholder="e.g. filesystem">
+        <div class="help">Short identifier; becomes the mcp_&lt;name&gt;_&lt;tool&gt; prefix.</div>
+      </div>
+      <div class="field">
+        <label>Command</label>
+        <input id="mcp-command" type="text" placeholder="e.g. npx, or a full path to an executable">
+      </div>
+      <div class="field">
+        <label>Args</label>
+        <input id="mcp-args" type="text" placeholder="-m  mcp_server_fs  C:\\data">
+        <div class="help">Space-separated. Backslashes are preserved as typed.</div>
+      </div>
+      <div class="field">
+        <label>Env vars</label>
+        <input id="mcp-env" type="text" placeholder="PATH=&quot;C:\\Program Files\\bin&quot;">
+        <div class="help">Space-separated KEY=VALUE pairs; quote a value containing spaces.</div>
+      </div>
+    </div>
+    <div class="form-actions">
+      <button class="btn primary" id="mcp-add">Add &amp; connect</button>
+      <button class="btn" id="mcp-reset">Clear</button>
+    </div>
+    <div id="mcp-err" class="field-error"></div>`;
+
+  const drawServers = () => {
+    const list = el("mcp-list");
+    list.innerHTML = "";
+    if (!state.mcp.length) {
+      list.innerHTML = `<div class="empty">No MCP servers configured.</div>`;
+      return;
+    }
+    for (const s of state.mcp) {
+      const row = document.createElement("div");
+      row.className = "row";
+      row.innerHTML = `
+        <div class="body">
+          <div class="name">${escapeHtml(s.name)}</div>
+          <div class="meta">${escapeHtml(s.command)} ${escapeHtml((s.args || []).join(" "))}</div>
+          ${Object.keys(s.env || {}).length
+            ? `<div class="meta">env: ${escapeHtml(Object.entries(s.env).map(([k, v]) => k + "=" + v).join(" "))}</div>`
+            : ""}
+        </div>
+        <div class="actions">
+          <button class="btn danger" data-remove="${escapeHtml(s.name)}">Remove</button>
+        </div>`;
+      row.querySelector("button").onclick = async () => {
+        const res = await window.pywebview.api.mcp_remove(s.name);
+        if (!res.ok) { setStatus(res.message || "Could not save", "bad"); return; }
+        state.mcp = res.servers || [];
+        drawServers();
+        setStatus(`Removed ${s.name}`, "ok");
+      };
+      list.appendChild(row);
+    }
+  };
+  drawServers();
+
+  el("mcp-reset").onclick = () => {
+    for (const id of ["mcp-name", "mcp-command", "mcp-args", "mcp-env"]) el(id).value = "";
+    el("mcp-err").textContent = "";
+  };
+
+  el("mcp-add").onclick = async () => {
+    el("mcp-err").textContent = "";
+    const res = await window.pywebview.api.mcp_add(
+      el("mcp-name").value, el("mcp-command").value,
+      el("mcp-args").value, el("mcp-env").value);
+    if (!res.ok) {
+      const errs = res.errors || {};
+      el("mcp-err").textContent = errs.name || errs._ || "Could not add server.";
+      return;
+    }
+    state.mcp = res.servers || [];
+    drawServers();
+    el("mcp-reset").onclick();
+    setStatus("Server added — it connects when the app reloads settings.", "ok");
+  };
+}
+
+
+/* ── system prompt panel ──────────────────────────────────── */
+async function renderPromptPanel() {
+  const panel = document.createElement("div");
+  panel.className = "panel";
+  content.appendChild(panel);
+  panel.innerHTML = `<div class="empty">Reading ${escapeHtml("SYSTEMPROMPT.md")}…</div>`;
+
+  if (state.promptBuf === null) {
+    const res = await window.pywebview.api.prompt_get();
+    if (!res.ok) {
+      panel.innerHTML = `<div class="empty">${escapeHtml(res.message || "Could not read the prompt file")}</div>`;
+      return;
+    }
+    state.prompt = res;
+    state.promptDisk = res.text;
+    state.promptBuf = res.text;
+    state.promptMsg = null;
+  }
+
+  const meta = state.prompt;
+  const editing = state.promptView === "file";
+  const dirty = state.promptBuf !== state.promptDisk;
+
+  panel.innerHTML = "";
+  panel.insertAdjacentHTML("beforeend", `
+    <div class="hint">
+      ${escapeHtml(meta.name)} · ${meta.size.toLocaleString()} chars ·
+      <span class="meta">${escapeHtml(meta.path)}</span>
+    </div>
+    <div class="hint${meta.enabled ? "" : " warn"}">
+      ${meta.enabled
+        ? "Injected into every request. The app owns the blocks listed below and "
+          + "rewrites them before each turn - text typed inside a pair of markers "
+          + "is replaced, not kept."
+        : "Currently NOT sent. The text is kept, just not injected - the Prompt "
+          + "toggle in the main window does the same thing."}
+    </div>`);
+
+  // tabs: the two views are different texts and must never be conflated
+  const tabs = document.createElement("div");
+  tabs.className = "prompt-tabs";
+  tabs.innerHTML = `
+    <button id="pv-file" class="${editing ? "on" : ""}">Edit file</button>
+    <button id="pv-sent" class="${editing ? "" : "on"}">As sent</button>
+    <span class="grow"></span>
+    <label class="hint" style="margin:0;display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="prompt-enabled" ${meta.enabled ? "checked" : ""}> sent
+    </label>`;
+  panel.appendChild(tabs);
+
+  const ta = document.createElement("textarea");
+  ta.className = "prompt-body";
+  ta.spellcheck = false;
+  ta.value = editing ? state.promptBuf : (meta.sent || "");
+  if (!editing) ta.readOnly = true;
+  panel.appendChild(ta);
+
+  if (!editing && meta.sent_err) {
+    panel.insertAdjacentHTML("beforeend",
+      `<div class="prompt-msg bad">Could not assemble: ${escapeHtml(meta.sent_err)}</div>`);
+  } else if (!editing) {
+    panel.insertAdjacentHTML("beforeend",
+      `<div class="hint" style="margin-top:8px">${escapeHtml(meta.sent_note)}</div>`);
+  }
+
+  if (editing) {
+    ta.addEventListener("input", () => {
+      state.promptBuf = ta.value;
+      foot.querySelector("#p-dirty").textContent =
+        (state.promptBuf === state.promptDisk) ? "" : "unsaved changes";
+      btnSave.disabled = state.promptBuf === state.promptDisk;
+    });
+  }
+
+  const foot = document.createElement("div");
+  foot.className = "prompt-foot";
+  foot.innerHTML = `
+    <button class="btn primary" id="p-save" ${(!editing || !dirty) ? "disabled" : ""}>Save</button>
+    <button class="btn" id="p-reload">Reload</button>
+    ${editing ? `<select id="p-block">
+        <option value="">Release block…</option>
+        ${(meta.blocks || []).map(b => `<option value="${escapeHtml(b)}">${escapeHtml(b)}</option>`).join("")}
+      </select>
+      <button class="btn" id="p-release" ${(meta.blocks || []).length ? "" : "disabled"}>Release</button>` : ""}
+    <span class="grow"></span>
+    <span id="p-dirty" class="hint" style="margin:0;color:var(--warn)">${dirty ? "unsaved changes" : ""}</span>`;
+  panel.appendChild(foot);
+  const btnSave = foot.querySelector("#p-save");
+
+  if (state.promptMsg) {
+    panel.insertAdjacentHTML("beforeend",
+      `<div class="prompt-msg ${state.promptMsg.warn ? "bad" : "ok"}">${escapeHtml(state.promptMsg.text)}</div>`);
+  }
+
+  if ((meta.unknown || []).length) {
+    panel.insertAdjacentHTML("beforeend",
+      `<div class="hint warn">Unknown placeholder(s), sent literally:
+        ${meta.unknown.map(u => escapeHtml("{{" + u + "}}")).join(", ")}</div>`);
+  }
+
+  const reload = async () => {
+    const res = await window.pywebview.api.prompt_get();
+    if (!res.ok) { setStatus(res.message, "bad"); return; }
+    state.prompt = res;
+    state.promptDisk = res.text;
+    state.promptBuf = res.text;
+    state.promptMsg = null;
+    render();
+  };
+
+  tabs.querySelector("#pv-file").onclick = () => { state.promptView = "file"; render(); };
+  tabs.querySelector("#pv-sent").onclick = async () => {
+    // Re-read the file before assembling: a skill toggle or a Settings save in
+    // another window changes what is sent, and this tab claims to show exactly that.
+    state.promptView = "sent";
+    state.promptBuf = ta.value;
+    const res = await window.pywebview.api.prompt_get();
+    if (res.ok) { state.prompt = { ...res, text: state.promptDisk }; }
+    render();
+  };
+  tabs.querySelector("#prompt-enabled").onchange = async (e) => {
+    const res = await window.pywebview.api.prompt_toggle(e.target.checked);
+    if (!res.ok) { setStatus(res.message || "Could not save", "bad"); e.target.checked = !e.target.checked; return; }
+    state.prompt = { ...res, text: state.promptDisk };
+    setStatus(res.enabled ? "Prompt will be sent" : "Prompt kept but not sent", "ok");
+    render();
+  };
+
+  foot.querySelector("#p-reload").onclick = reload;
+
+  btnSave.onclick = async () => {
+    setStatus("Saving…");
+    const res = await window.pywebview.api.prompt_save(state.promptBuf, state.promptDisk);
+    if (!res.ok) {
+      // Refused: the buffer is kept exactly as typed. A refusal must never cost
+      // the user the edit they just made.
+      state.promptMsg = { text: res.message, warn: true };
+      render();
+      setStatus("Not saved", "bad");
+      return;
+    }
+    // Adopt the TRUE post-sync bytes: sync regenerates managed blocks, so an edit
+    // inside one is already gone and showing it would keep lying.
+    state.promptDisk = res.text;
+    state.promptBuf = res.text;
+    state.promptMsg = { text: res.message, warn: !!res.warn };
+    // Re-read rather than re-derive. Which markers exist and which placeholders
+    // are unknown is the app's business (SP_MARK, _unknown_prompt_tokens); parsing
+    // the markers again here would be a second implementation free to drift.
+    const fresh = await window.pywebview.api.prompt_get();
+    if (fresh.ok) {
+      state.prompt = fresh;
+      state.promptDisk = res.text;      // ours: fresh.text == res.text post-sync
+      state.promptBuf = res.text;
+    }
+    render();
+    setStatus("Saved", "ok");
+  };
+
+  const rel = foot.querySelector("#p-release");
+  if (rel) rel.onclick = async () => {
+    const kind = foot.querySelector("#p-block").value;
+    if (!kind) { setStatus("Pick a block first", "bad"); return; }
+    const res = await window.pywebview.api.prompt_release(kind, state.promptBuf);
+    if (!res.ok) { state.promptMsg = { text: res.message, warn: true }; render(); return; }
+    state.promptBuf = res.text;
+    state.promptMsg = { text: res.message, warn: !!res.warn };
+    render();
+  };
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"
+  }[c]));
+}
+
+/* ── actions ──────────────────────────────────────────────── */
+function setStatus(msg, kind) {
+  const s = el("status");
+  s.textContent = msg || "";
+  s.className = kind || "";
+}
+
+el("search").addEventListener("input", (e) => {
+  state.filter = e.target.value.trim();
+  render();
+});
+
+el("btn-save").onclick = async () => {
+  setStatus("Saving…");
+  const res = await window.pywebview.api.save(state.values);
+  if (res.ok) {
+    /* The bridge may have rewritten a typed model name into the exact server ID, and
+       it owns model_history. Adopt what it actually stored - otherwise the form keeps
+       showing the pre-normalisation text and lies about what is on disk. */
+    if (res.values) state.values = { ...state.values, ...res.values };
+    setStatus((res.notes && res.notes.length) ? res.notes.join(" · ") : "Saved",
+              (res.notes && res.notes.length) ? "" : "ok");
+    render();
+  } else {
+    state.errors = res.errors || {};
+    renderNav();
+    render();
+    setStatus("Fix the highlighted fields.", "bad");
+    const first = Object.keys(state.errors)[0];
+    const wrap = content.querySelector(`[data-key="${first}"]`);
+    if (wrap) wrap.scrollIntoView({ block: "center" });
+  }
+};
+
+el("btn-cancel").onclick = () => window.pywebview.api.cancel();
+
+el("btn-test").onclick = async () => {
+  setStatus("Testing…");
+  const res = await window.pywebview.api.test_connection(
+    state.values.server_url, state.values.api_key);
+  setStatus(res.message, res.ok ? "ok" : "bad");
+};
+
+/* Fetch a server-backed name list. `auto` marks the open-time silent pass: only it
+   may overwrite Model Name, and only when the current value is unknown to the server
+   AND exactly one model is loaded. A manual Refresh never clobbers what the user just
+   typed or picked - the Tk dialog carried that comment and it still applies. */
+async function refreshField(f, inp, auto) {
+  const api = window.pywebview.api;
+  const expert = f.refresh === "expert_models";
+  const url = expert ? state.values.expert_server_url : state.values.server_url;
+  const key = expert ? state.values.expert_api_key : state.values.api_key;
+  if (expert && !(url || "").trim()) {
+    setStatus("Set Consultant URL and key first.", "bad");
+    return;
+  }
+  setStatus("Loading models…");
+  let res;
+  try {
+    res = expert ? await api.refresh_expert_models(url, key)
+                 : await api.refresh_models(url, key);
+  } catch (e) {
+    setStatus("Model list failed: " + e, "bad");
+    return;
+  }
+  state.models[f.key] = { ids: res.ids || [], loaded: res.loaded || [],
+                          note: res.note || "" };
+  if (!expert && auto) {
+    const loaded = res.loaded || [];
+    const cur = String(state.values[f.key] || "").trim();
+    const known = (res.ids || []).indexOf(cur) >= 0;
+    if (loaded.length === 1 && !known && cur !== loaded[0]) {
+      state.values[f.key] = loaded[0];
+      if (inp) inp.value = loaded[0];
+      render();
+      setStatus("Model Name auto-corrected to the loaded model: " + loaded[0], "ok");
+      return;
+    }
+    if (loaded.length > 1 && !known) {
+      render();
+      setStatus("Several models are loaded - pick one from the list", "");
+      return;
+    }
+  }
+  render();
+  setStatus(res.message || (res.ok ? "Model list updated" : "Model list unavailable"),
+            res.ok ? "ok" : "bad");
+}
+
+/* Open-time silent refresh of the primary model list, mirroring the Tk dialog's
+   `_refresh_models(True)` at build time. Best-effort: a server that is down must not
+   make the window look broken, so a failure settles into the field's own note. */
+async function autoLoadModels() {
+  const f = PAYLOAD.sections.flatMap(s => s.fields).find(x => x.refresh === "models");
+  if (!f) return;
+  try {
+    await refreshField(f, null, true);
+  } catch (e) { /* no server / no bridge: leave the saved value alone */ }
+}
+
+render();
+autoLoadModels();
+</script>
+</body>
+</html>

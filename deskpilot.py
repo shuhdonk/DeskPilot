@@ -1423,13 +1423,20 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.1.92"
+VERSION    = "1.2.32"
+# What the UI shows. VERSION itself must stay a bare dotted number: it goes on
+# the wire as the HTTP User-Agent ("Deskpilot/1.2.26") and in the MCP handshake's
+# clientInfo.version, so overloading it to label a fork would corrupt both.
+# next/run_next.py sets this to "0.1.0 · app 1.2.26" so a Next window can never
+# again look like a build it is not.
+VERSION_DISPLAY = VERSION
 BASE_DIR   = Path(__file__).resolve().parent
 # Data files default to next to the script; main() relocates them to
 # %LOCALAPPDATA%\Deskpilot when that is writable (see resolve_data_dir).
 SETTINGS_FILE = BASE_DIR / "deskpilot_settings.json"
 CHATS_FILE    = BASE_DIR / "deskpilot_chats.json"
 GEN_DIR      = BASE_DIR / "generated_images"
+DATA_DIR: Optional[Path] = None   # app data store; main() sets it before any prompt read
 MODEL_CACHE_DIR: Optional[Path] = None   # --multi: pin whisper/kokoro caches to the MAIN data dir (None = derive from GEN_DIR)
 try:
     GEN_DIR.mkdir(exist_ok=True)
@@ -1558,6 +1565,46 @@ EXPERT_FILE_CHARS = 60000         # per file handed to the expert
 EXPERT_TOTAL_CHARS = 200000       # all files + context combined
 EXPERT_MIN_CAP = 4096             # below this, retrying without a cap is pointless
 
+# v1.2.21: how many times one user prompt may auto-continue a reply the engine cut
+# off at the token limit (finish_reason='length'). Bounded because a model that
+# truncates every time would otherwise loop until the context is full; three lets a
+# genuinely long answer finish while capping the damage when something is wrong.
+TRUNC_CONTINUES_MAX = 3
+
+# v1.2.22: how many times ONE user prompt may nudge the model after it writes a
+# lead-in promising an action and then stops without emitting the tool call.
+# Bounded per TURN, not per step: MAX_TOOL_STEPS defaults to 0 (no cap) and the
+# turn deadline is opt-in, so a per-step allowance would let a model stuck in
+# "announce, stop, announce, stop" nudge itself until the context filled. Two
+# gives the measured recovery its chance (4/4) and then lets the turn end.
+DANGLING_NUDGES_MAX = 2
+
+# Wording matters: it has to name the missing action, not just say "continue",
+# because the failure is the model completing the SENTENCE instead of making the
+# CALL. Kept short - it is injected into the live history and summarised later.
+DANGLING_INTENT_NUDGE = (
+    "[Your message ended by announcing an action, but you did not emit the tool "
+    "call for it. Do not restate the announcement or explain what you were about "
+    "to do - emit the tool call now.]"
+)
+
+# v1.2.22: does this reply read as a promise that was never kept?
+# The signal is a trailing colon: the model set up the thing it was about to show
+# or do, then emitted EOS. Deliberately narrow - a real answer that happens to
+# mention "I'll check" mid-paragraph must NOT be interrupted, so prose that ends
+# in a full stop is left alone. Trailing quote/backtick/bracket punctuation is
+# stripped first because the model often closes a code span after the colon.
+def _announces_pending_action(text: str) -> bool:
+    t = (text or "").rstrip()
+    while t and t[-1] in "`*'\"\u201d\u2019)]} \t\r\n":
+        t = t[:-1].rstrip()
+    if not t.endswith(":"):
+        return False
+    # A reply that is ONLY a colon-ish fragment carries no information; still
+    # worth nudging. But a very long body ending in a colon is a truncated
+    # listing, not a dangling promise - the length branch handles that instead.
+    return len(t) <= 1200
+
 # ── Full-text chat search (v1.1.42) ───────────────────────────────────────────
 # The sidebar search box only ever matched chat TITLES, so a 20 MB history was
 # effectively unsearchable. This adds a SQLite FTS5 index over every message body.
@@ -1593,8 +1640,8 @@ ARCHIVE_MSG_CAP         = 4000    # read_archive: chars of one archived message
 # guess made after the fact; chat["compaction_archive"] survives but is deleted with
 # the chat. A ledger that is only ever appended to cannot silently lose an earlier
 # entry, and it lives in its own file so deleting the conversation does not take the
-# memory with it. The store is unbounded; only what gets injected into the prompt is
-# capped - an uncapped "keep everything" view would just hit the same wall later.
+# memory with it. The store is unbounded and, since v1.2.5, NOTHING from it is
+# injected into the system prompt - read_ledger() is the only way in, and it pages.
 LEDGER_DIR_NAME         = "ledger"
 LEDGER_GLOBAL_NAME      = "_global.jsonl"   # standing facts, shared by every chat
 LEDGER_ENTRY_MAX_CHARS  = 4000    # one entry's text (caps a single remember() call)
@@ -1602,9 +1649,6 @@ LEDGER_ENTRY_HARD_MAX   = 20000   # beyond this the call is refused, not truncat
 LEDGER_TAGS_MAX         = 8
 LEDGER_PAGE_DEFAULT     = 25      # read_ledger: entries per call
 LEDGER_PAGE_MAX         = 100
-LEDGER_INJECT_DEFAULT   = 4000    # chars of ledger tail in the system prompt (0 = off)
-LEDGER_INJECT_MAX       = 20000   # ceiling on that setting
-LEDGER_INJECT_ENTRIES   = 60      # never inject more than this many entries
 LEDGER_SCAN_MAX_BYTES   = 4_000_000  # a runaway ledger is read up to this far
 
 # ── v1.1.66: project memory index ────────────────────────────────────────────
@@ -1620,17 +1664,26 @@ PROJECT_MEMORY_SUBDIR   = "projects"      # where per-project memory files live
 PROJECT_MEMORY_DEFAULT  = 8000            # chars injected (0 = off)
 PROJECT_MEMORY_MAX      = 24000           # ceiling on that setting
 PROJECT_MEMORY_READ_MAX = 64000           # bytes read from disk before capping
-# v1.1.86 (SOW item 5 Gap 1): the ACTIVE project's own MEMORY.md is injected too.
-# Its own budget, separate from the index: the two files have different shapes and
-# different growth rates, and one knob for both meant a big project memory could only
-# be carried by inflating every index. Sized from the REAL files, not a guess - the
-# largest project memory in this workspace measured 26,483 chars (farmsentry,
-# 2026-10-19), so the default carries every current project with headroom and none
-# silently loses its tail. It rides on every request, but as a STABLE prefix that
-# changes only when the project or its memory changes, so a prefix-caching server
-# reuses it instead of re-prefilling it per turn.
-PROJECT_MEMORY_PROJECT_DEFAULT = 28000    # chars of the active project's MEMORY.md
-PROJECT_MEMORY_PROJECT_MAX     = 32000    # ceiling on that setting
+PROJECT_MEMORY_PROJECT_MAX = 14000        # v1.2.10: bound on the ACTIVE project's MEMORY.md
+# v1.2.16 memory_note. The pointer cap is the rule prose failed to enforce for five
+# releases, so the tool enforces it: a paragraph-shaped pointer is refused. Measured
+# on the live indexes a real routing row runs 94-271 chars (median 163), so 200 is
+# tight but fair - and the 1,348-char row that exists today is the disease, not the
+# precedent to match.
+MEMORY_NOTE_POINTER_MAX = 200
+MEMORY_NOTE_FACT_MAX    = 6000     # one fact, not a file dump
+MEMORY_NOTE_SCAN_MAX    = 400000   # bytes of project markdown searched for duplicates
+MEMORY_NOTE_SIMILAR     = 0.80     # Jaccard token overlap that counts as a near-match
+MEMORY_NOTE_SECTION     = "## Notes written by memory_note"
+                                        # injected per chat; the linter fails a project file over it
+
+# ── v1.2.3 Phase 1: the system prompt is ONE user-editable file ──────────────
+SYSTEMPROMPT_NAME = "SYSTEMPROMPT.md"   # app DATA dir, beside the JSON store
+SYSTEMPROMPT_READ_MAX = 200_000         # a prompt this long is a mistake; cap the read
+# Seed + safety net, GENERATED from the pre-Phase-1 build_system_message() so this phase
+# cannot change behaviour. Edit SYSTEMPROMPT.md, not this constant; it is used only when
+# the file is missing, empty or unreadable.
+SYSTEMPROMPT_DEFAULT = "You are Deskpilot, a helpful local AI desktop assistant running on the user's computer.{{workspace}}{{web_search}}{{scraper}} Tool economy: each tool call costs a full round trip and its output stays in context, so batch what you can - one comprehensive call that prints several things beats several narrow calls asking one question each; use search_files to locate code before reading whole files; do not re-read a file you already read this turn unless it changed. Verify the work, but verify it once and comprehensively rather than repeatedly in small probes. Verify before you assert: when a claim is about something that can have changed (prices, stock, versions, dates, what a product or API currently does, who holds what role) - or you would hesitate to bet on it - check it rather than answering from memory: one exa_search or searxng_search, or ask_expert for a code or design question you are unsure about. Budget it: one check per question, and if the first one does not settle it, state what is still uncertain and say so plainly instead of presenting a guess as a fact."
 # Active-project naming (v1.1.81). Declared up here because TOOL_SCHEMAS interpolates
 # PROJECT_SLUG_MAX into the set_project schema at import time - defining it further
 # down makes the module fail to import at all, which is a red screen, not a red test.
@@ -1658,9 +1711,16 @@ TEMP_DEFAULT      = "0.7"                                    # default temperatu
 # v1.1.77: High and XHigh are now SEPARATE choices. They used to be the same value -
 # "High" mapped to the template's maximum, xhigh - so a chat set to High was silently
 # running at maximum deliberation, and there was no way to ask for the plain "high"
-# tier at all. On Qwen3.8 Flash-Next high and xhigh resolve identically, so chats
-# already set to High are unaffected in practice; on engines that honour the full
-# ladder the distinction is real and worth exposing.
+# tier at all.
+# ⚠ v1.2.23: what used to sit here - "on Qwen3.8 Flash-Next high and xhigh resolve
+# identically, so chats already set to High are unaffected" - is FALSE for the
+# template Radiance serves today. It accepts only xhigh / medium / low and RAISES a
+# Jinja exception on 'high', so every turn of a High chat burned a 400 round-trip and
+# then ran with thinking silently dropped by the self-heal. A chat template's legal
+# tiers cannot be known from here, so they are now LEARNED from the server's own
+# refusal (parse_reasoning_tiers) and an illegal level is clamped to the nearest real
+# tier, up on a tie. Do not re-add a per-model claim to this comment - that is the
+# exact shape of the staleness that caused this.
 THINK_VALUES      = ("Default", "Off", "Low", "Medium", "High", "XHigh")
 THINK_DEFAULT     = "Default"
 
@@ -1980,16 +2040,31 @@ def spell_suggestions(word: str, checker, limit: int = 5) -> List[str]:
 # ---------------------------------------------------------------------------
 #  Dark modern palette ──────────────────────────────────────────────────────
 COL = {
-    "bg_deep":   "#171717",   # deepest surface (sidebar, code blocks)
-    "bg_main":   "#202123",   # main chat workspace
-    "bg_raised": "#40414F",   # raised / hover surfaces
-    "accent":    "#3B82F6",   # primary blue
-    "success":   "#10B981",   # green
-    "danger":    "#EF4444",   # red
-    "warning":   "#F59E0B",   # amber
-    "text":      "#E5E7EB",
-    "text_dim":  "#9CA3AF",
-    "border":    "#2E2F33",
+    # ⚠ Hues follow next/settings_ui.html :root - the two windows sit side by side,
+    # so a hue change belongs in BOTH files in one pass. accent/danger/warning were
+    # already identical; the rest were Tk's original neutral grey.
+    #
+    # ⚠ Lightness does NOT follow the web file, on purpose. The web UI outlines
+    # every .btn with a 1px --border; buttons here are relief="flat", bd=0 and are
+    # separated from the page by lightness alone. bg_raised/hover therefore keep the
+    # old luminance (1.58:1 / 1.23:1 vs page) - the web values would have dropped
+    # them to 1.23:1 / 1.16:1 and made the controls blur into the background.
+    # Measured with dev_scripts/_contrast_check.py; re-run it before changing these.
+    "bg_deep":   "#16181D",   # deepest surface (sidebar, code blocks) = --bg
+    "bg_main":   "#1C1F26",   # main chat workspace                     = --bg-nav
+    "bg_raised": "#39404E",   # raised surfaces / buttons (Tk-safe lightness)
+    "accent":    "#3B82F6",   # primary blue                            = --accent
+    "accent_hover": "#2563EB",                                          # --accent-dim
+    "success":   "#22C55E",   # green                                   = --ok
+    "success_hover": "#059669",
+    "danger":    "#EF4444",   # red                                     = --danger
+    "danger_hover": "#5B2323",  # hover on a raised button whose TEXT is danger
+    "stop_hover":   "#B91C1C",  # hover on a FILLED danger button (Stop)
+    "warning":   "#F59E0B",   # amber                                   = --warn
+    "text":      "#E6E9EF",
+    "text_dim":  "#9AA3B2",
+    "border":    "#333947",
+    "hover":     "#454D5E",   # neutral button hover (was 26x a #4B5563 literal)
 }
 
 # Font scaling: the "UI Font Size" setting (ui_font_size, default 12) sets the base
@@ -2034,6 +2109,7 @@ TOOLS: List[tuple] = [
     ("remember",             "🧷 Remember"),
     ("read_ledger",          "📓 Ledger"),
     ("set_project",          "📁 Project"),
+    ("memory_note",          "🗒 Note"),
     ("set_clipboard",        "📋 Set"),
     ("transcribe_audio",     "🎧 Audio"),
     # Consultant. Must be listed here too or it gets no permission chip, and the
@@ -2047,6 +2123,32 @@ TOOLS: List[tuple] = [
 
 # ── OpenAI-compatible tool schemas ───────────────────────────────────────────
 TOOL_SCHEMAS: Dict[str, dict] = {
+    "memory_note": {
+        "type": "function",
+        "function": {
+            "name": "memory_note",
+            # The description carries the routing decision: ledger vs MEMORY.md vs
+            # a sibling file. All three look similar from inside a turn, and picking
+            # wrong is what produced the churn.
+            "description": ("Record ONE durable project fact and keep the project index pointing at it, in a single call: the fact is appended to projects/<project>/history/<topic>.md and a one-line pointer is inserted into that project MEMORY.md. Use it for anything a later session working on THIS project must know: a decision and why, a constraint, an exact value or command that worked, a failure mode not to repeat. Prefer it over editing MEMORY.md directly, because detail goes in the sibling and the index only ever gains one row per TOPIC, so it cannot blow the injection budget with prose. It refuses to write a duplicate and reports where the fact already lives. Requires an active project (set_project first, or pass project=). NOT for: session status, progress narratives or build/test results; facts that outlive one project (use remember() with global=true); multi-paragraph writeups (use write_local_file, then note the path)."),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "fact": {"type": "string",
+                             "description": ("The fact. One per call, self-contained, max " + str(MEMORY_NOTE_FACT_MAX) + " chars.")},
+                    "topic": {"type": "string",
+                              "description": ("Slug for the sibling file, e.g. compaction writes history/compaction.md. Reusing an existing topic adds NO index row. Empty derives one from the fact.")},
+                    "pointer": {"type": "string",
+                                "description": ("Optional index row text, max " + str(MEMORY_NOTE_POINTER_MAX) + " chars. Defaults to the first sentence of the fact; a paragraph is refused.")},
+                    "section": {"type": "string",
+                                "description": ("Optional heading to open as a new ## section in the sibling file before the fact.")},
+                    "project": {"type": "string",
+                                "description": ("Defaults to the active project of this chat. Refused when there is none: it never writes to the workspace index.")},
+                },
+                "required": ["fact"],
+            },
+        },
+    },
     "searxng_search": {
         "type": "function",
         "function": {
@@ -2139,7 +2241,10 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                             "process runs in the configured File Workspace - the SAME root the "
                             "read/write/edit file tools use - so prefer paths relative to it "
                             "over long absolute path literals; a relative path you passed to "
-                            "write_local_file will be found here."),
+                                                        "write_local_file will be found here. "
+                            "fs writes and unlinks here are NOT covered by the per-turn "
+                            "checkpoints either - back up a script before changing or "
+                            "deleting it."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2162,7 +2267,9 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                             "reason. Files it changes are NOT covered by the "
                             "per-turn checkpoints (those only snapshot write_local_file "
                             "and edit_local_file), so \u21ba Revert turn will NOT undo "
-                            "shell-driven edits. "
+                            "shell-driven edits. Back up any script you are about to "
+                            "change from a shell command and verify the hash first, because "
+                            "nothing here can undo it. "
                             f"Stateless: each call is a fresh process, so cd and "
                             "environment variables do NOT persist between calls - "
                             "chain them in one command line (e.g. "
@@ -2277,8 +2384,12 @@ TOOL_SCHEMAS: Dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "write_local_file",
-            "description": ("Create or overwrite a local file with the given text content. "
-                            "Parent directories are created automatically."),
+            "description": ("Create or overwrite a local file with the given text "
+                            "content. Parent directories are created automatically. Before "
+                            "overwriting a script that already exists, copy it to a backup "
+                            "and confirm the hashes match; write bytes, preserve the file's "
+                            "line endings, and diff against the backup to confirm only the "
+                            "intended lines changed."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2300,7 +2411,11 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                             "mismatch is reported. Strongly preferred over write_local_file for "
                             "changing existing files - only the changed regions are sent. Edits "
                             "are applied sequentially in listed order: later edits see the output "
-                            "of earlier ones (dependent edits are allowed)."),
+                            "of earlier ones (dependent edits are allowed). "
+                            "Back up the file and verify the hash before editing a script, "
+                            "and keep every old_text narrow enough to match exactly once - an "
+                            "anchor that matches several places is a silent rewrite of the "
+                            "others."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2554,17 +2669,30 @@ TOOL_SCHEMAS: Dict[str, dict] = {
         "type": "function",
         "function": {
             "name": "remember",
+            # v1.2.7 BRAKE (owner decision). The first version of this description was
+            # all urgency and no cost: "use it AT THE MOMENT something matters", "anything
+            # you judge important should be written down", "a compaction summary is a lossy
+            # guess". Nothing said when NOT to write, and nothing said a note is permanent.
+            # Measured result: 49 entries / 82 KB in one chat, median 1,490 chars, over half
+            # session-status prose, 7 of them "CORRECTION to ledger entry N". So: the fear
+            # language is gone, and it now says what the ledger is NOT for and that nothing
+            # from it is injected - which is the fact that decides ledger vs MEMORY.md.
             "description": ("Append one durable note to this chat's LEDGER: an append-only "
                             "record that survives context compaction, handoff, and even "
-                            "deletion of the chat. Use it AT THE MOMENT something matters, "
-                            "not later - a compaction summary is a lossy guess made after "
-                            "the fact, so anything you judge important should be written "
-                            "down while you still have the full context. Good entries: a "
-                            "decision and why, a constraint that must not be re-litigated, "
-                            "an exact value/path/command that worked, a failure mode worth "
-                            "not repeating, an open question. One entry per fact; keep it "
-                            "self-contained (a future session reads it with no surrounding "
-                            "context). This never overwrites an earlier entry."),
+                            "deletion of the chat. Good entries: a decision and why, a "
+                            "constraint that must not be re-litigated, an exact value/path/"
+                            "command that worked, a failure mode worth not repeating, an "
+                            "open question. One entry per fact; keep it self-contained (a "
+                            "future session reads it with no surrounding context). Entries "
+                            "are permanent and never rewritten, so a wrong one costs a "
+                            "second entry to correct - fewer, better notes. NOT for: "
+                            "session status or progress narratives, build/test results, "
+                            "file inventories, or anything a project's MEMORY.md already "
+                            "holds. Nothing from the ledger is injected into the system "
+                            "prompt, so a fact the next session must have belongs in that "
+                            "project's MEMORY.md, which IS injected; keep the ledger for "
+                            "what belongs to no single project or is expensive to "
+                            "re-derive."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2593,8 +2721,8 @@ TOOL_SCHEMAS: Dict[str, dict] = {
                             "Call it as soon as the job is identifiable - at the START "
                             "of work, not at the end - and again whenever the work moves "
                             "to a different project. It shows the project in the top bar, "
-                            "and it makes the app inject that project's own MEMORY.md "
-                            "path into every following request.\n\n"
+                            "and the workspace index row it writes names that project's "
+                            "MEMORY.md path, which is how a later session finds it.\n\n"
                             "Existing project: pass just the name (any casing/spacing - "
                             "'GB10 Alert' finds 'GB10_Alert').\n"
                             "New project: pass name + a one-line description, and "
@@ -2650,11 +2778,11 @@ TOOL_SCHEMAS: Dict[str, dict] = {
         "function": {
             "name": "read_ledger",
             "description": ("Read a chat's append-only ledger (and the shared global one). "
-                            "Only the most recent entries are injected into the system "
-                            "prompt automatically, so this is how to reach the older ones - "
-                            "the full record is never pruned. Use it when the injected "
-                            "LEDGER block mentions entries it omitted for length, or when "
-                            "filtering by tag."),
+                            "Since v1.2.5 NOTHING from the ledger is injected into the "
+                            "system prompt, so this is the only way to reach it - the full "
+                            "record is never pruned. Use it for 'what did we decide about "
+                            "X' / 'where did we fix Y' questions about PAST work, or to "
+                            "filter by tag."),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -2694,12 +2822,18 @@ TOOL_SCHEMAS: Dict[str, dict] = {
             "description": ("Read one Agent Skill in full: its SKILL.md instructions and the "
                             "files bundled in its folder. Call it BEFORE starting a task that a "
                             "listed skill covers, then follow the instructions. Relative paths in "
-                            "the body resolve against the skill folder that is reported."),
+                            "the body resolve against the skill folder that is reported. Pass "
+                            "file=<path within the skill folder> to read one bundled file "
+                            "(scripts/, references/, templates/, ...) directly."),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "name": {"type": "string",
-                             "description": "The skill name, exactly as listed in the system prompt or by list_skills."}
+                             "description": "The skill name, exactly as listed in the system prompt or by list_skills."},
+                    "file": {"type": "string",
+                             "description": ("Optional. Read ONE bundled file from inside this skill's folder "
+                                             "(e.g. 'scripts/run.py'). The path must stay within the skill "
+                                             "directory; reads outside it are refused.")}
                 },
                 "required": ["name"]
             }
@@ -2800,6 +2934,10 @@ DEFAULT_PERMS = {
     # whole point is that the model declares the project without the user being
     # interrupted to approve it - the visible answer is the green top-bar label.
     "set_project":           "always",
+    # B7: only ever appends inside projects/<slug>/, so asking every time would
+    # re-create the interruption overhead this tool exists to remove. Same posture
+    # as set_project and remember.
+    "memory_note":           "always",
     "set_clipboard":         "ask",
     "transcribe_audio":      "ask",
     # ask_expert sends the material you name to a THIRD PARTY over the network.
@@ -2840,8 +2978,6 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     "chat_render_window": CHAT_RENDER_WINDOW_DEFAULT,  # message entries rendered per chat view (0 = all); v1.1.36
     "project_memory_chars": PROJECT_MEMORY_DEFAULT,  # chars of the workspace MEMORY.md index injected each request (0 = off); v1.1.66
     "project_memory_file": "",    # explicit index file; blank = <workspace>/MEMORY.md
-    "project_memory_project_chars": PROJECT_MEMORY_PROJECT_DEFAULT,  # chars of the ACTIVE project's own MEMORY.md injected each request (0 = off); v1.1.86
-    "ledger_inject_chars": LEDGER_INJECT_DEFAULT,  # chars of ledger tail in the system prompt (0 = off); Tier 3
     "custom_system_prompt": "",   # user instructions appended to the system prompt each request; blank = built-in only
     "custom_system_prompt_enabled": True,  # gate the prompt above WITHOUT discarding it; False = kept but not sent
     "spellcheck_enabled": False,  # underline suspected misspellings in the INPUT BOX only (needs pyspellchecker); v1.1.78
@@ -2861,6 +2997,8 @@ DEFAULT_SETTINGS: Dict[str, Any] = {
     # View state only - permissions are stored and enforced either way.
     "mcp_bar_expanded":  [],
     "skills_dir":        "",   # extra folder scanned for Agent Skills (SKILL.md); blank = defaults only
+    "prompt_preview_geometry": "",   # size+position of the System Prompt preview window
+    "skills_enabled":    [],   # owner-enabled skill names (opt-in); ONLY these are injected/loadable; v1.1.95
     # Consultant model (ask_expert). Any OpenAI-compatible endpoint works; these
     # are INDEPENDENT of server_url/api_key/model_name so the local model stays
     # primary. Blank expert_server_url or expert_api_key disables the tool.
@@ -3340,10 +3478,48 @@ def _expand_image_ref(p: dict) -> dict:
 #   ts      - render timestamp, shown in the transcript header
 #   steered - #10 mid-run steering: marks a message injected DURING a turn rather
 #             than one that started it (used for rendering/replay only)
-APP_LOCAL_MSG_KEYS = ("ts", "steered")
+#   tnote   - v1.2.19: the date/time stamp, FROZEN into the user message at the
+#             moment it was created. _prepare_request_messages() re-attaches it
+#             to the LAST user message only, so older turns keep byte-identical
+#             wire text across turns (the stamp used to MIGRATE to each newest
+#             message every turn, diverging the prompt mid-list and busting the
+#             engine's KV prefix cache on every engine that reuses extensions).
+APP_LOCAL_MSG_KEYS = ("ts", "steered", "tnote")
 
 
-def _prepare_request_messages(messages: List[dict]) -> List[dict]:
+def _with_note(m: dict, note: str) -> dict:
+    """v1.2.19: copy of an outgoing message with its FROZEN stamp appended.
+
+    String content gets the note concatenated (the note already opens with its
+    own blank lines); list content gets a trailing text part so image parts
+    keep their positions. Never mutates `m`."""
+    out = dict(m)
+    c = out.get("content")
+    if isinstance(c, str):
+        out["content"] = c + note
+    elif isinstance(c, list):
+        out["content"] = list(c) + [{"type": "text", "text": note.strip()}]
+    return out
+
+
+def _frozen_note(messages: List[dict], i: int) -> str:
+    """v1.2.19: the stamp belonging to message `i` - its OWN, never a newer one.
+
+    This is the whole point of the change: the stamp used to be re-derived from
+    the clock and re-attached to whichever user message was newest, so every
+    turn rewrote an EARLIER message's wire text and the request stopped being a
+    prefix extension of the previous one. Each user message now carries the note
+    it was created with, so its bytes never change again."""
+    try:
+        m = messages[i]
+    except (IndexError, TypeError, KeyError):
+        return ""
+    if not isinstance(m, dict) or m.get("role") != "user":
+        return ""
+    return str(m.get("tnote") or "")
+
+
+def _prepare_request_messages(messages: List[dict], stamp: bool = True) -> List[dict]:
     """Outgoing copy of a message list with screenshot payloads resolved.
 
     Only the most recent screenshot (the last one whose image is still readable)
@@ -3389,6 +3565,10 @@ def _prepare_request_messages(messages: List[dict]) -> List[dict]:
             # every other OpenAI field are deliberately NOT touched.
             if any(k in m for k in APP_LOCAL_MSG_KEYS):
                 m = {k: v for k, v in m.items() if k not in APP_LOCAL_MSG_KEYS}
+            if stamp and m.get("role") == "user":
+                _tn = _frozen_note(messages, i)
+                if _tn:
+                    m = _with_note(m, _tn)
             out.append(m)
             continue
         # Placeholder wording must match what the message actually was.
@@ -3413,6 +3593,14 @@ def _prepare_request_messages(messages: List[dict]) -> List[dict]:
                     parts.append(p)          # legacy inline payload / user attachment - keep as-is
             else:
                 parts.append(p)
+        if stamp and m.get("role") == "user":
+            _tn = _frozen_note(messages, i)
+            if _tn:
+                _mp = {"role": m.get("role", "user"),
+                       "content": parts or [{"type": "text", "text": stale_text}]}
+                parts = None
+                out.append(_with_note(_mp, _tn))
+                continue
         out.append({"role": m.get("role", "user"),
                     "content": parts or [{"type": "text", "text": stale_text}]})
     return out
@@ -3818,6 +4006,17 @@ def _atomic_write(path: Path, text: str) -> None:
         tmp = path.with_name(f"{path.name}.{os.getpid()}-{uuid.uuid4().hex[:8]}.tmp")
         try:
             tmp.write_bytes(text.encode("utf-8"))   # binary: no newline translation; keeps CRLF exact
+            # v1.2.17: fsync BEFORE the swap. Without it Windows may commit the rename
+            # (size, timestamps) while the file DATA is still in the cache, so a crash in
+            # that window leaves a full-size file of NULs. That is the exact shape of the
+            # 2026-10-30 loss: deskpilot_chats.json.corrupt-20261030T050617Z was
+            # 109,322,373 bytes with ZERO non-zero bytes and ValidDataLength == size.
+            # os.replace is ATOMIC but atomicity is not durability - only this fsync makes
+            # a mid-save crash leave the ORIGINAL untouched. Measured on the live 106 MB
+            # store: 160 ms with fsync vs 113 ms without.
+            with open(tmp, "rb+") as _f:
+                _f.flush()
+                os.fsync(_f.fileno())
             if path.exists():
                 try:
                     shutil.copy2(path, path.with_name(path.name + ".bak"))
@@ -3865,12 +4064,90 @@ HANG_STALL_S          = 8.0   # beat older than this => dump. Above Tk's own "no
 HANG_WATCH_INTERVAL_S = 1.0   # how often the watchdog looks
 HANG_REREPORT_S       = 30.0  # re-dump while still stalled: stuck vs moving frame
 HANG_MAX_DUMP_PER_RUN = 12    # bound disk use; a hang outliving this is already caught
+# v1.1.93: how many times the MAIN thread is sampled per report, and how far apart.
+# ONE sample is not evidence. _poll_ui_queue drains the WHOLE queue in a `while True`
+# and the beat is stamped once on ENTRY, so "stalled 9 s" can be one blocked call or
+# four hundred cheap ones - and the single sample lands wherever the thread happened
+# to be. That misread produced a confidently wrong root cause on 2026-10-23 (a report
+# blamed Text.see("end"), which measures 3-8 ms flat: see
+# projects/deskpilot/history/app-hang-dump-2026-10-23.md). Repeating the sample is what
+# separates the two: a leaf frame in most samples is the cause, one in a single sample
+# is scenery.
+HANG_SAMPLES      = 5
+HANG_SAMPLE_GAP_S = 0.2
 _HANG_DUMPS = [0]             # process-wide, so booting many apps cannot flood
 
 
 def _hang_report_dir() -> Path:
     """Read SETTINGS_FILE at call time - main() relocates it after import."""
     return SETTINGS_FILE.parent / "hang_reports"
+
+
+_FRAME_LINE = re.compile(r'File "[^"]*", line \d+, in .+')
+
+# A Tk dialog runs a NATIVE modal loop: the main window stops pumping events, so
+# Windows labels the app "not responding" and the owner cannot be maximized. That is
+# what a modal IS, not a stall - so it gets labelled, and stops drowning real hangs.
+_MODAL_MARKERS = ("messagebox.py", "commondialog.py", "simpledialog.py",
+                  "filedialog.py", "grab_set", "wait_window", "wait_variable")
+
+
+def _hang_leaf(snap: List[str]) -> str:
+    """The deepest (most recent) frame line of one snapshot - where it actually IS."""
+    for line in reversed(snap):
+        if _FRAME_LINE.search(line):
+            return line.strip()
+    return "?"
+
+
+def _hang_snapshots(main_id) -> List[List[str]]:
+    """The MAIN thread's stack, HANG_SAMPLES times HANG_SAMPLE_GAP_S apart.
+
+    Runs on the watchdog thread, so sleeping here is harmless - and it only works
+    because a thread blocked in a Tk call RELEASES the GIL. If it did not, this
+    thread would never run at all and no report would exist either.
+    """
+    snaps: List[List[str]] = []
+    for i in range(max(1, HANG_SAMPLES)):
+        try:
+            f = sys._current_frames().get(main_id)
+            snaps.append(traceback.format_stack(f) if f else [])
+        except Exception:
+            snaps.append([])
+        if i < HANG_SAMPLES - 1:
+            time.sleep(HANG_SAMPLE_GAP_S)
+    return snaps
+
+
+def _hang_verdict(snaps: List[List[str]]) -> str:
+    """Read the samples: one blocked call, aggregate work, or a modal dialog.
+
+    Ancestor frames (mainloop -> callit -> _poll_ui_queue) appear in EVERY sample by
+    construction, so they carry no information; only the LEAF discriminates.
+    """
+    try:
+        leaves = [_hang_leaf(s) for s in snaps if s]
+        if not leaves:
+            return "UNKNOWN (no main-thread stack captured)"
+        joined = " ".join(l for s in snaps for l in s)
+        for marker in _MODAL_MARKERS:
+            if marker in joined:
+                return ("WAITING ON MODAL DIALOG (%s) - a Tk modal loop, NOT a stall: "
+                        "the main window stops pumping while it is open, which is what "
+                        "'not responding' and 'cannot maximize' mean" % marker)
+        counts: Dict[str, int] = {}
+        for leaf in leaves:
+            counts[leaf] = counts.get(leaf, 0) + 1
+        top, n = max(counts.items(), key=lambda kv: kv[1])
+        if n == len(leaves):
+            return "BLOCKED IN ONE CALL (%d/%d samples agree): %s" % (n, len(leaves), top)
+        if n * 2 > len(leaves):
+            return "LIKELY ONE CALL (%d/%d samples agree): %s" % (n, len(leaves), top)
+        return ("MOVING, NOT STUCK - the leaf changed in most samples (%d distinct in %d), "
+                "so this is aggregate work across many callbacks, not one blocked call"
+                % (len(set(leaves)), len(leaves)))
+    except Exception:
+        return "UNKNOWN (verdict failed)"
 
 
 def _hang_dump(app, stalled_s: float) -> Optional[Path]:
@@ -3885,8 +4162,11 @@ def _hang_dump(app, stalled_s: float) -> Optional[Path]:
         d = _hang_report_dir()
         d.mkdir(parents=True, exist_ok=True)
         names = {t.ident: t.name for t in threading.enumerate() if t.ident}
-        frames = sys._current_frames()
         main_id = threading.main_thread().ident
+        # Sample BEFORE the (cheap) rest, so the observation window is contiguous.
+        snaps = _hang_snapshots(main_id)
+        verdict = _hang_verdict(snaps)
+        frames = sys._current_frames()
         out: List[str] = [
             "Deskpilot %s  |  MAIN THREAD STALLED %.1f s" % (VERSION, stalled_s),
             "local time      : %s" % datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3894,8 +4174,16 @@ def _hang_dump(app, stalled_s: float) -> Optional[Path]:
             "last main action: %s" % getattr(app, "_main_activity", "?"),
             "turn in flight  : %s" % ("YES" if getattr(app, "_busy", False) else "no"),
             "threads         : %s" % ", ".join(sorted(t.name for t in threading.enumerate())),
+            "verdict         : %s" % verdict,
             "",
         ]
+        leaves = [_hang_leaf(s) for s in snaps if s]
+        if len(leaves) > 1:
+            out.append("main-thread LEAF frame, %d samples %.1fs apart "
+                       "(ancestors are identical in all and prove nothing):"
+                       % (len(leaves), HANG_SAMPLE_GAP_S))
+            out.extend("    %s" % leaf for leaf in leaves)
+            out.append("")
         # Main thread first: it is the one that stopped pumping events.
         for tid, frame in sorted(frames.items(), key=lambda kv: (kv[0] != main_id, kv[0])):
             out.append("=" * 72)
@@ -4237,6 +4525,13 @@ CTX_ERROR_PATTERNS: Tuple[str, ...] = (
     r"n_ctx\s*(?:=|is)\s*([\d,]{3,9})",
     r"max(?:imum)?_?(?:total_)?tokens\s*(?:=|is|:)\s*([\d,]{3,9})",
     r"model'?s context (?:length|window)\s*(?:is|of)?\s*([\d,]{3,9})",
+    # v1.2.12 Strata: "... prompt (540052 tokens) leaves no room to answer
+    # in the context (262144)". Anchored on the WINDOW number on purpose -
+    # the generic "context window" pattern above cannot match, because Strata
+    # puts ": prompt (" between the words and the number, and taking the
+    # first number in the message would learn 540052 (the PROMPT size) as the
+    # window: the over-reporting direction the dialect notes call dangerous.
+    r"no room to answer in the context\s*\(\s*([\d,]{3,9})",
 )
 
 
@@ -4705,6 +5000,265 @@ def save_chats(chats: Dict[str, Any]) -> bool:
         print(f"[Deskpilot] Failed to save chats: {e}")
         return False
 
+# ── v1.2.17: versioned data backups ────────────────────────────────────────────
+# Why this exists. On 2026-10-30 the live chat store was zeroed by a crash mid-save
+# (109,322,373 bytes, ZERO non-zero bytes) and ~2.2 days of history was lost. The
+# forensic record (projects/deskpilot/history/chat-store-crash.md) says the app's one
+# rolling .bak DID hold the good data - and the app's own post-crash saves overwrote it
+# before recovery could run.
+#
+# That is why a plain "back up every 30 min, keep 2, delete the oldest" policy would
+# have failed the same way: after a crash the app restarts holding a nearly-empty store,
+# and its FIRST cycle rotates that empty store over the last good copy. Rotation on a
+# timer is the flaw. The guards below are the difference between a backup and a false
+# sense of safety:
+#
+#   * refuse when this session's load failed (in-memory is not the user's history);
+#   * refuse when the payload does not parse or has no chats;
+#   * refuse to PRUNE when the payload collapsed against the last payload we saw - a
+#     collapse is a symptom, not a change to preserve;
+#   * prune only AFTER the new generation is safely on disk;
+#   * skip when the source is unchanged in size and mtime, so an idle app does not
+#     rewrite ~106 MB every half hour.
+#
+# A refusal still SAVES the payload, as a .suspect generation that is never counted as a
+# generation and never prunes one.
+#
+# ⚠ THE BASELINE FOR THE SHRINK GUARD IS THE NEWEST PAYLOAD WE SAW, suspect included.
+#   Comparing only against the newest GENERATION is a permanent lockout: a 64 -> 20
+#   cleanup refuses, refusals create no generation, so every later cycle compares against
+#   the old 64 again and refuses forever - the user ends up with no backups at all, which
+#   is worse than the risk being guarded against. test_v1217_data_backups.py S7 pins this.
+#
+# ⚠ THERE IS DELIBERATELY NO MINIMUM-SIZE FLOOR. An earlier draft had
+#   BACKUP_MIN_BYTES = 4096, and it silently skipped a 76-byte settings file and a
+#   3 KB collapsed store. Two wrongs: a fresh install's settings are legitimately small,
+#   and skipping the collapsed store threw away the very diagnostic that tells the user
+#   their history just collapsed. _backup_stats() already rejects anything unparseable or
+#   without chats, so a size floor only ever suppressed VALID small payloads.
+#
+# Durability is the other half of the fix and lives in _atomic_write(): fsync the temp
+# BEFORE os.replace. Atomicity is not durability - without the fsync Windows may commit
+# the rename while the data is still cached, which is how a full-size NUL file is born.
+#
+# Measured on the live 106 MB store (dev_scripts/_measure_backup_cost.py): write 113 ms,
+# write+fsync 160 ms, copy+fsync+replace 656 ms, full parse 369 ms, gzip 788 ms -> 29%.
+# Compression is deliberately NOT used: it saves 75 MB and adds a decode step to the one
+# file opened in a panic, and disk is not the constraint (147 GB free).
+
+BACKUP_DIR_NAME = "backups"
+BACKUP_KEEP = 3                        # generations per file (~318 MB total, 147 GB free)
+BACKUP_SUSPECT_KEEP = 2                # refused-but-kept payloads per file
+BACKUP_INTERVAL_MS = 30 * 60 * 1000    # while the app is open
+BACKUP_SHRINK_RATIO = 0.5              # below half of the last payload seen = suspicious
+SUSPECT_SUFFIX = ".suspect"
+
+
+def _backup_dir() -> Path:
+    """<data dir>/backups - beside the store, so a --multi scratch profile gets its own."""
+    return Path(CHATS_FILE).with_name(BACKUP_DIR_NAME)
+
+
+def _backup_stats(name: str, payload: bytes):
+    """(chats, live_messages) for the history store, (keys, 0) for settings.
+
+    None means "must not be trusted": unparseable, not a dict, empty, or - for the
+    history store - no chats at all. The primary figure is always a COUNT of the same
+    unit for a given file, so the shrink guard compares like with like.
+
+    Validation is a FULL parse. There is no cheaper check that catches the shape of the
+    2026-10-30 loss - a 109 MB file of NULs has a perfectly ordinary header - and 369 ms
+    is affordable because this runs off the Tk thread.
+    """
+    try:
+        d = json.loads(payload.decode("utf-8"))
+    except Exception:
+        return None
+    if not isinstance(d, dict) or not d:
+        return None
+    if name == Path(CHATS_FILE).name:
+        chats = d.get("chats")
+        if not isinstance(chats, dict) or not chats:
+            return None
+        live = 0
+        for c in chats.values():
+            if isinstance(c, dict):
+                live += len(c.get("messages") or [])
+        return (len(chats), live)
+    return (len(d), 0)
+
+
+def _backup_slots(dirp: Path, name: str):
+    """(generations newest-first, suspects newest-first) for one data file.
+
+    In-flight .tmp files are ignored. Names carry a UTC second stamp, so a plain
+    descending string sort is chronological; for the same second the -N / .suspect
+    variants sort AFTER the bare name, which is the order they were written in.
+    """
+    try:
+        alls = [g for g in dirp.glob(name + ".*") if not g.name.endswith(".tmp")]
+    except OSError:
+        return [], []
+    sus = sorted([g for g in alls if g.name.endswith(SUSPECT_SUFFIX)],
+                 key=lambda p: p.name, reverse=True)
+    gen = sorted([g for g in alls if not g.name.endswith(SUSPECT_SUFFIX)],
+                 key=lambda p: p.name, reverse=True)
+    return gen, sus
+
+
+def _backup_prune(dirp: Path, name: str, suspects: bool = False) -> int:
+    """Delete everything past the keep-count. Called only after a successful write."""
+    gen, sus = _backup_slots(dirp, name)
+    pool = sus if suspects else gen
+    keep = BACKUP_SUSPECT_KEEP if suspects else BACKUP_KEEP
+    for old in pool[keep:]:
+        try:
+            old.unlink()
+        except OSError:
+            pass      # a locked generation is not worth losing the one just written
+    return min(len(pool), keep)
+
+
+def _backup_new_slot(dirp: Path, name: str, stamp: str, suspect: bool) -> Path:
+    suffix = SUSPECT_SUFFIX if suspect else ""
+    dst = dirp / ("%s.%s%s" % (name, stamp, suffix))
+    n = 1
+    while dst.exists():                       # two cycles inside one second
+        dst = dirp / ("%s.%s-%d%s" % (name, stamp, n, suffix))
+        n += 1
+    return dst
+
+
+def _backup_one(src_path: Path, reason: str) -> str:
+    """Write one generation for one data file. Returns a one-line status for the log.
+
+    Never raises: a backup that cannot run must not lose a turn or block shutdown.
+    """
+    name = src_path.name
+    try:
+        if not src_path.is_file():
+            return "skip(missing)"
+        st = src_path.stat()
+        if name == Path(CHATS_FILE).name and LOAD_FAILURE_NOTE:
+            # This session could not read the store, so what is on disk is not known
+            # good data and what is in memory is not the user's history.
+            return "refuse(load failed this session)"
+        payload = src_path.read_bytes()
+    except OSError as e:
+        return "skip(%s)" % e
+
+    stats = _backup_stats(name, payload)
+    if stats is None:
+        return "refuse(unparseable or no chats)"
+
+    dirp = _backup_dir()
+    try:
+        dirp.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return "skip(cannot create dir: %s)" % e
+
+    stamp = time.strftime("%Y%m%d-%H%M%SZ", time.gmtime())
+    gen, sus = _backup_slots(dirp, name)
+    # Baseline = the newest payload of ANY kind. See the ⚠ note at the top of this
+    # block: using only the newest generation makes one collapse refuse forever.
+    baseline = None
+    if gen and sus:
+        baseline = sus[0] if sus[0].name > gen[0].name else gen[0]
+    else:
+        baseline = (gen or sus or [None])[0]
+
+    shrink = ""
+    if baseline is not None:
+        try:
+            bst = baseline.stat()
+            if bst.st_size == len(payload) and int(bst.st_mtime) == int(st.st_mtime):
+                return "skip(unchanged)"
+            old = _backup_stats(name, baseline.read_bytes())
+        except OSError:
+            old = None
+        if old:
+            _u = "chats" if name == Path(CHATS_FILE).name else "keys"
+            if old[0] and stats[0] < old[0] * BACKUP_SHRINK_RATIO:
+                shrink = "%s %d -> %d" % (_u, old[0], stats[0])
+            elif old[1] and stats[1] < old[1] * BACKUP_SHRINK_RATIO:
+                shrink = "messages %d -> %d" % (old[1], stats[1])
+
+    # A collapse is kept, but as a .suspect: it must never displace a good generation,
+    # and it must never be the thing a recovery reaches for by accident.
+    dst = _backup_new_slot(dirp, name, stamp, bool(shrink))
+    tmp = dst.with_name(dst.name + ".tmp")
+    try:
+        tmp.write_bytes(payload)
+        # Stamp with the SOURCE's mtime, not "now": the unchanged-skip compares mtimes,
+        # and a copy that always looks newer would never skip.
+        try:
+            os.utime(tmp, ns=(st.st_atime_ns, st.st_mtime_ns))
+        except OSError:
+            pass
+        with open(tmp, "rb+") as f:
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, dst)
+    except OSError as e:
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return "error(%s)" % e
+
+    # Unit-aware wording. The first cut printed "deskpilot_settings.json: wrote ... 51
+    # chats / 0 msgs" for a SETTINGS file, where those numbers are key counts. Read in
+    # the middle of a recovery, "51 chats" looks like 13 chats vanished - the exact panic
+    # this feature exists to prevent, written into its own log line.
+    unit = ("chats" if name == Path(CHATS_FILE).name else "keys")
+    if shrink:
+        kept = _backup_prune(dirp, name, suspects=True)
+        return ("REFUSED to rotate: %s collapsed against %s. Kept as %s (%d suspect(s) "
+                "held); if this was not you, restore the newest generation WITHOUT the "
+                "%s suffix" % (shrink, baseline.name, dst.name, kept, SUSPECT_SUFFIX))
+    kept = _backup_prune(dirp, name)
+    detail = ("%d chats / %d msgs" % (stats[0], stats[1])
+              if unit == "chats" else "%d keys" % stats[0])
+    return ("wrote %s (%s B, %s, %d kept)"
+            % (dst.name, format(len(payload), ","), detail, kept))
+
+
+def run_data_backups(reason: str) -> None:
+    """One backup cycle for every data file. Safe from any thread; never raises.
+
+    `reason` is "open" | "interval" | "close" and only appears in the console line.
+    The search DB is deliberately NOT backed up: it is a rebuildable cache and the app
+    already treats deleting it as safe.
+    """
+    for p in (CHATS_FILE, SETTINGS_FILE):
+        try:
+            msg = _backup_one(Path(p), reason)
+        except Exception as e:                 # belt and braces: nothing escapes
+            msg = "error(%s)" % e
+        if not msg.startswith("skip(unchanged)"):
+            print(f"[{APP_NAME}] backup[{reason}] {Path(p).name}: {msg}")
+
+def _start_backup_heartbeat():
+    """Daemon thread: one backup cycle every BACKUP_INTERVAL_MS while the app is open.
+
+    Deliberately NOT a Tk after() callback. At a 30-minute cadence there is no reason to
+    occupy the Tk thread's timer wheel, and a plain thread cannot be bitten by TclError
+    during shutdown. daemon=True, so it never keeps the process alive on its own.
+
+    Safe to read the store while the main thread is saving: _atomic_write() swaps with
+    os.replace(), so a reader sees either the whole old file or the whole new one.
+    """
+    def _loop():
+        while True:
+            time.sleep(BACKUP_INTERVAL_MS / 1000.0)
+            try:
+                run_data_backups("interval")
+            except Exception:
+                pass      # a failed cycle must not kill the heartbeat
+    t = threading.Thread(target=_loop, name="data-backups", daemon=True)
+    t.start()
+    return t
+
 
 def _search_db_path() -> Path:
     """Where the FTS5 index lives: next to CHATS_FILE (so a --multi scratch profile
@@ -5151,40 +5705,6 @@ def _ledger_append(chat_id: str, text: str, tags: Optional[List[str]] = None,
     return entry
 
 
-def _ledger_inject_text(chat_id: str, budget_chars: int) -> str:
-    """The ledger block for the system prompt: newest entries, hard-bounded.
-
-    The STORE is unbounded; only this VIEW is capped - an uncapped "remember everything"
-    block would just hit the same context wall compaction exists to dodge. Newest first
-    in the file order, because the most recent notes are the ones a continuation needs.
-    Returns '' when the feature is off or there is nothing to show."""
-    budget = max(0, min(int(budget_chars or 0), LEDGER_INJECT_MAX))
-    if budget <= 0:
-        return ""
-    merged = _ledger_read_raw("") + _ledger_read_raw(chat_id)
-    if not merged:
-        return ""
-    merged = merged[-LEDGER_INJECT_ENTRIES:]
-    lines: List[str] = []
-    used = 0
-    dropped = 0
-    for e in reversed(merged):
-        ts = str(e.get("ts") or "")[:16].replace("T", " ")
-        tags = (" #" + " #".join(e.get("tags") or [])) if e.get("tags") else ""
-        src = "" if e.get("source") in (None, "model") else f" [{e.get('source')}]"
-        one = f"- {ts}{src}{tags}: {e.get('text')}"
-        if lines and used + len(one) > budget:
-            dropped += 1
-            continue
-        lines.append(one)
-        used += len(one)
-    lines.reverse()
-    if dropped:
-        lines.insert(0, f"[{dropped} older ledger entries omitted for length - "
-                        f"read_ledger() returns all of them]")
-    return ("LEDGER (append-only notes that survive compaction and chat deletion; "
-            "add to it with remember(), page through it with read_ledger()):\n"
-            + "\n".join(lines))
 
 
 def _migrate_inline_images(chats: Dict[str, Any]) -> None:
@@ -5328,6 +5848,23 @@ def render_inline(widget: tk.Text, text: str, tags: List[str]) -> None:
         _apply_urls(widget, text[pos:], tags, app)
 
 
+def _clean_cell(s: str) -> str:
+    """v1.2.20: a table cell's DISPLAY text - emphasis markers stripped so the
+    monospace grid can align on character count. Bold/code markers are the noisy
+    ones; single * and _ are left alone so identifiers (kv_tokens_total) survive."""
+    s = s.strip().replace("**", "").replace("`", "")
+    return s.strip()
+
+
+def _pad_cell(text: str, width: int, align: str) -> str:
+    if align == "right":
+        return text.rjust(width)
+    if align == "center":
+        left = (width - len(text)) // 2
+        return " " * left + text + " " * (width - len(text) - left)
+    return text.ljust(width)
+
+
 class MarkdownStream:
     """Incremental Markdown renderer for a tk.Text widget.
 
@@ -5346,6 +5883,7 @@ class MarkdownStream:
         self.code_lang = ""
         self.code_lines: List[str] = []
         self.pending = ""
+        self.table_buf: List[str] = []   # v1.2.20: buffered | rows, rendered aligned
 
     # ── public API ────────────────────────────────────────────────────────
     def feed(self, text: str) -> None:
@@ -5361,12 +5899,66 @@ class MarkdownStream:
         if self.pending:
             self._render_line(self.pending)
             self.pending = ""
+        if self.table_buf:
+            self._flush_table()
         if self.in_code:
             self._close_code_block()
 
     # ── internals ─────────────────────────────────────────────────────────
     def _insert(self, text: str, tags: Optional[List[str]] = None) -> None:
         self.app.chat_text.insert("end", text, tags or [])
+
+    def _flush_table(self) -> None:
+        """v1.2.20: render the buffered | rows as a column-aligned grid.
+
+        The old path echoed each raw pipe line and drew a fixed 60-char rule, so
+        columns never lined up and the separator was a stray bar. Here the whole
+        block is measured first, then re-emitted in monospace with a header rule
+        and a border sized to the real content. Alignment (:---, ---:, :---:) is
+        read from the separator row. Everything is one monospace font so the
+        box-drawing columns stay put; bold/code markers inside cells are stripped
+        for display (they would otherwise break the character grid)."""
+        rows, self.table_buf = self.table_buf, []
+        if not rows:
+            return
+        parsed = [[_clean_cell(c) for c in r.strip().strip("|").split("|")]
+                  for r in rows]
+        ncols = max(len(r) for r in parsed)
+        if ncols == 0:
+            return
+        for r in parsed:
+            r += [""] * (ncols - len(r))
+        header, body = parsed[0], []
+        aligns = ["left"] * ncols
+        for r in parsed[1:]:
+            if any(r) and all(re.fullmatch(r":?-{2,}:?", c) for c in r if c):
+                for ci, c in enumerate(r):
+                    if c.startswith(":") and c.endswith(":"):
+                        aligns[ci] = "center"
+                    elif c.endswith(":"):
+                        aligns[ci] = "right"
+                    elif c.startswith(":"):
+                        aligns[ci] = "left"
+                continue
+            body.append(r)
+        widths = [max([len(header[i])] + [len(r[i]) for r in body])
+                  for i in range(ncols)]
+
+        def border(l: str, m: str, rgt: str) -> str:
+            return l + m.join("─" * (widths[i] + 2) for i in range(ncols)) + rgt
+
+        def emit(cells: List[str], tags: List[str]) -> None:
+            parts = [" " + _pad_cell(cells[i], widths[i], aligns[i]) + " "
+                     for i in range(ncols)]
+            self._insert("│" + "│".join(parts) + "│\n", tags)
+
+        self._insert("\n")
+        self._insert(border("┌", "┬", "┐") + "\n", ["table_border"])
+        emit(header, ["table_hdr"])
+        self._insert(border("├", "┼", "┤") + "\n", ["table_border"])
+        for r in body:
+            emit(r, ["table_row"])
+        self._insert(border("└", "┴", "┘") + "\n", ["table_border"])
 
     def _render_line(self, line: str) -> None:
         stripped = line.strip()
@@ -5388,6 +5980,15 @@ class MarkdownStream:
             self._insert("\n")                        # spacer above the block
             return
 
+        # ── table rows: buffer the whole block, render it aligned on flush ──
+        # v1.2.20. Any non-table line (and finish()) flushes what came before, so
+        # a table can never bleed into the paragraph that follows it.
+        if stripped.startswith("|"):
+            self.table_buf.append(stripped)
+            return
+        if self.table_buf:
+            self._flush_table()
+
         # ── headers: # / ## / ### (####+ treated as h3) ───────────────────
         m = re.match(r"^(#{1,6})\s+(.*)$", line)
         if m:
@@ -5400,16 +6001,6 @@ class MarkdownStream:
 
         # ── blank line ────────────────────────────────────────────────────
         if not stripped:
-            self._insert("\n")
-            return
-
-        # ── table rows (| ... |): monospace; separator rows -> dim rule ──
-        if stripped.startswith("|"):
-            cells = [c.strip() for c in stripped.strip("|").split("|")]
-            if all(re.fullmatch(r":?-{2,}:?", c) for c in cells if c):
-                self._insert("─" * 60, ["rule"])              # |---|---| separator
-            else:
-                render_inline(self.app.chat_text, stripped, ["table_row"])
             self._insert("\n")
             return
 
@@ -5676,7 +6267,6 @@ def studio_sampling_overrides(chat, studio_sampling_setting) -> dict:
 
 
 STUDIO_TEMPERATURE = "0.9"   # per-chat temp Studio mode applies (over the 0.7 default)
-
 
 
 def _coerce_sampling(raw, lo, hi, is_int):
@@ -6043,7 +6633,6 @@ def run_sampling_verify(client, model: str, top: dict, flat: dict, models_info=N
     return lines
 
 
-
 def project_memory_file(settings: dict) -> Path:
     """Which file is the workspace index. Explicit setting wins; else <workspace>/MEMORY.md."""
     raw = str((settings or {}).get("project_memory_file") or "").strip()
@@ -6266,6 +6855,286 @@ def index_upsert_project(text: str, name: str, description: str = "",
     return "\n".join(lines), "created"
 
 
+def _note_norm(s) -> str:
+    """Lowercase, non-alphanumerics to spaces, collapsed. A COMPARISON form only - text
+    that gets written is never normalised, or the file would read like a hash."""
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9]+", " ", str(s or "").lower())).strip()
+
+
+def _note_slug_from_fact(fact: str) -> str:
+    """Fallback topic when the caller did not name one: first few words, keyed."""
+    words = re.findall(r"[a-zA-Z0-9]+", str(fact or ""))[:3]
+    return project_key("-".join(words)) or "notes"
+
+
+def _note_first_sentence(text: str) -> str:
+    """The default pointer: the leading sentence, whitespace-flattened, capped. A pointer
+    is a label, so if the first sentence is itself too long it is truncated with a marker
+    rather than silently becoming a paragraph in the index."""
+    flat = re.sub(r"\s+", " ", str(text or "")).strip()
+    m = re.split(r"(?<=[.!?])\s+", flat, maxsplit=1)
+    s = (m[0] if m else flat).strip()
+    if len(s) > MEMORY_NOTE_POINTER_MAX:
+        s = s[:MEMORY_NOTE_POINTER_MAX - 1].rstrip() + "\u2026"
+    return s
+
+
+def memory_note_search(project: str, fact: str) -> list:
+    """Near-matches for `fact` inside projects/<project>/*.md and history/*.md.
+
+    Returns [(rel_path, line_no, score)] best-first. Substring on the normalised text
+    scores 1.0; otherwise a Jaccard token overlap per paragraph, kept at or above
+    MEMORY_NOTE_SIMILAR. Bounded by MEMORY_NOTE_SCAN_MAX bytes so a large history/ cannot
+    make a note call hang.
+
+    The score is RETURNED rather than swallowed: an 0.82 near-match is a judgement the
+    model should make with the file:line in front of it, not a silent accept or reject.
+    """
+    out = []
+    try:
+        root = project_dir(project)
+        want = _note_norm(fact)
+        if not want or not root.is_dir():
+            return out
+        wt = set(want.split())
+        budget = MEMORY_NOTE_SCAN_MAX
+        # MEMORY.md is EXCLUDED: a pointer row there is by design a truncated copy of a
+        # fact, so treating it as the fact's home would make the second note on any
+        # topic report "already recorded in MEMORY.md" and misdirect the reader.
+        files = sorted([p for p in root.glob("*.md")
+                            if p.name != PROJECT_MEMORY_NAME]
+                       + list((root / "history").glob("*.md")))
+        for f in files:
+            try:
+                txt = f.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                continue
+            budget -= len(txt)
+            if budget < 0:
+                out.append(("<scan stopped: project markdown exceeds %d chars>"
+                            % MEMORY_NOTE_SCAN_MAX, 0, 0.0))
+                break
+            # Walk paragraphs while tracking the line each one starts on. re.split() would
+            # lose the offsets, and a wrong line number is worse than none: the model would
+            # open the file and not find the text.
+            start = 0
+            for chunk in re.split(r"\n[ \t]*\n", txt):
+                off = txt.find(chunk, start)
+                if off < 0:
+                    continue
+                line_no = txt.count("\n", 0, off) + 1
+                start = off + len(chunk)
+                pn = _note_norm(chunk)
+                if len(pn) < 12:
+                    continue
+                if want in pn or pn in want:
+                    out.append((str(f.relative_to(root)), line_no, 1.0))
+                    continue
+                pt = set(pn.split())
+                if not pt:
+                    continue
+                jac = len(wt & pt) / max(1, len(wt | pt))
+                if jac >= MEMORY_NOTE_SIMILAR:
+                    out.append((str(f.relative_to(root)), line_no, round(jac, 2)))
+    except Exception:
+        return out
+    out.sort(key=lambda x: -x[2])
+    return out[:5]
+
+
+def memory_note_index_edit(text: str, rel_target: str, pointer: str) -> tuple:
+    """Insert one pointer row into a project index's OWN section. Pure: (new_text, action).
+
+    action: 'row-exists' (index untouched - this is what bounds growth by DISTINCT TOPICS)
+            'created'    (a new row was inserted)
+            'no-file'    (empty text; the caller reports rather than inventing an index)
+
+    The section is created immediately after the H1 if absent, carrying its own table
+    header. Two measured reasons: (a) 4 of 7 indexes are table-dominant and 3
+    bullet-dominant, so parsing someone else's table means supporting every shape; (b) both
+    injection paths keep the HEAD and drop the TAIL when over budget, so a bottom-appended
+    pointer is invisible the moment it is written.
+
+    The section is created ONCE and later topics insert into its existing table. The first
+    version searched only for the row, so every new topic appended a whole second
+    "## Notes written by memory_note" heading - the tool would have manufactured the very
+    clutter it exists to prevent.
+    """
+    if not str(text or "").strip():
+        return text, "no-file"
+    ls = text.split("\n")
+    esc = str(pointer or "").replace("|", "\\|").strip()
+    if len(esc) > MEMORY_NOTE_POINTER_MAX:
+        # Truncation is announced, never silent: a row that reads as a complete pointer
+        # while quietly missing its tail is worse than one that admits it was cut.
+        esc = esc[:MEMORY_NOTE_POINTER_MAX - 1].rstrip() + "\u2026"
+    marker = "| `%s` |" % rel_target
+    for ln in ls:
+        if ln.strip().startswith(marker):
+            return text, "row-exists"
+    row = "| `%s` | %s |" % (rel_target, esc)
+
+    try:
+        si = ls.index(MEMORY_NOTE_SECTION)
+    except ValueError:
+        si = -1
+    if si >= 0:
+        # Insert after the LAST row of this section's table. The scan stops at the first
+        # non-table line once a row has been seen, so it cannot run on into the next
+        # section's table and drop a row in the wrong place.
+        seen = -1
+        for i in range(si + 1, len(ls)):
+            if ls[i].strip().startswith("|"):
+                seen = i
+            elif seen >= 0:
+                break
+        if seen >= 0:
+            ls.insert(seen + 1, row)
+            return "\n".join(ls), "created"
+        # Section exists but was hand-edited into having no table: rebuild under it
+        # rather than abandoning the pointer.
+        ls[si + 1:si + 1] = ["", "| Where | What |", "|---|---|", row]
+        return "\n".join(ls), "created"
+
+    at = 0
+    for i, ln in enumerate(ls):
+        if ln.startswith("# "):
+            at = i + 1
+            break
+    sec = [MEMORY_NOTE_SECTION, "",
+           "<!-- pointers only; the detail lives in the file named. Written by memory_note. -->",
+           "", "| Where | What |", "|---|---|", row]
+    ls[at:at] = [""] + sec
+    return "\n".join(ls), "created"
+
+
+
+def _active_project_block(name: str, budget: int = PROJECT_MEMORY_PROJECT_MAX) -> str:
+    """The ACTIVE project's own MEMORY.md, ready to append to the system message.
+
+    Why this exists: the workspace index only *tells* the model to read the project file,
+    and a note that depends on the model remembering to act on it is the failure mode this
+    whole line of work keeps hitting - the rules that matter (bump VERSION before editing
+    the app, build the installer after) were in a file nobody was reading, and the session
+    that needed them had no idea.
+
+    Why it is appended here and not written into SYSTEMPROMPT.md: that file is ONE global
+    document and the active project is per-chat. Putting per-chat state in it would be
+    wrong for every chat except the last one to write it, and would clutter the file the
+    user hand-edits. So the file stays the general prompt and this rides beside it, which
+    is what the ⇌ window's "As sent" tab exists to reveal.
+
+    Removal is automatic because there is nothing to remove: a chat with no `project`
+    field - a new chat, or one that was never in a project - produces "" here.
+
+    Truncation cuts on a LINE boundary. The index is a table of rows; a character-naive cut
+    slices a row in half and an incomplete rule reads as a real one.
+    """
+    name = str(name or "").strip()
+    if not name:
+        return ""
+    try:
+        p = project_memory_path(name)
+        if not p.is_file():
+            return ""
+        body = _sp_norm(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        return ""
+    full_len = len(body)      # the FILE's size, before any truncation
+    if len(body) > budget:
+        cut = body[:budget]
+        cut = cut[:cut.rfind("\n")] if "\n" in cut else cut
+        body = (cut + "\n\n[... project memory truncated at %d of %d chars. The rest is "
+                "on disk and nothing is lost: read_local_file %s ...]"
+                % (len(cut), len(body), p))
+    # v1.2.14: the budget rides IN the injected block. It used to live only in
+    # the file's own prose, and prose rots - the fictional 28,000 cap was quoted
+    # as current for five releases after the setting was deleted, and a session
+    # that believed it wrote straight past the real ceiling with the tail
+    # silently un-injected. One number, printed by the thing that enforces it.
+    pct = (100 * full_len // budget) if budget > 0 else 0
+    gauge = f"{full_len:,} / {budget:,} chars ({pct}%)"
+    if full_len > budget:
+        gauge += " - OVER BUDGET, tail NOT injected: split detail into a"
+        gauge += " sibling file and leave a one-line pointer here"
+    return "# ACTIVE PROJECT: %s - %s\n%s" % (name, gauge, body)
+
+
+def memory_file_len(path) -> int:
+    """The ONE way a memory file's size is measured. -1 if it cannot be read.
+
+    Normalised, because that is what the injector measures: _active_project_block
+    truncates _sp_norm(text), so trailing whitespace never reaches a session and
+    must not count against the budget. v1.2.14 shipped three different numbers for
+    one file (header 13,875 / receipt 13,877 / linter 13,877) because two sites
+    counted raw read_text() and one counted the normalised body - a miniature of
+    the exact second-source-of-truth problem that release exists to remove. Any new
+    budget readout calls this and nothing else.
+    """
+    try:
+        return len(_sp_norm(Path(path).read_text(encoding="utf-8", errors="replace")))
+    except Exception:
+        return -1
+
+
+def memory_budget_note(path, settings: dict) -> str:
+    """One line for a tool receipt: how full is the memory file you just wrote.
+
+    WHY THIS EXISTS. check_memory.py had zero references in this file - the app has
+    never once run its own linter - so writing MEMORY.md returned "net +444 bytes"
+    and the model only learned it had broken the budget by shelling out to find out.
+    That shell-out is one of the six calls in the churn loop the owner reported
+    ("task done in 10 seconds, 5 minutes on memory files"). Putting the number in
+    the receipt removes the loop's re-check step, and a wrong number becomes
+    impossible to hold in mind because it is reprinted on every write.
+
+    Only the INJECTED files get a note: a project's MEMORY.md and the workspace
+    index. history/*.md and every other file have no ceiling, so a note there would
+    be noise - and noise is what makes a signal get ignored.
+
+    Never raises, and returns "" for anything that is not an injected memory file:
+    a receipt helper must not be able to break a write.
+    """
+    try:
+        p = Path(path).resolve()
+        if p.name != PROJECT_MEMORY_NAME or not p.is_file():
+            return ""
+        s = settings or {}
+        try:
+            idx_budget = int(float(s.get("project_memory_chars", PROJECT_MEMORY_DEFAULT)))
+        except (TypeError, ValueError):
+            idx_budget = PROJECT_MEMORY_DEFAULT
+        idx_budget = max(0, min(idx_budget, PROJECT_MEMORY_MAX))
+        used = memory_file_len(p)   # normalised: the same number the header prints
+        if used < 0:
+            return ""
+        try:
+            if p == project_memory_file(s).resolve():
+                budget, kind = idx_budget, "workspace index"
+            elif p.parent.parent == projects_root() and p.parent.is_dir():
+                budget, kind = int(PROJECT_MEMORY_PROJECT_MAX), "project memory"
+            else:
+                return ""              # projects/<name>/history/MEMORY.md etc.
+        except Exception:
+            return ""
+        if budget <= 0:
+            return ""
+        pct = 100 * used // budget
+        if used > budget:
+            return (f"\nMEMORY BUDGET OVER: {kind} {used:,} / {budget:,} chars "
+                    f"({pct}%) - the injector truncates at a line boundary, so every "
+                    f"char past {budget:,} is INVISIBLE to sessions in this project. "
+                    f"Move detail into a sibling file and leave a one-line pointer "
+                    f"here; do NOT shorten prose to fit.")
+        if pct >= 90:
+            return (f"\nMEMORY BUDGET: {kind} {used:,} / {budget:,} chars ({pct}%) - "
+                    f"nearly full. The next fact goes in a sibling file with a "
+                    f"pointer, not into this index.")
+        return f"\nMEMORY BUDGET: {kind} {used:,} / {budget:,} chars ({pct}%)"
+    except Exception:
+        return ""
+
+
 def _project_memory_text(settings: dict) -> str:
     """The workspace memory INDEX, for the system prompt. '' when off or absent.
 
@@ -6299,77 +7168,14 @@ def _project_memory_text(settings: dict) -> str:
         raw = raw[:budget].rstrip()
         note = (f"\n\n[... index truncated at {budget} of {total} chars - "
                 f"read_local_file the whole file at {p} ...]")
-    return (f"PROJECT MEMORY INDEX (workspace convention: every project has its own "
-            f"folder under {default_workspace_root() / PROJECT_MEMORY_SUBDIR} with its "
-            f"own MEMORY.md; read that file before working in a project, and update it "
-            f"when anything durable changes):\n{raw}{note}"
-            # The split rule rides on EVERY request on purpose. It used to live only
-            # in the index body, where a model skimming it has been known to "fix" an
-            # over-budget memory file by DELETING rows from it - unrecoverable loss.
-            # Two projects lost real history that way before the rule was moved here.
-            f"\n\nMEMORY SIZE RULE: a project MEMORY.md that outgrows its budget is "
-            f"SPLIT, never trimmed. Move detail into a sibling file "
-            f"(projects/<name>/HARDWARE.md, RULES.md, history/<topic>.md) and leave "
-            f"the main file as an index whose rows say what lives where. Deleting or "
-            f"compressing a fact to hit a byte target DESTROYS information and is "
-            f"never the right fix; splitting preserves it. Verify after splitting "
-            f"that every fact is still findable in the project.")
+    # v1.2.5: ONE framing line, then the file. The old block hardcoded a four-line
+    # header plus a 446-char MEMORY SIZE RULE; policy prose the user may want to
+    # change belongs in SYSTEMPROMPT.md, not in code that runs on every request.
+    return (f"WORKSPACE MEMORY INDEX ({p}) - one row per project; read "
+            f"{PROJECT_MEMORY_SUBDIR}/<name>/{PROJECT_MEMORY_NAME} before working "
+            f"in that project:\n{raw}{note}")
 
 
-def _project_memory_project_text(settings: dict, project_name: str) -> str:
-    """The ACTIVE project's own MEMORY.md, for the system prompt. '' when off/absent.
-
-    SOW item 5 Gap 1. The index says WHICH folder to look in; this is what actually
-    makes the model aware, because "read the project memory first" is a step a model
-    skips under pressure - and by the time it skips it, it has already re-derived a
-    settled fact or created a second memory file beside the real one. Injecting the
-    file removes the optional step instead of recommending it.
-
-    Reads the folder that ACTUALLY exists via resolve_project(), never a slugified
-    guess: the real folders are `GB10_Alert` and `Price-Stock_Montor`, and a path
-    built from a normalised name would silently read nothing while looking correct.
-
-    Truncation is stated rather than hidden - a silently cut memory file reads like a
-    complete one, and the model then treats the missing half as never having existed.
-    """
-    name = str(project_name or "").strip()
-    if not name:
-        return ""
-    try:
-        budget = int(float((settings or {}).get("project_memory_project_chars",
-                                                PROJECT_MEMORY_PROJECT_DEFAULT)))
-    except (TypeError, ValueError):
-        budget = PROJECT_MEMORY_PROJECT_DEFAULT
-    budget = max(0, min(budget, PROJECT_MEMORY_PROJECT_MAX))
-    if budget <= 0:
-        return ""
-    canonical, path, existed = resolve_project(name)
-    if not existed or path is None:
-        return ""
-    p = path / PROJECT_MEMORY_NAME
-    try:
-        if not p.is_file():
-            return ""
-        size = p.stat().st_size
-        raw = p.read_bytes()[:PROJECT_MEMORY_READ_MAX].decode("utf-8", "replace")
-    except Exception:
-        return ""
-    raw = raw.strip()
-    if not raw:
-        return ""
-    total = len(raw)
-    note = ""
-    if total > budget:
-        raw = raw[:budget].rstrip()
-        # "+" when the DISK read was capped before the budget was reached, so the
-        # reported total is a floor rather than a number that looks exact.
-        note = (f"\n\n[... {PROJECT_MEMORY_NAME} truncated at {budget} of {total}"
-                f"{'+' if size > PROJECT_MEMORY_READ_MAX else ''} chars - "
-                f"read_local_file the whole file at {p} ...]")
-    return (f"ACTIVE PROJECT MEMORY - {PROJECT_MEMORY_SUBDIR}/{canonical}/{PROJECT_MEMORY_NAME} "
-            f"(injected so this project's rules, entry points and settled decisions are "
-            f"known without a lookup; update this file in the same turn as any durable "
-            f"change, and split it rather than trimming it):\n{raw}{note}")
 
 
 def effective_custom_prompt(settings: dict) -> str:
@@ -6390,16 +7196,580 @@ def effective_custom_prompt(settings: dict) -> str:
     return str(s.get("custom_system_prompt") or "")
 
 
-def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_key: str = "",
-                         custom_prompt: str = "", skills_index: str = "",
-                         ledger: str = "", project_memory: str = "",
-                         project: str = "", studio=False,
-                         project_memory_full: str = "") -> Optional[dict]:
+_SP_CACHE: dict = {}       # {"path","key","text"}; key is (mtime_ns, size) so an edit in a
+                           # text editor takes effect on the NEXT request, no restart.
+_SP_FILE_CACHE: dict = {}  # {"base","path"}; keeps resolve_data_dir()'s write probe off the
+                           # per-request path (it mkdirs and writes a probe file).
+_SP_SEED_WARNED: set = set()  # paths whose seed failure has already been reported
+
+
+# ── v1.2.6: the file IS the prompt ────────────────────────────────────────
+# Everything the app contributes to the system prompt is written INTO SYSTEMPROMPT.md as
+# a marker-delimited managed block. Only the text between a pair of markers is ever
+# replaced, so prose written outside them is never touched, and every change leaves a
+# .prev copy. The model must be able to be told nothing the user cannot read in the file.
+SP_MARK = "<!--dp:%s-->"
+
+# The one line the app puts above the user's persona text inside the persona block. A
+# constant because the ⇌ editor must STRIP it to recover the setting value: if the two
+# spellings drift, every save either duplicates the header or eats user text.
+PERSONA_PREFIX = "User instructions (apply to every reply):"
+SP_KINDS = ("workspace", "search", "scraper", "skills", "memory", "persona")
+SP_STATE = "SYSTEMPROMPT.state.json"
+# Written by the --settings-window child; the only evidence available when
+# the window fails to appear, since it cannot be observed from here.
+SETTINGS_LOG_NAME = "settings_window.log"
+SP_HEADER = ("# ── managed by DeskPilot ─────────────────────────────────────────────\n"
+             "# Between each pair of markers DeskPilot writes its own text; it regenerates\n"
+             "# them when Settings, skills or the workspace index change. Edit freely\n"
+             "# anywhere else, or delete a pair of markers to opt out of that block for good.")
+
+
+def _sp_state_path() -> Path:
+    return system_prompt_file().with_name(SP_STATE)
+
+
+def _sp_read_state() -> dict:
+    try:
+        return json.loads(_sp_state_path().read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+def _sp_norm(text: str) -> str:
+    """The one canonical form of the prompt file: LF only, repaired tokens, no padding.
+
+    The loader, the writer and the state hash all go through here. Without it a stray
+    CRLF makes the system prompt and a byte read of the file disagree by one character -
+    exactly the drift this change exists to remove.
+    """
+    if text is None:
+        return ""
+    flat = text.replace("\r\n", "\n").replace("\r", "\n")
+    return _unescape_prompt_tokens(flat).strip()
+
+
+def _sp_lf(text: str) -> str:
+    """Newlines only - no token repair, no stripping.
+
+    A managed block embeds the contents of OTHER files (the workspace index, a skill
+    description). Those files carry their own line endings, so embedding them raw puts
+    CRLF inside SYSTEMPROMPT.md while the loader hands the model LF - and the promise
+    that the prompt IS the file fails by one character per line. Normalizing the body
+    before it goes in is what makes the written file byte-identical to what is sent."""
+    return (text or "").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _sp_block_span(text: str, kind: str):
+    """(start, end) covering one managed block INCLUDING both markers, else None."""
+    a = SP_MARK % kind
+    i = text.find(a)
+    if i < 0:
+        return None
+    j = text.find(a, i + len(a))
+    if j < 0:
+        return None
+    return i, j + len(a)
+
+
+def _sp_collapse(text: str, kind: str) -> str:
+    """Keep at most one managed block per kind.
+
+    A second marker pair would otherwise ride on every request forever: _sp_block_span
+    only ever looks at the first pair, so nothing could remove the stale copy."""
+    a = SP_MARK % kind
+    idx = []
+    i = text.find(a)
+    while i >= 0:
+        idx.append(i)
+        i = text.find(a, i + len(a))
+    if len(idx) < 4:
+        return text                      # none, or one well-formed block
+    if len(idx) % 2:
+        return text                      # unbalanced marker: the user's own text
+    out = text[: idx[1] + len(a)]        # keep the first block whole
+    cursor = idx[1] + len(a)
+    j = 2
+    while j + 1 < len(idx):
+        out += text[cursor: idx[j]]      # text outside the later blocks is kept
+        cursor = idx[j + 1] + len(a)     # the duplicate block itself is dropped
+        j += 2
+    out += text[cursor:]
+    while "\n\n\n" in out:
+        out = out.replace("\n\n\n", "\n\n")
+    return out
+
+
+def _sp_replace_block(text: str, kind: str, body: str) -> str:
+    """Replace one managed block's body; append it if absent; REMOVE it if body is empty.
+
+    An empty body must not leave a heading plus blank lines on every request, and
+    removal must not glue the surrounding text together."""
+    a = SP_MARK % kind
+    body = (body or "").strip()
+    rendered = (f"{a}\n{body}\n{a}") if body else ""
+    span = _sp_block_span(text, kind)
+    if span:
+        s, e = span
+        if rendered:
+            return text[:s] + rendered + text[e:]
+        head, tail = text[:s].rstrip("\n"), text[e:].lstrip("\n")
+        return (head + "\n\n" + tail) if (head and tail) else (head or tail)
+    if not rendered:
+        return text
+    base = text.rstrip("\n")
+    if SP_HEADER not in base:
+        base += "\n\n" + SP_HEADER
+    return base + "\n\n" + rendered + "\n"
+
+
+def _persona_block(settings: dict) -> str:
+    """The Settings custom prompt as it appears in the file ('' when switched off)."""
+    txt = effective_custom_prompt(settings).strip()
+    return (PERSONA_PREFIX + "\n" + txt) if txt else ""
+
+
+def _sp_managed_spans(text: str) -> list:
+    """[(kind, start, end)] char offsets of every managed block, INCLUDING its marker
+    pair, in document order.
+
+    Used by the ⇌ editor to shade app-owned regions and to tell which of them an edit
+    landed in. A block whose markers are gone is simply absent here - which is the whole
+    point of "Release block": presence of the pair is what makes it app-owned.
+    """
+    out = []
+    for kind in SP_KINDS:
+        span = _sp_block_span(text, kind)
+        if span:
+            out.append((kind, span[0], span[1]))
+    out.sort(key=lambda x: x[1])
+    return out
+
+
+def _sp_inline_bodies(settings: dict) -> dict:
+    """Every managed block's content, keyed by kind. '' means 'not wanted right now'.
+
+    These sentences used to be invented per request from the settings. They are text in
+    the file now, so the user can read them, edit them, or delete the block to opt out -
+    and they are still regenerated when their source changes (a new workspace path, an
+    added API key), which a one-time materialization could not do."""
+    s = settings or {}
+    ws = str(s.get("file_workspace") or "").strip()
+    return {
+        "workspace": (
+            f"The user has restricted the local file tools to this workspace folder: {ws}. "
+            f"All read_local_file and write_local_file paths MUST be inside it; anything "
+            f"outside is rejected. Use absolute paths within that folder.") if ws else "",
+        "search": (
+            "Web search tools: when the most up-to-date information is needed (current "
+            "events, recent news, latest developments), prefer exa_search (Exa neural/"
+            "semantic search); use searxng_search (local SearXNG) for quick lookups where "
+            "freshness does not matter.") if str(s.get("exa_api_key") or "").strip() else "",
+        "scraper": (
+            "firecrawl_scrape is a powerful scraper (handles JavaScript-rendered pages and "
+            "anti-bot walls) - use it whenever a page needs a browser engine or resists "
+            "plain fetching. fetch_url remains the faster first choice for simple static "
+            "pages.") if str(s.get("firecrawl_api_key") or "").strip() else "",
+        "skills": _skills_index_text(s),
+        "memory": _project_memory_text(s),
+        "persona": _persona_block(s),
+    }
+
+
+def sync_system_prompt(settings: dict = None, reason: str = "") -> dict:
+    """Materialize everything the app contributes into SYSTEMPROMPT.md.
+
+    Runs at startup, on a Settings save, on the Prompt toggle, on a skill enable/disable,
+    and before a turn. Never a wholesale overwrite: managed blocks are replaced in place
+    and everything else is copied through untouched. Idempotent - a second call with
+    unchanged inputs writes nothing, because a prompt that churns each turn would drop
+    the engine's KV prefix cache for the whole conversation.
+
+    Two refusals protect the user's file: a file larger than the read cap would be
+    silently TRUNCATED by a rewrite, and a block the user deleted is never re-added.
+    Returns {"ok","changed","wrote","refused","note"}.
+    """
+    res = {"ok": False, "changed": False, "wrote": [], "refused": "", "note": ""}
+    p = system_prompt_file()
+    try:
+        _seed_system_prompt(p)
+        size = p.stat().st_size
+        blob = p.read_bytes()[:SYSTEMPROMPT_READ_MAX]
+    except Exception as e:
+        res["refused"] = "could not read the file (%s)" % e
+        return res
+    if size > SYSTEMPROMPT_READ_MAX:
+        # Rewriting it would drop everything past the cap. Say so instead of eating it.
+        res["refused"] = ("file is %d bytes, over the %d-byte read cap; refusing to "
+                          "rewrite it" % (size, SYSTEMPROMPT_READ_MAX))
+        return res
+    disk = blob.decode("utf-8", "replace")
+    text = _sp_norm(disk)
+    orig = text
+    state = _sp_read_state()
+    opted = set(state.get("opted_out") or [])
+    prev_kinds = set(state.get("kinds") or [])
+
+    # One-time: the inline tokens become blocks. The token is removed either way, so a
+    # hand-written file that never had them is left alone forever.
+    for tok in ("{{workspace}}", "{{web_search}}", "{{scraper}}"):
+        if tok in text:
+            text = text.replace(tok, "").strip("\n")
+    # A stray single marker means the file is malformed (one of a pair was deleted).
+    # Guessing here is how a block gets silently lost, so refuse and say which kind.
+    for kind in SP_KINDS:
+        if (SP_MARK % kind) in text and text.count(SP_MARK % kind) % 2:
+            res["refused"] = ("the file has a stray '%s' marker with no closing pair; "
+                              "delete it or restore its partner" % (SP_MARK % kind))
+            return res
+    for kind in SP_KINDS:
+        text = _sp_collapse(text, kind)
+
+    bodies = _sp_inline_bodies(settings)
+    # A NON-EMPTY block the app wrote last time that is now gone was deleted by the user:
+    # honour that forever. An EMPTY block that is gone is just a toggle (persona off, key
+    # removed) and must come back when its source returns - so the emptiness test is the
+    # whole rule.
+    # Re-adding a marker pair is how the user opts BACK in, so presence clears the flag.
+    opted -= {k for k in SP_KINDS if (SP_MARK % k) in text}
+    # 'gone' means NO marker of that kind anywhere - the user deleted the pair, which is
+    # the documented opt-out. But that inference is only safe on a file that is still
+    # visibly MANAGED. If EVERY marker is gone the user replaced the whole file with
+    # their own prose, and reading that as 'opt out of everything, forever' would mean
+    # the app silently never writes again - the worst possible outcome for someone who
+    # just rewrote their prompt. A blank file is the same story. Re-add in both cases.
+    still_managed = text.strip() and any((SP_MARK % k) in text for k in SP_KINDS)
+    if still_managed:
+        for kind in SP_KINDS:
+            if kind in prev_kinds and (bodies.get(kind) or "").strip() \
+                    and (SP_MARK % kind) not in text:
+                opted.add(kind)
+    wrote = []
+    for kind in SP_KINDS:
+        if kind in opted:
+            continue
+        before = text
+        text = _sp_replace_block(text, kind, _sp_lf(bodies.get(kind) or ""))
+        if text != before:
+            wrote.append(kind)
+    text = text.strip("\n") + "\n"
+
+    # Compare against the RAW bytes on disk, not the normalized form. Comparing
+    # normalized-to-normalized lets a CRLF file pass the check and never be rewritten -
+    # and then the prompt (LF, because the loader normalizes) is not the file (CRLF),
+    # which is the one thing this whole change promises. Writing the canonical text here
+    # makes the file converge to exactly what is sent, once, and stays idempotent.
+    if disk == text:
+        res["ok"] = True
+        return res
+    # Only claim a hand-edit when there is a previous write to compare against: on the
+    # first sync there is no recorded hash, and reporting 'hand-edited' then is noise
+    # that would make the user doubt a file they never touched.
+    prev_hash = str(state.get("sha256") or "")
+    canon = (orig + "\n") if orig else "\n"
+    if prev_hash and hashlib.sha256(canon.encode("utf-8")).hexdigest() != prev_hash:
+        res["note"] = "file was hand-edited since the last sync; only managed blocks updated"
+    try:
+        if p.exists():
+            p.with_name(p.name + ".prev").write_bytes(p.read_bytes())
+        _atomic_write(p, text)
+    except Exception as e:
+        res["refused"] = "could not write the file (%s)" % e
+        return res
+    _SP_CACHE.clear()
+    now_kinds = sorted(k for k in SP_KINDS if _sp_block_span(text, k) is not None)
+    try:
+        _atomic_write(_sp_state_path(),
+                      json.dumps({"sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(),
+                                  "reason": reason, "kinds": now_kinds,
+                                  "opted_out": sorted(opted)},
+                                 indent=1, sort_keys=True))
+    except Exception:
+        pass
+    res["ok"] = True
+    res["changed"] = True
+    res["wrote"] = wrote
+    return res
+
+
+def system_prompt_file() -> Path:
+    """Where SYSTEMPROMPT.md lives: the app data dir, beside the settings/chats JSON.
+
+    Resolved from resolve_data_dir()'s RETURN VALUE, never a literal path, so it lands
+    correctly per OS (%LOCALAPPDATA%\\Deskpilot on Windows; the script folder as the
+    existing fallback elsewhere).
+
+    Deliberately NOT SETTINGS_FILE.parent: --multi relocates that into scratch_<pid>/, and
+    the prompt is one shared user file - a per-instance copy would let one window's edits
+    silently diverge from another's. DATA_DIR is set by main() before
+    _setup_multi_profile() and is never redirected by it.
+    """
+    global _SP_FILE_CACHE
+    base = DATA_DIR if DATA_DIR is not None else resolve_data_dir()
+    if _SP_FILE_CACHE.get("base") != base:
+        _SP_FILE_CACHE = {"base": base, "path": base / SYSTEMPROMPT_NAME}
+    return _SP_FILE_CACHE["path"]
+
+
+def _seed_system_prompt(p: Path) -> None:
+    """Write the default template on first run. Never overwrites - copy-not-clobber, the
+    same discipline as _migrate_legacy_files. Warns once per path: this runs on the request
+    path, and a read-only data dir must not print on every message."""
+    try:
+        if not p.exists():
+            p.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(p, SYSTEMPROMPT_DEFAULT)
+    except Exception as e:
+        if str(p) not in _SP_SEED_WARNED:
+            _SP_SEED_WARNED.add(str(p))
+            print(f"[{APP_NAME}] Could not create {SYSTEMPROMPT_NAME}: {e}")
+
+
+# ── v1.2.4: placeholder tokens must survive a Markdown-aware editor ───────────
+# Reproduced on a live install: an editor escaped '{{web_search}}' to
+# '{{web\_search}}'. Substitution matches the exact token, so nothing matched - the
+# web-search guidance vanished from EVERY request while the model still saw the raw
+# braces, and nothing anywhere said so. Two rules follow from that:
+#   1. normalise escapes inside a token before substituting (below), and
+#   2. make an unrecognised token LOUD (see _unknown_prompt_tokens), because a
+#      silently shortened prompt is indistinguishable from a correct one.
+# Only text BETWEEN braces is rewritten: a Windows path in prose keeps its backslashes.
+_TOKEN_RE = re.compile(r"\{\{([^{}]*?)\}\}")
+
+# Every token the assembler knows. Keep in step with build_system_message(); the
+# preview warning is the check that a new token got documented here too.
+# Tokens the app still recognizes in the file. v1.2.6: the three block tokens are gone -
+# their content is written into the file instead of substituted into it. workspace /
+# web_search / scraper are materialized into managed blocks by sync_system_prompt(), with
+# {{workspace}} also expanded by build_system_message() as a pre-sync fallback.
+SYSTEMPROMPT_TOKENS = frozenset({"workspace", "web_search", "scraper"})
+
+
+def _unescape_prompt_tokens(text: str) -> str:
+    r"""Strip backslash escapes inside {{placeholder}} tokens.
+
+    '{{web\_search}}' -> '{{web_search}}'; 'C:\Users\x' is left alone. Idempotent,
+    and a no-op when the template has no braces at all."""
+    if "{{" not in (text or ""):
+        return text or ""
+    return _TOKEN_RE.sub(lambda m: "{{" + m.group(1).replace("\\", "") + "}}", text)
+
+
+def _unknown_prompt_tokens() -> list:
+    """Tokens present in the current template that the assembler does not implement.
+
+    Computed from the TEMPLATE, never from the assembled prompt: injected project
+    memory or a ledger entry may legitimately contain braces, and those are not
+    placeholders (substitution is template-only, by design - see Phase 1 T5e)."""
+    try:
+        tpl = system_prompt_text()
+    except Exception:
+        return []
+    out = sorted({m.group(1).strip() for m in _TOKEN_RE.finditer(tpl or "")
+                  if m.group(1).strip() not in SYSTEMPROMPT_TOKENS})
+    return out[:8]
+
+
+def _prompt_bodies(t: str) -> Dict[str, str]:
+    """kind -> inner body of each managed block, for the diff that decides warnings."""
+    out: Dict[str, str] = {}
+    for kind, s, e in _sp_managed_spans(t):
+        inner, mk = t[s:e], SP_MARK % kind
+        if inner.startswith(mk):
+            inner = inner[len(mk):]
+        if inner.endswith(mk):
+            inner = inner[:-len(mk)]
+        out[kind] = inner.strip("\n")
+    return out
+
+
+def save_prompt_text(new_text: str, settings: dict, loaded_baseline: str,
+                     persist=None) -> Dict[str, Any]:
+    """Write SYSTEMPROMPT.md through the ONE contract. v1.2.27.
+
+    Extracted verbatim from _preview_system_prompt._do_save so the Next web
+    settings window can save the prompt WITHOUT reimplementing the guards. Those
+    guards are not decoration: each exists because of a real lost update or a
+    real stripped workspace jail, and a second copy would drop whichever one
+    nobody remembered to port.
+
+    All refusals happen BEFORE any write, in this order:
+      1. an empty file - it would strip every operating instruction, jail included
+      2. unbalanced markers - one of a pair makes sync_system_prompt refuse the
+         whole file, so saving it would break the app's ability to refresh it
+      3. v1.2.11 lost-update guard - loaded_baseline must still match the disk
+      4. persona write-back, under the same CUSTOM_PROMPT_MAX Settings enforces
+
+    `loaded_baseline` must be _sp_norm() of the text the editor actually loaded.
+    `persist(settings)` writes the settings dict; defaults to save_settings. The
+    Next child passes its own so the persona write-back lands in the Next store
+    and never touches the live one - the same read/write split the settings
+    bridge already keeps.
+
+    Returns {"ok", "message", "warn", "text", "touched", "unknown", "refused"}.
+    On success "text" is the TRUE post-sync file bytes: sync regenerates every
+    managed block, so an edit inside one is already gone, and showing the real
+    bytes makes a doomed edit vanish in front of the user - which says more than
+    any warning could.
+    """
+    def refuse(msg: str) -> Dict[str, Any]:
+        return {"ok": False, "message": msg, "warn": True, "text": "",
+                "touched": [], "unknown": [], "refused": ""}
+
+    t = _sp_norm(new_text)
+    if not t.strip():
+        return refuse("Not saved: an empty prompt file would strip every operating "
+                      "instruction, including the workspace jail. Keep at least one "
+                      "line.")
+    for kind in SP_KINDS:
+        mk = SP_MARK % kind
+        if mk in t and t.count(mk) % 2:
+            return refuse("Not saved: '%s' appears %d time(s). A block needs an opening "
+                          "AND a closing marker - with only one of a pair the app "
+                          "refuses to refresh the file at all." % (mk, t.count(mk)))
+
+    # v1.2.11 lost-update guard. The editor holds a snapshot taken when it opened;
+    # a Settings save, a skill toggle, the Prompt toggle or a second editor window
+    # all rewrite the file through sync_system_prompt(). Saving this buffer over a
+    # newer file would silently discard that - and the persona write-back below
+    # would push stale text into Settings too.
+    disk_now = _sp_norm(system_prompt_text())
+    if disk_now != loaded_baseline:
+        return refuse("Not saved: the file changed on disk since this window opened "
+                      "(a Settings save, a skill toggle, or another window). Saving "
+                      "would overwrite that. Press Reload to load the current file, "
+                      "then re-apply your edit.")
+
+    old, new = _prompt_bodies(system_prompt_text()), _prompt_bodies(t)
+    touched: List[str] = []
+
+    # D2: the persona's authoritative store is the SETTING, not the file - the block
+    # is generated from it, and the Prompt toggle only works because the setting
+    # keeps the text while the block is blanked. So an edit here writes back.
+    pb = new.get("persona")
+    if pb is not None:
+        txt = pb[len(PERSONA_PREFIX):].strip() if pb.startswith(PERSONA_PREFIX) \
+            else pb.strip()
+        if txt != str(settings.get("custom_system_prompt") or "").strip():
+            if len(txt) > CUSTOM_PROMPT_MAX:
+                return refuse("Not saved: the persona text is %d characters and the cap "
+                              "is %d. Shorten it here or in Settings."
+                              % (len(txt), CUSTOM_PROMPT_MAX))
+            settings["custom_system_prompt"] = txt
+            touched.append("persona (written back to Settings)")
+    for kind in sorted(new):
+        if kind != "persona" and kind in old and old[kind] != new[kind]:
+            touched.append(kind)
+
+    try:
+        _atomic_write(system_prompt_file(), t)
+    except Exception as e:
+        return refuse("Could not write the file: %s" % e)
+    res = sync_system_prompt(settings, "editor")
+    try:
+        (persist or save_settings)(settings)
+    except Exception as e:
+        return refuse("Prompt saved, but Settings could not be written: %s" % e)
+
+    cur = system_prompt_text()
+    if res.get("refused"):
+        return {"ok": True, "warn": True, "text": cur, "touched": touched,
+                "unknown": [], "refused": str(res["refused"]),
+                "message": "Written, but the app declined to refresh it: %s"
+                           % res["refused"]}
+
+    out = "Saved. Live on the next message - no restart needed."
+    if touched:
+        out += ("\n\u26a0 You edited inside app-owned block(s): %s. The app "
+                "rewrites those before every turn, so that text will be replaced. "
+                "Move it outside the markers, or press Release block to keep it "
+                "permanently." % ", ".join(touched))
+    unk = _unknown_prompt_tokens()
+    if unk:
+        out += ("\n\u26a0 unknown placeholder(s) now in the file: "
+                + ", ".join("{{%s}}" % x for x in unk) + " - sent literally.")
+    return {"ok": True, "warn": bool(touched or unk), "text": cur,
+            "touched": touched, "unknown": unk, "refused": "", "message": out}
+
+
+def release_prompt_block(text: str, kind: str) -> Dict[str, Any]:
+    """Cut one managed block out of `text` (the Release opt-out), v1.2.27.
+
+    Pure - it does not write. The caller saves the result through
+    save_prompt_text(), so the empty/balanced/lost-update guards still apply.
+    """
+    if not kind:
+        return {"ok": False, "message": "Pick a block to release first.", "text": text}
+    span = _sp_block_span(text, kind)
+    if not span:
+        return {"ok": False, "message": "That block is not in the file.", "text": text}
+    s, e = span
+    out = (text[:s] + text[e:]).replace("\n\n\n", "\n\n")
+    if not [x for x in SP_KINDS if (SP_MARK % x) in out]:
+        return {"ok": True, "text": out, "kind": kind,
+                "message": "Released '%s'. \u26a0 No managed markers remain, so the app "
+                           "now treats this file as entirely hand-written and will "
+                           "re-add every block on the next sync. Keep at least one pair "
+                           "if you want the opt-out to stick." % kind, "warn": True}
+    return {"ok": True, "text": out, "kind": kind,
+            "message": "Released '%s' - press Save to write it. While its markers stay "
+                       "gone the app will not manage that block again." % kind,
+            "warn": False}
+
+
+def system_prompt_text() -> str:
+    """The editable template, re-read whenever the file changes.
+
+    Falls back to SYSTEMPROMPT_DEFAULT when the file is missing, unreadable or blank: an
+    empty prompt would silently strip every operating instruction (the workspace jail, the
+    tool guidance) while the app still appeared to work. The fallback is reported."""
+    p = system_prompt_file()
+    try:
+        key = (p.stat().st_mtime_ns, p.stat().st_size)
+    except OSError:
+        # Missing (or unstatable): seed it so the user has something to edit, and use the
+        # default for THIS request. The seeded text IS the default, so output is identical
+        # either way and the next request simply reads the file back.
+        _SP_CACHE.clear()
+        _seed_system_prompt(p)
+        return SYSTEMPROMPT_DEFAULT
+    if _SP_CACHE.get("path") == str(p) and _SP_CACHE.get("key") == key:
+        return _SP_CACHE["text"]
+    try:
+        raw = p.read_bytes()[:SYSTEMPROMPT_READ_MAX].decode("utf-8", "replace")
+    except Exception:
+        raw = ""
+    # v1.2.6: ONE canonical form, shared with sync_system_prompt(), so the prompt the
+    # model receives is byte-identical to the file - line endings included.
+    raw = _sp_norm(raw)
+    if raw:
+        _SP_CACHE.update({"path": str(p), "key": key, "text": raw})
+        return raw
+    _seed_system_prompt(p)
+    return SYSTEMPROMPT_DEFAULT      # not cached: recovers once the file has content
+
+
+def build_system_message(file_workspace: str = "", studio=False) -> Optional[dict]:
     """System prompt injected at request time (never persisted to chat history).
 
     The model has no other way of knowing the real current date/time; without
     this, questions like "what time is it?" get hallucinated answers. Built
     fresh for every API call so long sessions don't go stale.
+
+    v1.2.6 THE FILE IS THE PROMPT (owner decision): this returns the contents of
+    SYSTEMPROMPT.md. Nothing is appended and nothing is generated. Everything the app
+    contributes - the workspace sentence, the search and scraper guidance, the enabled
+    skills index, the workspace memory index and the user's custom prompt - is written
+    INTO that file by sync_system_prompt() as marker-delimited managed blocks, so what
+    the user reads in the file is byte-for-byte what the model receives. An appended
+    block is invisible in the file, and an instruction the user cannot read, edit or
+    delete is exactly what this change exists to end.
+
+    v1.2.5 CLEAN SLATE (owner decision): the active project's own MEMORY.md, the ledger
+    tail, the hardcoded "ACTIVE PROJECT:" line and the hardcoded MEMORY SIZE RULE were
+    REMOVED FROM THE CODE, not gated off, so nothing can reappear by changing a setting.
+    That content is still reachable - read_local_file for any MEMORY.md, read_ledger()
+    for the ledger - it is simply not carried on every request.
 
     v1.1.77: the opening line used to end with "Keep answers concise." It was
     hardcoded, gated by nothing, and sat in every request the app ever sent - the one
@@ -6417,20 +7787,19 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
                         assumes messages[0] is a system message).
 
     A generative session has no use for the workspace jail, tool guidance, tool-economy
-    paragraph, skills index, ledger or user persona - every one of them reads as "be a
-    terse operator", so 'full' returns the brief ALONE and ignores those arguments.
+    paragraph, skills index or user persona - every one of them reads as "be a terse
+    operator", so 'full' returns the brief ALONE and ignores those arguments.
 
     ⚠ PROJECT MEMORY is decided by the CALLER, not here (v1.1.83): the request path
     appends the workspace memory index to STUDIO_SYSTEM_PROMPT for 'full', because a
     generative session still has to know which project it is in. So 'full' is NOT
-    literally "STUDIO_SYSTEM_PROMPT only" on the wire - it is that plus project
-    memory. 'pure' remains nothing at all. Do not move that append in here: this
+    literally "STUDIO_SYSTEM_PROMPT only" on the wire - it is that plus the workspace
+    memory index. 'pure' remains nothing at all. Do not move that append in here: this
     function's 'full' contract (one exact string) is what the Studio identity test
     pins, and folding memory in would make the test unable to tell the two apart.
 
-    custom_prompt (Settings -> Custom System Prompt) is appended AFTER all the
-    built-in context so persona/style instructions layer on top of - and can
-    never replace - the operational facts above.
+    The custom prompt is no longer an argument: it is the 'persona' managed block in the
+    file, written there when Settings saves or the Prompt toggle flips.
 
     The date/time is NOT here: it changes every minute and would invalidate the
     engine's KV prefix cache for the whole conversation. See build_time_note(),
@@ -6442,82 +7811,23 @@ def build_system_message(file_workspace: str = "", exa_key: str = "", firecrawl_
         return None
     if mode == "full":
         return {"role": "system", "content": STUDIO_SYSTEM_PROMPT}
-    content = (
-        f"You are Deskpilot, a helpful local AI desktop assistant running on the user's computer."
-    )
-    if file_workspace:
-        content += (f" The user has restricted the local file tools to this workspace folder: {file_workspace}. "
-                    f"All read_local_file and write_local_file paths MUST be inside it; anything outside is rejected. "
-                    f"Use absolute paths within that folder.")
-    if exa_key:
-        content += (" Web search tools: when the most up-to-date information is needed (current events, "
-                    "recent news, latest developments), prefer exa_search (Exa neural/semantic search); "
-                    "use searxng_search (local SearXNG) for quick lookups where freshness does not matter.")
-    if firecrawl_key:
-        content += (" firecrawl_scrape is a powerful scraper (handles JavaScript-rendered pages and anti-bot "
-                    "walls) - use it whenever a page needs a browser engine or resists plain fetching. "
-                    "fetch_url remains the faster first choice for simple static pages.")
-    content += (" Tool economy: each tool call costs a full round trip and its output stays in "
-                "context, so batch what you can - one comprehensive call that prints several "
-                "things beats several narrow calls asking one question each; use search_files to "
-                "locate code before reading whole files; do not re-read a file you already read "
-                "this turn unless it changed. Verify the work, but verify it once and "
-                "comprehensively rather than repeatedly in small probes.")
-    # v1.1.86 (SOW item 2): the capability existed but nothing TRIGGERED it, so it
-    # went unused unless the user happened to ask. This is the nudge, and it is
-    # deliberately paired with a budget - an unbounded "always verify" turns every
-    # answer into a research project and trades hallucination for latency. One check
-    # per question; if it does not settle the matter, say what is uncertain instead of
-    # burning more calls. ask_expert already carries its own "use it where a fresh pair
-    # of eyes helps" guidance, so this line only has to make the FIRST move automatic.
-    content += (" Verify before you assert: when a claim is about something that can "
-                "have changed (prices, stock, versions, dates, what a product or API "
-                "currently does, who holds what role) - or you would hesitate to bet "
-                "on it - check it rather than answering from memory: one exa_search or "
-                "searxng_search, or ask_expert for a code or design question you are "
-                "unsure about. Budget it: one check per question, and if the first one "
-                "does not settle it, state what is still uncertain and say so plainly "
-                "instead of presenting a guess as a fact.")
-    si = (skills_index or "").strip()
-    if si:
-        # Placed BEFORE the user's standing instructions so skills read as available
-        # capability, not as rules competing with the persona.
-        content += "\n\n" + si
-    pm = (project_memory or "").strip()
-    if pm:
-        # The index is a standing instruction about where to look, so it sits with
-        # the skills block and ahead of the ledger (facts) and the user's own text.
-        content += "\n\n" + pm
-    proj = (project or "").strip()
-    if proj:
-        # Which of those projects THIS chat is working on, plus the path to its
-        # memory file. The index says where to look in general; this removes the
-        # remaining guess, which is what made "read the project memory first"
-        # skippable. Changes only when the project changes, so the prefix is
-        # stable turn to turn (one re-prefill per project switch, not per turn).
-        content += ("\n\nACTIVE PROJECT: " + proj
-                    + " - before working in it, read "
-                    + PROJECT_MEMORY_SUBDIR + "/" + proj + "/" + PROJECT_MEMORY_NAME
-                    + ". If the work here belongs to a different project, or starts a "
-                    "new one, call set_project() so the label and the index follow.")
-    pmf = (project_memory_full or "").strip()
-    if pmf:
-        # The active project's OWN memory, placed directly after the line that names
-        # it: that line is the pointer, this is the payload, and keeping them adjacent
-        # means the model never has to connect two separate sections. Appended AFTER
-        # the index so the (stable) index prefix stays stable for prompt caching.
-        content += "\n\n" + pmf
-    led = (ledger or "").strip()
-    if led:
-        # The ledger is FACTS, not instructions, and it sits after the skills block but
-        # before the user's standing prompt: it must not be able to displace the persona
-        # or the workspace jail, and it must stay above anything the user wrote.
-        content += "\n\n" + led
-    custom = (custom_prompt or "").strip()
-    if custom:
-        content += "\n\nUser instructions (apply to every reply):\n" + custom
-    return {"role": "system", "content": content}
+    # v1.2.3 Phase 1: the instruction text is no longer hardcoded here - it comes from
+    # SYSTEMPROMPT.md (user-editable, re-read on change), with SYSTEMPROMPT_DEFAULT as the
+    # seed and the fallback. Everything below reproduces the pre-Phase-1 assembly exactly:
+    # the three inline placeholders expand to the same conditional sentences (empty when
+    # the key/setting is absent), and the block bodies are .strip()ed and joined with one
+    # "\n\n" each, in the original order.
+    head = system_prompt_text()
 
+    # v1.2.6: the file is the prompt, so there is nothing to assemble. The single
+    # substitution left is a FALLBACK for a file the app has not synced yet (a hand
+    # written file, or the first request of a fresh install before startup sync ran) -
+    # sending a literal '{{workspace}}' to the model would be worse than the small
+    # infidelity, so it is expanded here and sync removes the token for good.
+    if "{{workspace}}" in head and file_workspace:
+        head = head.replace("{{workspace}}", _sp_inline_bodies(
+            {"file_workspace": file_workspace})["workspace"])
+    return {"role": "system", "content": head}
 
 def build_time_note() -> str:
     """The volatile per-request date/time line, kept OUT of the system message.
@@ -6548,11 +7858,15 @@ def build_time_note() -> str:
         off_s = f"UTC{sign}{h}" + (f":{m:02d}" if m else "")   # e.g. UTC+5:30, UTC-4
     else:
         off_s = "unknown offset"
+    # v1.2.7b (owner): the two instruction sentences that used to follow are gone. A
+    # date stated in the prompt is used without needing permission, and timezone
+    # conversion needs no instruction - they were 136 chars of belt on a belt. The FACT
+    # is what earns its keep: every dated SOW / history file / "settled <date>" line in
+    # this project was written by a model that knew what day it was. test_v1173 pinned
+    # the old wording deliberately; it was updated with this change, not deleted.
     return (f"\n\nCurrent date and time on the user's machine: "
             f"{now.strftime('%A, %B %d, %Y at %I:%M %p')} "
-            f"(timezone {now.strftime('%Z') or 'local'}, {off_s}). "
-            f"If the user asks about the current date or time, use this information; "
-            f"for other time zones, convert from it and mention the conversion.")
+            f"(timezone {now.strftime('%Z') or 'local'}, {off_s}).")
 
 
 def _stamp_last_user(messages: List[dict], note: str) -> List[dict]:
@@ -6766,12 +8080,296 @@ SKILL_FILE_NAME = "SKILL.md"             # the only file that makes a folder a s
 SKILL_NAME_MAX = 64                      # frontmatter name length cap
 SKILL_DESC_MAX = 1024                    # frontmatter description length cap
 SKILL_INDEX_MAX = 60                     # skills named in the system prompt
-SKILL_INDEX_CHARS = 8000                 # hard cap on the whole injected index
+SKILL_INDEX_CHARS = 40000                # hard cap on the whole injected index (v1.1.95: raised 8000->40000)
 SKILL_BODY_MAX = 40000                   # chars of SKILL.md body returned by load_skill
 SKILL_SCAN_DEPTH = 3                     # how deep below a root to look for SKILL.md
 SKILL_SCAN_MAX = 400                     # directories visited per scan (bounded walk)
 SKILL_SKIP_DIRS = frozenset({            # never descended into while scanning
     "node_modules", ".git", "__pycache__", ".venv", "venv", "site-packages"})
+# ════════════════════════════════════════════════════════════════════════
+# v1.1.96 (Phase 2): the official Hermes skill catalog, bundled for offline use.
+# SKILL_CATALOG_SNAPSHOT is generated by dev_scripts/_build_snapshot.py from the
+# official repo's skills-catalog.md; each entry's `path` is the repo folder that
+# holds its SKILL.md (+ scripts/, references/). GitHub refresh is opt-in (a button),
+# never automatic - see _add_skill_dialog. Repo location for the downloader:
+SKILL_REPO_OWNER = "NousResearch"
+SKILL_REPO_NAME  = "hermes-agent"
+SKILL_REPO_REF   = "main"
+
+# Bundled snapshot of the official Hermes skill catalog (58 skills),
+# built from https://github.com/NousResearch/hermes-agent/blob/main/
+# website/docs/reference/skills-catalog.md  (see dev_scripts/_build_snapshot.py).
+# Offline-safe: the Add-Skill picker reads this when GitHub is unreachable.
+SKILL_CATALOG_SNAPSHOT = [
+    {'name': 'apple-notes', 'description': 'Manage Apple Notes via memo CLI: create, search, edit', 'category': 'apple', 'path': 'skills/apple/apple-notes/SKILL.md'},
+    {'name': 'apple-reminders', 'description': 'Apple Reminders via remindctl: add, list, complete', 'category': 'apple', 'path': 'skills/apple/apple-reminders/SKILL.md'},
+    {'name': 'findmy', 'description': 'Track Apple devices/AirTags via FindMy.app on macOS', 'category': 'apple', 'path': 'skills/apple/findmy/SKILL.md'},
+    {'name': 'imessage', 'description': 'Send and receive iMessages/SMS via the imsg CLI on macOS', 'category': 'apple', 'path': 'skills/apple/imessage/SKILL.md'},
+    {'name': 'claude-code', 'description': 'Delegate coding to Claude Code CLI (features, PRs)', 'category': 'autonomous-ai-agents', 'path': 'skills/autonomous-ai-agents/claude-code/SKILL.md'},
+    {'name': 'codex', 'description': 'Delegate coding to OpenAI Codex CLI (features, PRs)', 'category': 'autonomous-ai-agents', 'path': 'skills/autonomous-ai-agents/codex/SKILL.md'},
+    {'name': 'computer-use', 'description': 'Drive the desktop background-first; escalate on signal', 'category': 'autonomous-ai-agents', 'path': 'skills/autonomous-ai-agents/computer-use/SKILL.md'},
+    {'name': 'hermes-agent', 'description': 'Use, configure, theme, extend, and orchestrate Hermes Agent', 'category': 'autonomous-ai-agents', 'path': 'skills/autonomous-ai-agents/hermes-agent/SKILL.md'},
+    {'name': 'opencode', 'description': 'Delegate coding to OpenCode CLI (features, PR review)', 'category': 'autonomous-ai-agents', 'path': 'skills/autonomous-ai-agents/opencode/SKILL.md'},
+    {'name': 'architecture-diagram', 'description': 'Dark-themed SVG architecture/cloud/infra diagrams as HTML', 'category': 'creative', 'path': 'skills/creative/architecture-diagram/SKILL.md'},
+    {'name': 'ascii-video', 'description': 'ASCII video: convert video/audio to colored ASCII MP4/GIF', 'category': 'creative', 'path': 'skills/creative/ascii-video/SKILL.md'},
+    {'name': 'baoyu-infographic', 'description': 'Infographics: 21 layouts x 21 styles (信息图, 可视化)', 'category': 'creative', 'path': 'skills/creative/baoyu-infographic/SKILL.md'},
+    {'name': 'claude-design', 'description': 'Design one-off HTML artifacts (landing, deck, prototype)', 'category': 'creative', 'path': 'skills/creative/claude-design/SKILL.md'},
+    {'name': 'design-md', 'description': "Author/validate/export Google's DESIGN.md token spec files", 'category': 'creative', 'path': 'skills/creative/design-md/SKILL.md'},
+    {'name': 'humanizer', 'description': 'Humanize text: strip AI-isms and add real voice', 'category': 'creative', 'path': 'skills/creative/humanizer/SKILL.md'},
+    {'name': 'manim-video', 'description': 'Manim CE animations: 3Blue1Brown math/algo videos', 'category': 'creative', 'path': 'skills/creative/manim-video/SKILL.md'},
+    {'name': 'p5js', 'description': 'p5.js sketches: gen art, shaders, interactive, 3D', 'category': 'creative', 'path': 'skills/creative/p5js/SKILL.md'},
+    {'name': 'popular-web-designs', 'description': '54 real design systems (Stripe, Linear, Vercel) as HTML/CSS', 'category': 'creative', 'path': 'skills/creative/popular-web-designs/SKILL.md'},
+    {'name': 'songwriting-and-ai-music', 'description': 'Songwriting craft and Suno AI music prompts', 'category': 'creative', 'path': 'skills/creative/songwriting-and-ai-music/SKILL.md'},
+    {'name': 'sdlc-review', 'description': 'Review Kanban handoffs and route verified outcomes', 'category': 'devops', 'path': 'skills/devops/sdlc-review/SKILL.md'},
+    {'name': 'email-inbox-triage', 'description': 'Triage an inbox: prioritize threads, draft replies safely', 'category': 'email', 'path': 'skills/email/email-inbox-triage/SKILL.md'},
+    {'name': 'himalaya', 'description': 'Himalaya CLI: IMAP/SMTP email from terminal', 'category': 'email', 'path': 'skills/email/himalaya/SKILL.md'},
+    {'name': 'gif-search', 'description': 'Search/download GIFs from Tenor via curl + jq', 'category': 'media', 'path': 'skills/media/gif-search/SKILL.md'},
+    {'name': 'songsee', 'description': 'Audio spectrograms/features (mel, chroma, MFCC) via CLI', 'category': 'media', 'path': 'skills/media/songsee/SKILL.md'},
+    {'name': 'youtube-content', 'description': 'YouTube transcripts to summaries, threads, blogs', 'category': 'media', 'path': 'skills/media/youtube-content/SKILL.md'},
+    {'name': 'obsidian', 'description': 'Read, search, create, and edit notes in the Obsidian vault', 'category': 'note-taking', 'path': 'skills/note-taking/obsidian/SKILL.md'},
+    {'name': 'airtable', 'description': 'Airtable REST API via curl. Records CRUD, filters, upserts', 'category': 'productivity', 'path': 'skills/productivity/airtable/SKILL.md'},
+    {'name': 'box', 'description': 'Box manages cloud files, sharing, search, and metadata', 'category': 'productivity', 'path': 'skills/productivity/box/SKILL.md'},
+    {'name': 'document-to-action-items', 'description': 'Extract cited obligations, deadlines, tasks from documents', 'category': 'productivity', 'path': 'skills/productivity/document-to-action-items/SKILL.md'},
+    {'name': 'docx', 'description': 'Create, read, edit, template, and review Word .docx files', 'category': 'productivity', 'path': 'skills/productivity/docx/SKILL.md'},
+    {'name': 'google-workspace', 'description': 'Gmail, Calendar, Drive, Docs, Sheets via gws CLI or Python', 'category': 'productivity', 'path': 'skills/productivity/google-workspace/SKILL.md'},
+    {'name': 'maps', 'description': 'Geocode, POIs, routes, timezones via OpenStreetMap/OSRM', 'category': 'productivity', 'path': 'skills/productivity/maps/SKILL.md'},
+    {'name': 'meeting-action-items', 'description': 'Turn meeting notes into cited decisions, owners, tickets', 'category': 'productivity', 'path': 'skills/productivity/meeting-action-items/SKILL.md'},
+    {'name': 'notion', 'description': 'Notion API + ntn CLI: pages, databases, markdown, Workers', 'category': 'productivity', 'path': 'skills/productivity/notion/SKILL.md'},
+    {'name': 'pdf', 'description': 'PDF files: create, read, merge, fill, OCR, edit text', 'category': 'productivity', 'path': 'skills/productivity/pdf/SKILL.md'},
+    {'name': 'powerpoint', 'description': 'Create, read, edit .pptx decks with python-pptx', 'category': 'productivity', 'path': 'skills/productivity/powerpoint/SKILL.md'},
+    {'name': 'product-price-monitor', 'description': 'Watch product, flight, or listing prices; alert on target', 'category': 'productivity', 'path': 'skills/productivity/product-price-monitor/SKILL.md'},
+    {'name': 'teams-meeting-pipeline', 'description': 'Teams meeting summaries, job replay, Graph subscriptions', 'category': 'productivity', 'path': 'skills/productivity/teams-meeting-pipeline/SKILL.md'},
+    {'name': 'weekly-review-planning', 'description': 'Weekly reset: commitments, stalled work, next-week plan', 'category': 'productivity', 'path': 'skills/productivity/weekly-review-planning/SKILL.md'},
+    {'name': 'xlsx', 'description': 'Create, read, edit Excel .xlsx workbooks and CSVs', 'category': 'productivity', 'path': 'skills/productivity/xlsx/SKILL.md'},
+    {'name': 'arxiv', 'description': 'Search arXiv papers by keyword, author, category, or ID', 'category': 'research', 'path': 'skills/research/arxiv/SKILL.md'},
+    {'name': 'competitor-news-monitor', 'description': 'Watch named companies for material news; cited digests', 'category': 'research', 'path': 'skills/research/competitor-news-monitor/SKILL.md'},
+    {'name': 'grounded-citations', 'description': 'Ground answers and documents in cited, verifiable sources', 'category': 'research', 'path': 'skills/research/grounded-citations/SKILL.md'},
+    {'name': 'llm-wiki', 'description': "Karpathy's LLM Wiki: build/query interlinked markdown KB", 'category': 'research', 'path': 'skills/research/llm-wiki/SKILL.md'},
+    {'name': 'xurl', 'description': 'X/Twitter via xurl CLI: raw post search, posting, DM, media', 'category': 'social-media', 'path': 'skills/social-media/xurl/SKILL.md'},
+    {'name': 'codebase-inspection', 'description': 'Inspect codebases w/ pygount: LOC, languages, ratios', 'category': 'software-development', 'path': 'skills/software-development/codebase-inspection/SKILL.md'},
+    {'name': 'dogfood', 'description': 'Exploratory QA of web apps: find bugs, evidence, reports', 'category': 'software-development', 'path': 'skills/software-development/dogfood/SKILL.md'},
+    {'name': 'github', 'description': 'GitHub via gh CLI: PRs, issues, reviews, repos, auth', 'category': 'software-development', 'path': 'skills/software-development/github/SKILL.md'},
+    {'name': 'hermes-agent-skill-authoring', 'description': 'Author in-repo SKILL.md files: frontmatter and structure', 'category': 'software-development', 'path': 'skills/software-development/hermes-agent-skill-authoring/SKILL.md'},
+    {'name': 'inspecting-hermes-desktop-dom', 'description': 'Read the live Hermes desktop DOM/CSS over CDP', 'category': 'software-development', 'path': 'skills/software-development/inspecting-hermes-desktop-dom/SKILL.md'},
+    {'name': 'node-inspect-debugger', 'description': 'Debug Node.js via --inspect + Chrome DevTools Protocol CLI', 'category': 'software-development', 'path': 'skills/software-development/node-inspect-debugger/SKILL.md'},
+    {'name': 'python-debugpy', 'description': 'Debug Python: pdb REPL + debugpy remote (DAP)', 'category': 'software-development', 'path': 'skills/software-development/python-debugpy/SKILL.md'},
+    {'name': 'requesting-code-review', 'description': 'Pre-commit review: security scan, quality gates, auto-fix', 'category': 'software-development', 'path': 'skills/software-development/requesting-code-review/SKILL.md'},
+    {'name': 'simplify-code', 'description': 'Parallel 4-agent cleanup of recent code changes', 'category': 'software-development', 'path': 'skills/software-development/simplify-code/SKILL.md'},
+    {'name': 'spike', 'description': 'Throwaway experiments to validate an idea before build', 'category': 'software-development', 'path': 'skills/software-development/spike/SKILL.md'},
+    {'name': 'systematic-debugging', 'description': '4-phase root cause debugging: understand bugs before fixing', 'category': 'software-development', 'path': 'skills/software-development/systematic-debugging/SKILL.md'},
+    {'name': 'test-driven-development', 'description': 'TDD: enforce RED-GREEN-REFACTOR, tests before code', 'category': 'software-development', 'path': 'skills/software-development/test-driven-development/SKILL.md'},
+    {'name': 'blocked-page-recovery', 'description': 'Use when a fetch fails: 403/429, paywall, WAF, bot wall', 'category': 'web', 'path': 'skills/web/blocked-page-recovery/SKILL.md'},
+]
+
+# ════════════════════════════════════════════════════════════════════════
+# v1.1.96 (Phase 2): per-skill download manifest, built by dev_scripts/
+# _build_manifest.py from the recursive GitHub tree. SKILL_MANIFEST maps each
+# bundled skill folder 'skills/<cat>/<name>' -> [{rel, url}] of its files.
+# The downloader fetches these raw URLs directly: no contents API (rate-limited
+# without a token) and works offline once fetched. Mirrors SKILL_CATALOG_SNAPSHOT.
+# ⚠ Regenerate with dev_scripts/_build_manifest.py when the repo changes.
+SKILL_MANIFEST = {"skills/apple/apple-notes": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/apple/apple-notes/SKILL.md"}], "skills/apple/apple-reminders": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/apple/apple-reminders/SKILL.md"}], "skills/apple/findmy": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/apple/findmy/SKILL.md"}], "skills/apple/imessage": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/apple/imessage/SKILL.md"}], "skills/autonomous-ai-agents/claude-code": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/claude-code/SKILL.md"}], "skills/autonomous-ai-agents/codex": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/codex/SKILL.md"}], "skills/autonomous-ai-agents/computer-use": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/computer-use/SKILL.md"}], "skills/autonomous-ai-agents/hermes-agent": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/SKILL.md"}, {"rel": "references/background-systems.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/background-systems.md"}, {"rel": "references/cli-reference.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/cli-reference.md"}, {"rel": "references/configuration.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/configuration.md"}, {"rel": "references/contributor-guide.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/contributor-guide.md"}, {"rel": "references/delegate-task-concurrency-diagnosis.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/delegate-task-concurrency-diagnosis.md"}, {"rel": "references/desktop-plugins.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/desktop-plugins.md"}, {"rel": "references/native-mcp.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/native-mcp.md"}, {"rel": "references/petdex.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/petdex.md"}, {"rel": "references/portal-auth-for-third-party-apps.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/portal-auth-for-third-party-apps.md"}, {"rel": "references/project-context-files.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/project-context-files.md"}, {"rel": "references/providers-and-models.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/providers-and-models.md"}, {"rel": "references/security-privacy.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/security-privacy.md"}, {"rel": "references/slash-commands.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/slash-commands.md"}, {"rel": "references/themes.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/themes.md"}, {"rel": "references/troubleshooting.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/troubleshooting.md"}, {"rel": "references/tui-widgets.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/tui-widgets.md"}, {"rel": "references/webhooks.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/webhooks.md"}, {"rel": "references/windows-quirks.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/references/windows-quirks.md"}, {"rel": "templates/clock.mjs", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/templates/clock.mjs"}, {"rel": "templates/plugin.js", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/templates/plugin.js"}, {"rel": "templates/skin.yaml", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/hermes-agent/templates/skin.yaml"}], "skills/autonomous-ai-agents/opencode": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/autonomous-ai-agents/opencode/SKILL.md"}], "skills/creative/architecture-diagram": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/architecture-diagram/SKILL.md"}, {"rel": "templates/template.html", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/architecture-diagram/templates/template.html"}], "skills/creative/ascii-video": [{"rel": "README.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/README.md"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/SKILL.md"}, {"rel": "references/architecture.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/architecture.md"}, {"rel": "references/composition.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/composition.md"}, {"rel": "references/effects.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/effects.md"}, {"rel": "references/inputs.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/inputs.md"}, {"rel": "references/optimization.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/optimization.md"}, {"rel": "references/scenes.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/scenes.md"}, {"rel": "references/shaders.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/shaders.md"}, {"rel": "references/troubleshooting.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/ascii-video/references/troubleshooting.md"}], "skills/creative/baoyu-infographic": [{"rel": "PORT_NOTES.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/PORT_NOTES.md"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/SKILL.md"}, {"rel": "references/analysis-framework.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/analysis-framework.md"}, {"rel": "references/base-prompt.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/base-prompt.md"}, {"rel": "references/layouts/bento-grid.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/bento-grid.md"}, {"rel": "references/layouts/binary-comparison.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/binary-comparison.md"}, {"rel": "references/layouts/bridge.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/bridge.md"}, {"rel": "references/layouts/circular-flow.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/circular-flow.md"}, {"rel": "references/layouts/comic-strip.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/comic-strip.md"}, {"rel": "references/layouts/comparison-matrix.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/comparison-matrix.md"}, {"rel": "references/layouts/dashboard.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/dashboard.md"}, {"rel": "references/layouts/dense-modules.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/dense-modules.md"}, {"rel": "references/layouts/funnel.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/funnel.md"}, {"rel": "references/layouts/hierarchical-layers.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/hierarchical-layers.md"}, {"rel": "references/layouts/hub-spoke.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/hub-spoke.md"}, {"rel": "references/layouts/iceberg.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/iceberg.md"}, {"rel": "references/layouts/isometric-map.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/isometric-map.md"}, {"rel": "references/layouts/jigsaw.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/jigsaw.md"}, {"rel": "references/layouts/linear-progression.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/linear-progression.md"}, {"rel": "references/layouts/periodic-table.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/periodic-table.md"}, {"rel": "references/layouts/story-mountain.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/story-mountain.md"}, {"rel": "references/layouts/structural-breakdown.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/structural-breakdown.md"}, {"rel": "references/layouts/tree-branching.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/tree-branching.md"}, {"rel": "references/layouts/venn-diagram.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/venn-diagram.md"}, {"rel": "references/layouts/winding-roadmap.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/layouts/winding-roadmap.md"}, {"rel": "references/structured-content-template.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/structured-content-template.md"}, {"rel": "references/styles/aged-academia.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/aged-academia.md"}, {"rel": "references/styles/bold-graphic.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/bold-graphic.md"}, {"rel": "references/styles/chalkboard.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/chalkboard.md"}, {"rel": "references/styles/claymation.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/claymation.md"}, {"rel": "references/styles/corporate-memphis.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/corporate-memphis.md"}, {"rel": "references/styles/craft-handmade.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/craft-handmade.md"}, {"rel": "references/styles/cyberpunk-neon.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/cyberpunk-neon.md"}, {"rel": "references/styles/hand-drawn-edu.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/hand-drawn-edu.md"}, {"rel": "references/styles/ikea-manual.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/ikea-manual.md"}, {"rel": "references/styles/kawaii.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/kawaii.md"}, {"rel": "references/styles/knolling.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/knolling.md"}, {"rel": "references/styles/lego-brick.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/lego-brick.md"}, {"rel": "references/styles/morandi-journal.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/morandi-journal.md"}, {"rel": "references/styles/origami.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/origami.md"}, {"rel": "references/styles/pixel-art.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/pixel-art.md"}, {"rel": "references/styles/pop-laboratory.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/pop-laboratory.md"}, {"rel": "references/styles/retro-pop-grid.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/retro-pop-grid.md"}, {"rel": "references/styles/storybook-watercolor.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/storybook-watercolor.md"}, {"rel": "references/styles/subway-map.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/subway-map.md"}, {"rel": "references/styles/technical-schematic.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/technical-schematic.md"}, {"rel": "references/styles/ui-wireframe.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/baoyu-infographic/references/styles/ui-wireframe.md"}], "skills/creative/claude-design": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/claude-design/SKILL.md"}], "skills/creative/design-md": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/design-md/SKILL.md"}, {"rel": "templates/starter.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/design-md/templates/starter.md"}], "skills/creative/humanizer": [{"rel": "LICENSE", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/humanizer/LICENSE"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/humanizer/SKILL.md"}], "skills/creative/manim-video": [{"rel": "README.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/README.md"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/SKILL.md"}, {"rel": "references/animation-design-thinking.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/animation-design-thinking.md"}, {"rel": "references/animations.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/animations.md"}, {"rel": "references/camera-and-3d.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/camera-and-3d.md"}, {"rel": "references/decorations.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/decorations.md"}, {"rel": "references/equations.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/equations.md"}, {"rel": "references/graphs-and-data.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/graphs-and-data.md"}, {"rel": "references/mobjects.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/mobjects.md"}, {"rel": "references/paper-explainer.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/paper-explainer.md"}, {"rel": "references/production-quality.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/production-quality.md"}, {"rel": "references/rendering.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/rendering.md"}, {"rel": "references/scene-planning.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/scene-planning.md"}, {"rel": "references/troubleshooting.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/troubleshooting.md"}, {"rel": "references/updaters-and-trackers.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/updaters-and-trackers.md"}, {"rel": "references/visual-design.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/references/visual-design.md"}, {"rel": "scripts/setup.sh", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/manim-video/scripts/setup.sh"}], "skills/creative/p5js": [{"rel": "README.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/README.md"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/SKILL.md"}, {"rel": "references/animation.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/animation.md"}, {"rel": "references/color-systems.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/color-systems.md"}, {"rel": "references/core-api.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/core-api.md"}, {"rel": "references/export-pipeline.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/export-pipeline.md"}, {"rel": "references/interaction.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/interaction.md"}, {"rel": "references/shapes-and-geometry.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/shapes-and-geometry.md"}, {"rel": "references/troubleshooting.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/troubleshooting.md"}, {"rel": "references/typography.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/typography.md"}, {"rel": "references/visual-effects.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/visual-effects.md"}, {"rel": "references/webgl-and-3d.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/references/webgl-and-3d.md"}, {"rel": "scripts/export-frames.js", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/scripts/export-frames.js"}, {"rel": "scripts/render.sh", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/scripts/render.sh"}, {"rel": "scripts/serve.sh", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/scripts/serve.sh"}, {"rel": "scripts/setup.sh", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/scripts/setup.sh"}, {"rel": "templates/viewer.html", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/p5js/templates/viewer.html"}], "skills/creative/popular-web-designs": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/SKILL.md"}, {"rel": "templates/airbnb.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/airbnb.md"}, {"rel": "templates/airtable.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/airtable.md"}, {"rel": "templates/apple.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/apple.md"}, {"rel": "templates/bmw.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/bmw.md"}, {"rel": "templates/cal.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/cal.md"}, {"rel": "templates/claude.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/claude.md"}, {"rel": "templates/clay.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/clay.md"}, {"rel": "templates/clickhouse.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/clickhouse.md"}, {"rel": "templates/cohere.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/cohere.md"}, {"rel": "templates/coinbase.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/coinbase.md"}, {"rel": "templates/composio.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/composio.md"}, {"rel": "templates/cursor.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/cursor.md"}, {"rel": "templates/elevenlabs.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/elevenlabs.md"}, {"rel": "templates/expo.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/expo.md"}, {"rel": "templates/figma.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/figma.md"}, {"rel": "templates/framer.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/framer.md"}, {"rel": "templates/hashicorp.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/hashicorp.md"}, {"rel": "templates/ibm.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/ibm.md"}, {"rel": "templates/intercom.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/intercom.md"}, {"rel": "templates/kraken.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/kraken.md"}, {"rel": "templates/linear.app.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/linear.app.md"}, {"rel": "templates/lovable.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/lovable.md"}, {"rel": "templates/minimax.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/minimax.md"}, {"rel": "templates/mintlify.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/mintlify.md"}, {"rel": "templates/miro.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/miro.md"}, {"rel": "templates/mistral.ai.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/mistral.ai.md"}, {"rel": "templates/mongodb.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/mongodb.md"}, {"rel": "templates/notion.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/notion.md"}, {"rel": "templates/nvidia.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/nvidia.md"}, {"rel": "templates/ollama.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/ollama.md"}, {"rel": "templates/opencode.ai.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/opencode.ai.md"}, {"rel": "templates/pinterest.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/pinterest.md"}, {"rel": "templates/posthog.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/posthog.md"}, {"rel": "templates/raycast.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/raycast.md"}, {"rel": "templates/replicate.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/replicate.md"}, {"rel": "templates/resend.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/resend.md"}, {"rel": "templates/revolut.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/revolut.md"}, {"rel": "templates/runwayml.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/runwayml.md"}, {"rel": "templates/sanity.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/sanity.md"}, {"rel": "templates/sentry.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/sentry.md"}, {"rel": "templates/spacex.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/spacex.md"}, {"rel": "templates/spotify.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/spotify.md"}, {"rel": "templates/stripe.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/stripe.md"}, {"rel": "templates/supabase.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/supabase.md"}, {"rel": "templates/superhuman.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/superhuman.md"}, {"rel": "templates/together.ai.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/together.ai.md"}, {"rel": "templates/uber.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/uber.md"}, {"rel": "templates/vercel.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/vercel.md"}, {"rel": "templates/voltagent.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/voltagent.md"}, {"rel": "templates/warp.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/warp.md"}, {"rel": "templates/webflow.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/webflow.md"}, {"rel": "templates/wise.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/wise.md"}, {"rel": "templates/x.ai.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/x.ai.md"}, {"rel": "templates/zapier.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/popular-web-designs/templates/zapier.md"}], "skills/creative/songwriting-and-ai-music": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/creative/songwriting-and-ai-music/SKILL.md"}], "skills/devops/sdlc-review": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/devops/sdlc-review/SKILL.md"}], "skills/email/email-inbox-triage": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/email/email-inbox-triage/SKILL.md"}], "skills/email/himalaya": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/email/himalaya/SKILL.md"}, {"rel": "references/configuration.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/email/himalaya/references/configuration.md"}, {"rel": "references/message-composition.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/email/himalaya/references/message-composition.md"}], "skills/media/gif-search": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/media/gif-search/SKILL.md"}], "skills/media/songsee": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/media/songsee/SKILL.md"}], "skills/media/youtube-content": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/media/youtube-content/SKILL.md"}, {"rel": "references/output-formats.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/media/youtube-content/references/output-formats.md"}, {"rel": "scripts/fetch_transcript.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/media/youtube-content/scripts/fetch_transcript.py"}], "skills/note-taking/obsidian": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/note-taking/obsidian/SKILL.md"}], "skills/productivity/airtable": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/airtable/SKILL.md"}], "skills/productivity/box": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/SKILL.md"}, {"rel": "references/bulk-operations.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/bulk-operations.md"}, {"rel": "references/cli-guide.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/cli-guide.md"}, {"rel": "references/content-workflows.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/content-workflows.md"}, {"rel": "references/hubs.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/hubs.md"}, {"rel": "references/oauth-setup.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/oauth-setup.md"}, {"rel": "references/rest-api.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/rest-api.md"}, {"rel": "references/sdk-development.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/sdk-development.md"}, {"rel": "references/search-and-ai.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/search-and-ai.md"}, {"rel": "references/troubleshooting.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/troubleshooting.md"}, {"rel": "references/webhooks-and-events.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/box/references/webhooks-and-events.md"}], "skills/productivity/document-to-action-items": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/document-to-action-items/SKILL.md"}], "skills/productivity/docx": [{"rel": "LICENSE", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/LICENSE"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/SKILL.md"}, {"rel": "references/revisions-and-comments.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/references/revisions-and-comments.md"}, {"rel": "scripts/docx_comments.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_comments.py"}, {"rel": "scripts/docx_common.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_common.py"}, {"rel": "scripts/docx_create.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_create.py"}, {"rel": "scripts/docx_edit.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_edit.py"}, {"rel": "scripts/docx_read.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_read.py"}, {"rel": "scripts/docx_revisions.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_revisions.py"}, {"rel": "scripts/docx_template.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_template.py"}, {"rel": "scripts/docx_validate.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/scripts/docx_validate.py"}, {"rel": "tests/test_docx_skill.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/docx/tests/test_docx_skill.py"}], "skills/productivity/google-workspace": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/SKILL.md"}, {"rel": "references/daily-brief.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/references/daily-brief.md"}, {"rel": "references/gmail-search-syntax.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/references/gmail-search-syntax.md"}, {"rel": "scripts/_hermes_home.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/scripts/_hermes_home.py"}, {"rel": "scripts/google_api.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/scripts/google_api.py"}, {"rel": "scripts/gws_bridge.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/scripts/gws_bridge.py"}, {"rel": "scripts/setup.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/google-workspace/scripts/setup.py"}], "skills/productivity/maps": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/maps/SKILL.md"}, {"rel": "scripts/maps_client.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/maps/scripts/maps_client.py"}], "skills/productivity/meeting-action-items": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/meeting-action-items/SKILL.md"}], "skills/productivity/notion": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/notion/SKILL.md"}, {"rel": "references/block-types.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/notion/references/block-types.md"}], "skills/productivity/pdf": [{"rel": "LICENSE", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/LICENSE"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/SKILL.md"}, {"rel": "references/forms.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/references/forms.md"}, {"rel": "references/nano-pdf-editing.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/references/nano-pdf-editing.md"}, {"rel": "references/ocr-extraction.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/references/ocr-extraction.md"}, {"rel": "scripts/_raster.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/_raster.py"}, {"rel": "scripts/extract_marker.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/extract_marker.py"}, {"rel": "scripts/extract_pymupdf.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/extract_pymupdf.py"}, {"rel": "scripts/pdf_create.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_create.py"}, {"rel": "scripts/pdf_fill_form.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_fill_form.py"}, {"rel": "scripts/pdf_form_layout.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_form_layout.py"}, {"rel": "scripts/pdf_make_form.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_make_form.py"}, {"rel": "scripts/pdf_merge.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_merge.py"}, {"rel": "scripts/pdf_meta.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_meta.py"}, {"rel": "scripts/pdf_page_image.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_page_image.py"}, {"rel": "scripts/pdf_read.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_read.py"}, {"rel": "scripts/pdf_secure.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_secure.py"}, {"rel": "scripts/pdf_split.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_split.py"}, {"rel": "scripts/pdf_stamp.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_stamp.py"}, {"rel": "scripts/pdf_watermark.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/scripts/pdf_watermark.py"}, {"rel": "tests/test_pdf_skill.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/pdf/tests/test_pdf_skill.py"}], "skills/productivity/powerpoint": [{"rel": "LICENSE", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/LICENSE"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/SKILL.md"}, {"rel": "scripts/pptx_create.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/scripts/pptx_create.py"}, {"rel": "scripts/pptx_edit.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/scripts/pptx_edit.py"}, {"rel": "scripts/pptx_from_template.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/scripts/pptx_from_template.py"}, {"rel": "scripts/pptx_read.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/scripts/pptx_read.py"}, {"rel": "scripts/pptx_render.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/scripts/pptx_render.py"}, {"rel": "tests/test_powerpoint_skill.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/powerpoint/tests/test_powerpoint_skill.py"}], "skills/productivity/product-price-monitor": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/product-price-monitor/SKILL.md"}], "skills/productivity/teams-meeting-pipeline": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/teams-meeting-pipeline/SKILL.md"}], "skills/productivity/weekly-review-planning": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/weekly-review-planning/SKILL.md"}], "skills/productivity/xlsx": [{"rel": "LICENSE", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/LICENSE"}, {"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/SKILL.md"}, {"rel": "references/restructuring.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/references/restructuring.md"}, {"rel": "scripts/csv_to_xlsx.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/csv_to_xlsx.py"}, {"rel": "scripts/xlsx_create.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/xlsx_create.py"}, {"rel": "scripts/xlsx_edit.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/xlsx_edit.py"}, {"rel": "scripts/xlsx_read.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/xlsx_read.py"}, {"rel": "scripts/xlsx_recalc.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/xlsx_recalc.py"}, {"rel": "scripts/xlsx_restructure.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/xlsx_restructure.py"}, {"rel": "scripts/xlsx_to_csv.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/scripts/xlsx_to_csv.py"}, {"rel": "tests/test_xlsx_skill.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/productivity/xlsx/tests/test_xlsx_skill.py"}], "skills/research/arxiv": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/arxiv/SKILL.md"}, {"rel": "scripts/search_arxiv.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/arxiv/scripts/search_arxiv.py"}], "skills/research/competitor-news-monitor": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/competitor-news-monitor/SKILL.md"}], "skills/research/grounded-citations": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/grounded-citations/SKILL.md"}, {"rel": "references/citation-formats.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/grounded-citations/references/citation-formats.md"}, {"rel": "references/grounding-rationale.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/grounded-citations/references/grounding-rationale.md"}, {"rel": "scripts/_hermes_home.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/grounded-citations/scripts/_hermes_home.py"}, {"rel": "scripts/sources.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/grounded-citations/scripts/sources.py"}], "skills/research/llm-wiki": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/research/llm-wiki/SKILL.md"}], "skills/social-media/xurl": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/social-media/xurl/SKILL.md"}], "skills/software-development/codebase-inspection": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/codebase-inspection/SKILL.md"}], "skills/software-development/dogfood": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/dogfood/SKILL.md"}, {"rel": "references/issue-taxonomy.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/dogfood/references/issue-taxonomy.md"}, {"rel": "templates/dogfood-report-template.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/dogfood/templates/dogfood-report-template.md"}], "skills/software-development/github": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/SKILL.md"}, {"rel": "references/auth.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/auth.md"}, {"rel": "references/ci-troubleshooting.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/ci-troubleshooting.md"}, {"rel": "references/code-review.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/code-review.md"}, {"rel": "references/conventional-commits.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/conventional-commits.md"}, {"rel": "references/github-api-cheatsheet.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/github-api-cheatsheet.md"}, {"rel": "references/issue-to-pr.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/issue-to-pr.md"}, {"rel": "references/issues.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/issues.md"}, {"rel": "references/pr-workflow.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/pr-workflow.md"}, {"rel": "references/repo-management.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/repo-management.md"}, {"rel": "references/review-output-template.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/references/review-output-template.md"}, {"rel": "scripts/gh-env.sh", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/scripts/gh-env.sh"}, {"rel": "scripts/git-credential-token.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/scripts/git-credential-token.py"}, {"rel": "templates/bug-report.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/templates/bug-report.md"}, {"rel": "templates/feature-request.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/templates/feature-request.md"}, {"rel": "templates/pr-body-bugfix.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/templates/pr-body-bugfix.md"}, {"rel": "templates/pr-body-feature.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/github/templates/pr-body-feature.md"}], "skills/software-development/hermes-agent-skill-authoring": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/hermes-agent-skill-authoring/SKILL.md"}], "skills/software-development/inspecting-hermes-desktop-dom": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/inspecting-hermes-desktop-dom/SKILL.md"}], "skills/software-development/node-inspect-debugger": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/node-inspect-debugger/SKILL.md"}], "skills/software-development/python-debugpy": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/python-debugpy/SKILL.md"}], "skills/software-development/requesting-code-review": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/requesting-code-review/SKILL.md"}], "skills/software-development/simplify-code": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/simplify-code/SKILL.md"}], "skills/software-development/spike": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/spike/SKILL.md"}], "skills/software-development/systematic-debugging": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/systematic-debugging/SKILL.md"}], "skills/software-development/test-driven-development": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/software-development/test-driven-development/SKILL.md"}], "skills/web/blocked-page-recovery": [{"rel": "SKILL.md", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/web/blocked-page-recovery/SKILL.md"}, {"rel": "scripts/recover_page.py", "url": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/skills/web/blocked-page-recovery/scripts/recover_page.py"}]}
+
+# ════════════════════════════════════════════════════════════════════════
+# v1.1.96 (Phase 2): catalog helpers for the Add-Skill picker. All pure / offline;
+# the only network call is _refresh_catalog_from_github, which the user triggers.
+# ════════════════════════════════════════════════════════════════════════
+
+def _skill_folder_key(record) -> str:
+    """A catalog record's repo folder key (path minus its trailing '/SKILL.md').
+
+    e.g. 'skills/apple/apple-notes/SKILL.md' -> 'skills/apple/apple-notes', which is the
+    key SKILL_MANIFEST is stored under."""
+    p = (record or {}).get("path") or ""
+    return p.rsplit("/", 1)[0] if "/" in p else p
+
+
+def _skill_install_dir(folder_key: str):
+    """Where a catalog folder installs: <workspace>/skills/<folder-without-skills-prefix>.
+
+    Returns a Path inside the skills root, or None if it would escape (traversal guard).
+    The installed skill is then auto-discovered by _discover_skills on next scan."""
+    rel = folder_key or ""
+    if rel.lower().startswith("skills/"):
+        rel = rel[len("skills/"):]
+    base = default_workspace_root() / SKILLS_SUBDIR
+    return _safe_skill_join(base, *rel.split("/"))
+
+
+def _refresh_catalog_from_github():
+    """Fetch + parse the live skills-catalog.md from GitHub. Returns a list of records
+    (each resolvable to a bundled manifest) or None on any failure - offline, HTTP error,
+    empty result. Never raises; the picker falls back to SKILL_CATALOG_SNAPSHOT."""
+    try:
+        url = f"{_skill_repo_raw_base()}/website/docs/reference/skills-catalog.md"
+        text = _http_get_bytes(url).decode("utf-8", "replace")
+        rows = _parse_skill_catalog_md(text)
+    except Exception:
+        return None
+    out = [r for r in rows if SKILL_MANIFEST.get(_skill_folder_key(r))]
+    return out or None
+
+
+# ════════════════════════════════════════════════════════════════════════
+# v1.1.96 (Phase 2): import official Hermes skills from the catalog.
+# The functions below are pure-ish and dependency-injectable so they are unit-testable
+# without a network: pass fake fetch_json / fetch_bytes to drive them offline.
+# ════════════════════════════════════════════════════════════════════════
+
+def _skill_repo_api() -> str:
+    """GitHub contents API root for the official Hermes skill repo."""
+    return f"https://api.github.com/repos/{SKILL_REPO_OWNER}/{SKILL_REPO_NAME}"
+
+
+def _skill_repo_raw_base() -> str:
+    """raw.githubusercontent base; used as a fallback when a file has no download_url."""
+    return (f"https://raw.githubusercontent.com/"
+            f"{SKILL_REPO_OWNER}/{SKILL_REPO_NAME}/{SKILL_REPO_REF}")
+
+
+def _http_get_json(url: str, timeout: int = 20):
+    """GET a URL as JSON. Raises on HTTP/parse error so the caller can surface it."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": APP_NAME,
+                      "Accept": "application/vnd.github+json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8", "replace"))
+
+
+def _http_get_bytes(url: str, timeout: int = 30, max_bytes: int = 8 * 1024 * 1024) -> bytes:
+    """GET a URL's bytes, capped at max_bytes so a hostile repo cannot pull us into a
+    huge download. Raises RuntimeError if the cap is exceeded."""
+    req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+    total = 0
+    chunks = []
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        while True:
+            b = r.read(65536)
+            if not b:
+                break
+            total += len(b)
+            if total > max_bytes:
+                raise RuntimeError("file exceeds the download cap")
+            chunks.append(b)
+    return b"".join(chunks)
+
+
+def _safe_skill_join(root: Path, *parts):
+    """Join parts under `root` and confirm the result stays INSIDE root.
+
+    Returns the resolved child Path, or None if it escapes root (a '..' component,
+    an absolute path, or anything else that would write outside the skills folder).
+    This is the single traversal guard for skill downloads - every file goes through it."""
+    try:
+        base = Path(root).resolve()
+        cand = Path(root).joinpath(*[str(p) for p in parts]).resolve()
+    except Exception:
+        return None
+    try:
+        if base == cand or base in cand.parents:
+            return cand
+    except Exception:
+        pass
+    return None
+
+
+def _skill_folder_of(catalog_path: str) -> str:
+    """A catalog record's `path` is the SKILL.md file; its folder is everything before it."""
+    p = (catalog_path or "").strip()
+    if "/" in p:
+        return p.rsplit("/", 1)[0] or "."
+    return "."
+
+
+def _parse_skill_catalog_md(text: str, prefix: str = "skills/") -> list:
+    """Parse the official skills-catalog.md into [{name, description, category, path}].
+
+    `path` is normalised to the repo SKILL.md location (prefix + doc-path + '/SKILL.md')
+    so a refreshed catalog and the bundled snapshot share one download code path.
+    Header rows and unparseable lines are skipped."""
+    rows = []
+    cur = None
+    for line in (text or "").splitlines():
+        m = re.match(r'^##\s+(.+?)\s*$', line)
+        if m:
+            cur = m.group(1).strip()
+            continue
+        s = line.strip()
+        if not s.startswith("|") or "---" in line or "|" not in s:
+            continue
+        cells = [c.strip() for c in s.strip().strip("|").split("|")]
+        if len(cells) < 3:
+            continue
+        nm = re.search(r'\[([^\]]+)\]', cells[0])
+        name = nm.group(1).strip('` ').strip() if nm else ""
+        raw_path = cells[2].strip().strip('`').strip()
+        if not name or name == "Skill" or raw_path == "Path":
+            continue
+        desc = re.sub(r'\s+', ' ', cells[1]).strip().rstrip(".")
+        rows.append({"name": name, "description": desc, "category": cur,
+                     "path": f"{prefix}{raw_path}/SKILL.md"})
+    return rows
+
+
+def _catalog_records() -> list:
+    """The bundled offline catalog. A copy of the module constant; never hits the network."""
+    return [dict(r) for r in SKILL_CATALOG_SNAPSHOT]
+
+
+def _skill_folder_download(folder_path: str, dest_dir, progress=None, *,
+                           timeout: int = 20, max_bytes: int = 8 * 1024 * 1024,
+                           fetch_bytes=None):
+    """Download a bundled skill's files into `dest_dir`. Returns (ok: bool, message: str).
+
+    Uses the bundled SKILL_MANIFEST (folder -> [{rel, url}]) so it fetches raw file URLs
+    directly - no contents API (rate-limited without a token) and works offline once the
+    manifest is present. `folder_path` is the repo folder key (e.g. 'skills/email/himalaya');
+    pass None to auto-resolve from the catalog record's path. `fetch_bytes` defaults to the
+    real HTTP fetch but may be injected for tests. Every written file passes through
+    _safe_skill_join, so nothing can escape dest_dir."""
+    fetch_bytes = fetch_bytes or _http_get_bytes
+    folder_path = folder_path or ""
+    if not folder_path:
+        return False, "no skill selected"
+    entries = SKILL_MANIFEST.get(folder_path)
+    if entries is None:
+        # resolve from the catalog record's path (path is .../<folder>/SKILL.md)
+        for r in _catalog_records():
+            if r.get("path") == folder_path or r.get("path").rstrip("/").endswith(
+                    "/" + folder_path.rsplit("/", 1)[-1] if "/" in folder_path else folder_path):
+                entries = SKILL_MANIFEST.get(r["path"].rsplit("/", 1)[0])
+                folder_path = r["path"].rsplit("/", 1)[0]
+                break
+    if not entries:
+        return False, f"no download manifest for {folder_path} (not a bundled skill?)"
+    base = Path(dest_dir)
+    base.mkdir(parents=True, exist_ok=True)
+    files = 0
+    for it in entries:
+        rel = it.get("rel") or "SKILL.md"
+        url = it.get("url")
+        if not url:
+            continue
+        dest = _safe_skill_join(base, *rel.split("/"))
+        if dest is None:
+            return False, f"unsafe path blocked: {rel}"
+        try:
+            data = fetch_bytes(url, timeout=timeout + 10, max_bytes=max_bytes)
+        except Exception as e:
+            return False, f"failed to download {rel}: {e}"
+        try:
+            dest.parent.mkdir(parents=True, exist_ok=True)   # nested files (scripts/run.sh)
+            dest.write_bytes(data)
+        except Exception as e:
+            return False, f"cannot write {rel}: {e}"
+        files += 1
+        if progress:
+            progress(f"{files}/{len(entries)} file(s)")
+    have_md = any(p.name.lower() == SKILL_FILE_NAME.lower()
+                  for p in base.rglob("*") if p.is_file())
+    if not have_md:
+        return False, "downloaded folder has no SKILL.md"
+    return True, f"{files} file(s) into {base}"
 
 
 def _skill_frontmatter(text: str) -> tuple:
@@ -6874,6 +8472,119 @@ def _skill_dirs(settings) -> List[Path]:
     return out
 
 
+# ── v1.1.95 Agent Skills enable/disable (owner-curated, opt-in) ──────────────
+# A skill folder on disk is INSTALLED; whether it is ACTIVE (injected into the system
+# prompt and loadable by the model) is a separate per-skill setting, defaulting OFF so
+# adding a skill never floods every prompt. Layer B - the skill-tool permission
+# off/ask/always - is unchanged; this only decides WHICH skills are eligible once the
+# model is already allowed to use them.
+
+def _enabled_skill_names(settings) -> List[str]:
+    """The owner's ENABLED skill names (opt-in). Anything installed but not on this list
+    stays visible in Settings -> Manage Skills yet is never injected or loadable."""
+    raw = (settings or {}).get("skills_enabled")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    return [str(n).strip() for n in raw if str(n).strip()]
+
+
+def _is_skill_enabled(settings, name: str) -> bool:
+    """True when `name` is on the owner's enabled list. Absent/empty list = nothing active."""
+    want = (name or "").strip().lower()
+    return any(str(n).strip().lower() == want for n in _enabled_skill_names(settings))
+
+
+def _active_skills(settings) -> List[dict]:
+    """Installed skills that are ENABLED, in discovery order. This is the ONLY list the
+    system prompt and load_skill consult; _discover_skills still reports everything."""
+    enabled = set(n.strip().lower() for n in _enabled_skill_names(settings))
+    return [s for s in _discover_skills(settings)
+            if str(s.get("name") or "").strip().lower() in enabled
+               and s.get("supported_here", True)]
+
+
+def _skill_filter(skills, query: str) -> List[dict]:
+    """Case-insensitive name/description match for the Manage Skills search box. An empty
+    query returns everything."""
+    q = (query or "").strip().lower()
+    if not q:
+        return list(skills or [])
+    return [s for s in (skills or [])
+            if q in str(s.get("name") or "").lower()
+               or q in str(s.get("description") or "").lower()]
+
+
+# ── v1.1.97 Hermes compatibility shim (imported skills actually FUNCTION) ──────
+
+HERMES_TOOL_MAP = {
+    "terminal": "run_shell",
+    "read_file": "read_local_file",
+    "write_file": "write_local_file",
+    "patch": "edit_local_file",
+    "web_search": "exa_search or searxng_search",
+    "web_extract": "firecrawl_scrape or fetch_url",
+    "image_generate": "generate_local_image",
+}
+
+
+def _current_platform() -> str:
+    """Normalised host OS: 'linux' / 'macos' / 'windows' (or sys.platform verbatim)."""
+    p = sys.platform.lower()
+    if p.startswith("linux"):
+        return "linux"
+    if p == "darwin":
+        return "macos"
+    if p.startswith("win"):
+        return "windows"
+    return p
+
+
+def _skill_platforms(meta) -> List[str]:
+    """Platform tokens declared in frontmatter 'platforms:' (lowercased, deduped).
+
+    Accepts inline lists ('linux, macos'), folded continuation lines, and block-style
+    YAML lists ('- ' markers and inline [ ] { } brackets are stripped). Empty = runs everywhere."""
+    raw = str((meta or {}).get("platforms") or "").strip()
+    out: List[str] = []
+    for t in re.split(r"[,\s]+", raw.lower()):
+        t = t.strip('-*[]{}')
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def _normalize_platform(tok: str) -> str:
+    t = (tok or "").strip().lower()
+    if t in ("linux", "linux2", "gnu"):
+        return "linux"
+    if t in ("macos", "osx", "darwin"):
+        return "macos"
+    if t in ("windows", "win32", "win64", "win"):
+        return "windows"
+    return t
+
+
+def _skill_supported_here(meta) -> bool:
+    """True if the skill's declared platforms include this host OS (or it declares none)."""
+    plats = {_normalize_platform(t) for t in _skill_platforms(meta)}
+    if not plats:
+        return True
+    return _current_platform() in plats
+
+
+def _hermes_tool_preamble(body: str) -> str:
+    """A short tool-name translation note for a Hermes skill body, or '' when it uses no
+    Hermes-only tool names. Lists ONLY the aliases actually present in the body."""
+    hits = []
+    for hermes, desk in HERMES_TOOL_MAP.items():
+        if re.search(r"\b" + re.escape(hermes) + r"\b", body or ""):
+            hits.append(f"{hermes} -> {desk}")
+    if not hits:
+        return ""
+    return ("\n[Tool-name note - this skill was written for the Hermes tool set. Use these "
+            "DeskPilot tools instead of the Hermes names it mentions: " + "; ".join(hits)
+            + ".]")
+
 def _discover_skills(settings) -> List[dict]:
     """Scan the skill folders for */SKILL.md -> [{name, description, path, dir}].
 
@@ -6914,26 +8625,35 @@ def _discover_skills(settings) -> List[dict]:
                 by_name.add(low)
                 found.append({"name": name,
                               "description": re.sub(r"\s+", " ", str(meta.get("description") or "")).strip()[:SKILL_DESC_MAX],
+                              "platforms": _skill_platforms(meta),
+                              "supported_here": _skill_supported_here(meta),
                               "path": str(e), "dir": str(d)})
                 if len(found) >= SKILL_INDEX_MAX * 4:
                     break
     return found
 
 
-def _skills_index_text(settings) -> str:
-    """The 'available skills' block for the system prompt ('' when there are none).
+def _skills_index_pick(settings) -> tuple:
+    """(text, names) for the skills block that WOULD be injected into a system prompt.
 
-    Deliberately tiny: one line per skill.  This is progressive disclosure - a
-    skill's body costs context only once the model actually asks for it."""
-    skills = _discover_skills(settings)
+    ONE source of truth. _skills_index_text() renders the text this selects, and
+    Settings -> Manage Skills marks its rows from these names, so the UI can never claim
+    a skill is injected when the enable flag, the platform filter or the index budget
+    left it out. (v1.1.95: only ENABLED skills qualify; a disabled one stays installed and
+    visible in Manage Skills, just not sent.)
+
+    Deliberately tiny: one line per skill. This is progressive disclosure - a skill's body
+    costs context only once the model actually asks for it."""
+    skills = _active_skills(settings)
     if not skills:
-        return ""
+        return "", []
     lines = ["", "",
              f"Available skills (folders holding a {SKILL_FILE_NAME}): a skill is reusable "
              "step-by-step procedure the user wrote down. If one fits the task, call "
              "load_skill(name) to read it BEFORE acting, then follow it. list_skills() "
              "reports where they live:"]
     used = n = 0
+    names: List[str] = []
     for s in skills:
         if n >= SKILL_INDEX_MAX:
             break
@@ -6941,11 +8661,17 @@ def _skills_index_text(settings) -> str:
         if used + len(line) > SKILL_INDEX_CHARS:
             break
         lines.append(line)
+        names.append(str(s.get("name") or ""))
         used += len(line)
         n += 1
     if len(skills) > n:
         lines.append(f"- [... {len(skills) - n} more - call list_skills() to see them all]")
-    return "\n".join(lines)
+    return "\n".join(lines), names
+
+
+def _skills_index_text(settings) -> str:
+    """The 'available skills' block for the system prompt ('' when there are none)."""
+    return _skills_index_pick(settings)[0]
 
 
 def _handoff_note_path(notes_dir: Path, chat_id: str, title: str = "",
@@ -7160,7 +8886,6 @@ def _is_synthetic_prompt(text: str) -> bool:
     the note's prompt log."""
     t = (text or "").lstrip()
     return t.startswith(COMPACTION_MARKER) or t.startswith(SESSION_HANDOFF_MARKER)
-
 
 
 def _recent_prompts_section(messages: List[dict],
@@ -7484,7 +9209,15 @@ def is_context_overflow_error(msg: str) -> bool:
                             "prompt is too long", "input is too long",
                             "reduce the length of the messages",
                             "too many tokens", "exceeds the maximum context",
-                            "insufficient space", "context overflow")):
+                            "insufficient space", "context overflow",
+                            # v1.2.12 Strata, verified against the refusal this server actually
+                            # returns (measured live, not guessed): "request exceeds the context
+                            # window: prompt (540052 tokens) leaves no room to answer in the context
+                            # (262144); requests are never truncated". None of the phrases above
+                            # match it, so BOTH the mid-turn handoff net and the compaction summary
+                            # retry ladder were dead here: the deterministic-digest rate was 100% on
+                            # 2026-10-26/27/28 against 0-10% back on llama.cpp.
+                            "exceeds the context window", "leaves no room to answer")):
         return True
     # llama.cpp / Unsloth style: "the request exceeds the available context size (N)
     # try increasing the context size" - matched as a phrase so bare numbers never trip it.
@@ -7623,9 +9356,18 @@ def session_total_tokens(usage: Optional[dict], full_content: str, full_reasonin
 # a half-finished answer. We now retry the step ONCE when the failure looks like a
 # transient connection problem - but never for server-side rejections (model not
 # found, context too long, bad request), which won't fix themselves on a retry.
+# v1.2.23: an engine that DIES mid-generation is transient in exactly the way a
+# dropped connection is, and Radiance says so itself - 'the engine stopped
+# unexpectedly (exit code 1); the next request restarts it'. It arrives as an
+# openai APIError raised while iterating the stream, and none of the words above
+# match it, so the retry that would have worked was never attempted and the
+# server's own explanation was thrown away in favour of "(model returned an
+# empty response)". These phrases are the crash, not a rejection: a 400 never
+# contains them, so a genuine bad request still fails fast.
 _TRANSIENT_STREAM_KEYWORDS = (
     "connection", "reset", "timed out", "timeout", "broken pipe",
     "remote end closed", "eof occurred", "incomplete read", "temporarily",
+    "stopped unexpectedly", "engine stopped", "restarts it", "server_error",
 )
 
 def _is_transient_stream_error(e: Exception) -> bool:
@@ -7635,6 +9377,123 @@ def _is_transient_stream_error(e: Exception) -> bool:
         return True
     m = str(e).lower()
     return any(k in m for k in _TRANSIENT_STREAM_KEYWORDS)
+
+
+# ── v1.2.23: the reasoning_effort tiers THIS server actually accepts ─────────
+# Which effort names are legal is decided by the model's chat template, and the
+# templates disagree: Radiance's qwen4exp raises on anything outside
+# xhigh/medium/low, so a chat set to "High" 400s on every turn. Deliberately NOT
+# a per-model table - a table is what went stale in the THINK_VALUES comment and
+# caused this. The server enumerates its own set in the refusal, so parse that,
+# the same "believe the server" rule window_from_error_text follows for context
+# windows. Cached per endpoint+model because the refusal only arrives AFTER a
+# wasted round-trip; paying it once per model is the entire point.
+REASONING_TIER_ORDER = ("low", "medium", "high", "xhigh")   # ladder order; 'none'/'minimal' are
+#   deliberately NOT tiers - on Radiance they mean 'thinking off', and a clamp
+#   must never turn thinking off by itself
+# The selector's labels, so a clamp can write the level back in the SAME words
+# the dropdown shows (THINK_VALUES) rather than the wire spelling.
+THINK_LABEL = {"low": "Low", "medium": "Medium", "high": "High", "xhigh": "XHigh"}
+_THINKING_TIERS: Dict[str, Tuple[str, ...]] = {}
+_THINKING_TIERS_LOCK = threading.Lock()
+
+
+def _thinking_tier_key(server_url: str, model: str) -> str:
+    return ((server_url or "").strip().rstrip("/").lower()
+            + "|" + (model or "").strip().lower())
+
+
+def parse_reasoning_tiers(msg: str) -> Tuple[str, ...]:
+    """The effort names a server refusal says it supports, in ladder order.
+
+    Two shapes, both captured from Radiance on 2026-11-07 for qwen4exp:
+
+      * the PRE-FLIGHT validator's JSON body: "reasoning_effort: 'high' is not
+        a level this model's chat template takes. It takes 'low', 'medium' and
+        'xhigh'; 'none' and 'minimal' turn thinking off", which also carries a
+        machine-readable  "supported":["none","minimal","low","medium","xhigh"]
+      * the chat template's own Jinja exception: "Unexpected reasoning effort
+        high. Supported types are xhigh (default), medium, and low."
+
+    The JSON array wins: it is machine-readable and cannot be re-worded by a
+    future build. Prose is the fallback, scoped to the ONE clause after the
+    keyword so a tier name appearing anywhere else - notably the rejected value
+    itself, 'high' - cannot be mistaken for a supported one.
+
+    Returns () when the message names no set. An absent answer beats a guessed
+    one: a wrong ladder would silently rewrite the user's thinking level.
+    """
+    if not msg:
+        return ()
+    found = set()
+    m = re.search(r'"supported"\s*:\s*\[([^\]]*)\]', msg)
+    if m:
+        found = {w for w in re.findall(r"[a-z]+", m.group(1).lower())
+                 if w in REASONING_TIER_ORDER}
+    if not found:
+        clause = ""
+        for pat in (r'supported (?:types|levels?|efforts?|values?)\b(.*)',
+                    r"\bit takes\b(.*)"):
+            m = re.search(pat, msg, re.I)
+            if m:
+                clause = re.split(r"[.;]", m.group(1), maxsplit=1)[0]
+                break
+        found = {w for w in re.findall(r"[a-z]+", clause.lower())
+                 if w in REASONING_TIER_ORDER}
+    if not found:
+        return ()
+    return tuple(t for t in REASONING_TIER_ORDER if t in found)
+def remember_reasoning_tiers(server_url: str, model: str, tiers) -> None:
+    """Record the ladder one endpoint+model reported. Empty is never stored."""
+    if not tiers:
+        return
+    with _THINKING_TIERS_LOCK:
+        _THINKING_TIERS[_thinking_tier_key(server_url, model)] = tuple(tiers)
+
+
+def known_reasoning_tiers(server_url: str, model: str) -> Tuple[str, ...]:
+    with _THINKING_TIERS_LOCK:
+        return _THINKING_TIERS.get(_thinking_tier_key(server_url, model), ())
+
+
+def clamp_reasoning_effort(effort: str, tiers) -> str:
+    """Nearest tier the server accepts, rounding UP on a tie; '' if no change.
+
+    'high' on a template with no 'high' becomes 'xhigh' (owner 2026-11-07): the
+    name sits between medium and xhigh, so both are one step away, and losing
+    deliberation is silent while losing speed is visible. '' means 'send it as
+    the user chose' - already legal, unknown ladder, or a level this app does
+    not model. The caller must never treat '' as 'drop thinking'.
+    """
+    if not tiers or effort not in REASONING_TIER_ORDER:
+        return ""
+    legal = tuple(t for t in tiers if t in REASONING_TIER_ORDER)
+    if not legal or effort in legal:
+        return ""
+    i = REASONING_TIER_ORDER.index(effort)
+    # Nearest by ladder distance; ties go UP (the -index term), so high -> xhigh.
+    best = min(legal, key=lambda t: (abs(REASONING_TIER_ORDER.index(t) - i),
+                                     -REASONING_TIER_ORDER.index(t)))
+    return best
+
+
+def clamp_thinking_body(body: Optional[dict], server_url: str,
+                        model: str) -> Tuple[Optional[dict], str, str]:
+    """(body to send, effort asked for, effort actually sent) - '' when unchanged.
+
+    Clamps an illegal reasoning_effort to the ladder this endpoint+model reported.
+    Returns the body untouched when the ladder is unknown, when the level is
+    already legal, or when there is no effort to clamp: 'we have no idea' must
+    never become 'drop the user's thinking level'.
+    """
+    eff = ((body or {}).get("chat_template_kwargs") or {}).get("reasoning_effort")
+    if not eff:
+        return body, "", ""
+    to = clamp_reasoning_effort(str(eff), known_reasoning_tiers(server_url, model))
+    if not to:
+        return body, "", ""
+    return ({"chat_template_kwargs": {"reasoning_effort": to}}, str(eff), to)
+
 
 # ════════════════════════════════════════════════════════════════════════════
 #  MAIN APPLICATION
@@ -7649,6 +9508,19 @@ class DeskpilotApp:
             FONT_DELTA = int(self.settings.get("ui_font_size", FONT_BASE)) - FONT_BASE
         except (TypeError, ValueError):
             FONT_DELTA = 0
+        # v1.2.17: snapshot the store AS IT SITS ON DISK before this session reads or
+        # rewrites it. This is the copy that would have saved the 2026-10-30 session: the
+        # pre-crash file existed, and the app's own later saves replaced it. The guards in
+        # run_data_backups() skip it when the load failed or the payload is not trustworthy.
+        try:
+            run_data_backups("open")
+        except Exception:
+            pass
+        try:
+            _start_backup_heartbeat()   # one cycle every BACKUP_INTERVAL_MS while open
+        except Exception:
+            pass
+
         self.chats = load_chats()
         self.current_chat_id: Optional[str] = None
 
@@ -7663,6 +9535,7 @@ class DeskpilotApp:
         self._closed = False
         self._stick_bottom = True
         self._run_chat_id: Optional[str] = None
+        self._run_project: str = ""   # v1.2.10: project of the chat RUNNING the turn, captured on the main thread
         self._active_md: Optional[MarkdownStream] = None   # main thread only
         self._reasoning_sid: Optional[str] = None          # main thread only
         self._reasoning_sids: List[str] = []               # open reasoning drawers this turn (main thread)
@@ -7732,6 +9605,12 @@ class DeskpilotApp:
         self._spell_retries = 0                            # bounded wait-for-build retries
         self._archive_expanded: Dict[str, set] = {}         # cid -> {compaction_number} drawers opened this session
         self._clients: Dict[tuple, Any] = {}       # (server_url, api_key) -> cached OpenAI client (keep-alive pooling)
+        self._clients_lock = threading.Lock()      # guards _clients (worker + ask_expert read/write vs save's invalidate)
+        # v1.1.94: a mid-turn settings Save must not close the client an in-flight turn is
+        # streaming through - the worker holds one client for every request of the turn, so
+        # closing it underfoot kills the turn. When _busy is set we DEFER the invalidation;
+        # the release path (anywhere _busy -> False) flushes it. Mirrors the MCP keep-alive.
+        self._pending_client_invalidate = threading.Event()
         self._last_chats_save = 0.0                # time.monotonic() of last chats.json write (throttles mid-turn saves)
         self._pending_temperature: Optional[str] = None   # welcome-state temp change, applied to the chat the next send creates
         self._sampling_sent: Optional[dict] = None   # last request's sampling payload (worker writes, note renders)
@@ -7941,24 +9820,33 @@ class DeskpilotApp:
         self.chat_search_hits = tk.Frame(side, bg=COL["bg_deep"])
         self.chat_search_hits.pack(fill="x", padx=12)
 
+        # v1.2.1: the system prompt is sent but never shown anywhere, so "is my skill
+        # actually injected?" had no answer in the UI. Compact button (not the full-width
+        # New Chat treatment) in the gap the owner picked: under the search box, above
+        # New Chat.
+        tk.Button(side, text="\u21cc  System Prompt", command=self._preview_system_prompt,
+                  bg=COL["bg_raised"], fg=COL["text_dim"], activebackground=COL["hover"],
+                  relief="flat", bd=0, padx=8, pady=2, cursor="hand2", anchor="w",
+                  font=F(9)).pack(fill="x", padx=12, pady=(0, 6))
+
         tk.Button(side, text="+ New Chat", command=self.new_chat,
-                  bg=COL["accent"], fg="#FFFFFF", activebackground="#2563EB",
+                  bg=COL["accent"], fg="#FFFFFF", activebackground=COL["accent_hover"],
                   relief="flat", bd=0, padx=10, pady=7, cursor="hand2",
                   font=F(12, "bold")).pack(fill="x", padx=12, pady=(0, 8))
 
         row = tk.Frame(side, bg=COL["bg_deep"])
         row.pack(fill="x", padx=12, pady=(0, 10))
         tk.Button(row, text="✏️ Rename Chat", command=self.rename_chat,
-                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                   relief="flat", bd=0, padx=8, pady=5, cursor="hand2",
                   font=F(11)).pack(side="left", fill="x", expand=True, padx=(0, 4))
         tk.Button(row, text="🗑️ Delete Chat", command=self.delete_chat,
-                  bg=COL["bg_raised"], fg=COL["danger"], activebackground="#5B2323",
+                  bg=COL["bg_raised"], fg=COL["danger"], activebackground=COL["danger_hover"],
                   relief="flat", bd=0, padx=8, pady=5, cursor="hand2",
                   font=F(11)).pack(side="left", fill="x", expand=True, padx=(4, 0))
 
         tk.Button(side, text="📥 Export Chat", command=self.export_chat,
-                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                   relief="flat", bd=0, padx=8, pady=5, cursor="hand2",
                   font=F(11)).pack(fill="x", padx=12)
 
@@ -7985,10 +9873,11 @@ class DeskpilotApp:
 
         tk.Frame(side, bg=COL["border"], height=1).pack(fill="x", padx=12, pady=8)
         tk.Button(side, text="⚙ Settings", command=self.open_settings,
-                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                   relief="flat", bd=0, padx=10, pady=6, cursor="hand2",
                   font=F(11)).pack(fill="x", padx=12)
-        tk.Label(side, text=f"{APP_NAME} v{VERSION}", bg=COL["bg_deep"], fg=COL["text_dim"],
+        # v1.2.26: VERSION_DISPLAY, not VERSION - see the note at its definition.
+        tk.Label(side, text=f"{APP_NAME} v{VERSION_DISPLAY}", bg=COL["bg_deep"], fg=COL["text_dim"],
                  font=F(10)).pack(pady=(6, 10))
 
     def _build_chat_area(self) -> None:
@@ -8000,7 +9889,7 @@ class DeskpilotApp:
         top = tk.Frame(area, bg=COL["bg_main"])
         top.pack(fill="x")
         tk.Button(top, text="☰", command=self.toggle_sidebar,
-                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                   relief="flat", bd=0, width=3, cursor="hand2",
                   font=F(13)).pack(side="left", padx=(10, 4), pady=8)
         tk.Label(top, text=f"◆ {APP_NAME}", bg=COL["bg_main"], fg=COL["accent"],
@@ -8087,7 +9976,7 @@ class DeskpilotApp:
         inp.pack(fill="x", padx=12, pady=(4, 8))
 
         tk.Button(inp, text="📎", command=self.attach_files,
-                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                   relief="flat", bd=0, width=3, cursor="hand2",
                   font=F(13)).pack(side="left", padx=(0, 6))
 
@@ -8181,12 +10070,12 @@ class DeskpilotApp:
         # 860, or 800), so the pre-existing floor is already sufficient.
 
         self.mic_btn = tk.Button(inp, text="🎤", command=self.toggle_mic,
-                                 bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                                 bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                                  relief="flat", bd=0, width=3, cursor="hand2",
                                  font=F(13))
 
         self.tts_btn = tk.Button(inp, text="🔊", command=self.toggle_tts,
-                                 bg=COL["bg_raised"], fg=COL["text_dim"], activebackground="#4B5563",
+                                 bg=COL["bg_raised"], fg=COL["text_dim"], activebackground=COL["hover"],
                                  relief="flat", bd=0, width=3, cursor="hand2",
                                  font=F(13))
 
@@ -8248,7 +10137,7 @@ class DeskpilotApp:
         self._perm_tooltip(self.studio_check, self._studio_tip_text)
 
         self.send_btn = tk.Button(inp, text="➤ Send", command=self.send_message,
-                                  bg=COL["accent"], fg="#FFFFFF", activebackground="#2563EB",
+                                  bg=COL["accent"], fg="#FFFFFF", activebackground=COL["accent_hover"],
                                   relief="flat", bd=0, padx=18, pady=10, cursor="hand2",
                                   font=F(12, "bold"))
         # ── pack order: right-side cluster FIRST, then the expanding box ──────
@@ -8432,6 +10321,9 @@ class DeskpilotApp:
         self.settings["custom_system_prompt_enabled"] = want
         try:
             save_settings(self.settings)
+            # v1.2.6: the persona lives IN the file now, so toggling it must rewrite that
+            # block or the model keeps receiving text the UI says is off.
+            sync_system_prompt(self.settings, "prompt-toggle")
         except Exception as e:
             self._set_status(f"Could not save prompt setting: {e}")
         self._set_status("Custom system prompt " + ("ON" if want else "OFF")
@@ -8558,6 +10450,8 @@ class DeskpilotApp:
                 y = widget.winfo_rooty() + widget.winfo_height() + 2
             except tk.TclError:
                 return
+
+
             body = text_fn()
             # Wrap to a readable column, then keep the whole tip on screen. Sized
             # from the label's OWN effective point size (F() already folds in the
@@ -8877,6 +10771,12 @@ class DeskpilotApp:
         t.tag_configure("quote", foreground=COL["text_dim"], lmargin1=14, lmargin2=14)
         t.tag_configure("link",      foreground="#60A5FA", underline=True)   # no font: inherit surrounding weight
         t.tag_configure("table_row", font=FM(11), foreground=COL["text"])
+        # v1.2.20: aligned grid. Header is bold monospace (Consolas bold keeps the
+        # same advance width, so columns stay put); the border is monospace too -
+        # a proportional border font would misalign the box-drawing against cells.
+        t.tag_configure("table_hdr", font=("Consolas", max(7, 11 + FONT_DELTA), "bold"),
+                        foreground="#F9FAFB")
+        t.tag_configure("table_border", font=FM(11), foreground=COL["border"])
         t.tag_configure("rule",      foreground=COL["border"], font=F(11))
         t.tag_configure("dim",   foreground=COL["text_dim"], font=F(11))
         t.tag_configure("error", foreground=COL["danger"], font=F(12, "bold"))
@@ -9061,23 +10961,6 @@ class DeskpilotApp:
             return
         self._handoff_start(cid, int(self._ctx_used or 0), int(self._ctx_total or 0))
 
-    def _ledger_inject(self, chat_id: str) -> str:
-        """The ledger block for one request. Safe on any thread.
-
-        Reads the setting at call time (so turning it off takes effect immediately) and
-        swallows every failure: a ledger is an enhancement and must never stop a request
-        the way a broken index must never stop a save."""
-        try:
-            budget = int(float(self.settings.get("ledger_inject_chars",
-                                                 LEDGER_INJECT_DEFAULT)))
-        except (TypeError, ValueError):
-            budget = LEDGER_INJECT_DEFAULT
-        if budget <= 0:
-            return ""
-        try:
-            return _ledger_inject_text(str(chat_id or ""), budget)
-        except Exception:
-            return ""
 
     def _ctx_window(self) -> int:
         """Context window size as seen from a worker thread.
@@ -9596,21 +11479,7 @@ class DeskpilotApp:
             kwargs: Dict[str, Any] = dict(
                 model=model,
                 messages=_stamp_last_user([
-                    build_system_message(str(self.settings.get("file_workspace") or ""),
-                                         str(self.settings.get("exa_api_key") or ""),
-                                         str(self.settings.get("firecrawl_api_key") or ""),
-                                         effective_custom_prompt(self.settings),
-                                         _skills_index_text(self.settings),
-                                         self._ledger_inject(chat_id),
-                                         _project_memory_text(self.settings),
-                                         chat_project(chat),
-                                         # v1.1.86: the summary is what the NEXT session
-                                         # inherits, so it must be written with the
-                                         # project's settled rules in view - otherwise
-                                         # the handoff quietly drops them on the floor.
-                                         False,
-                                         _project_memory_project_text(self.settings,
-                                                                      chat_project(chat))),
+                    build_system_message(str(self.settings.get("file_workspace") or "")),
                     *history,
                     {"role": "user", "content": _handoff_prompt(title)},
                 ], build_time_note()),
@@ -9731,8 +11600,15 @@ class DeskpilotApp:
             self.chat_text.insert("end", "\n", [body_tag])
 
     def _show_handoff(self, summary: str, file_path: str, chat_id: str,
-                      used_at: int = 0, total_at: int = 0) -> None:
+                      used_at: int = 0, total_at: int = 0, persist: bool = True) -> None:
         """Render the handoff accordion (summary body + Copy / Start-New-Session).
+
+        persist=False marks the chat-OPEN re-render, and it must NOT write: the
+        store is 106 MB and save_chats() costs ~0.68 s of pure-Python CPU on the
+        MAIN thread (measured: dumps 0.526 s + encode 0.047 s + write 0.104 s), so
+        a read that saved turned every click on a handoff chat into a visible
+        freeze - the GIL-holding shape of the reported hangs, which leave no
+        watchdog dump.
 
         Persists the summary to the chat record FIRST so it survives a restart or a
         switch away from this chat: load_chat() re-renders it, and
@@ -9744,7 +11620,8 @@ class DeskpilotApp:
                 chat["handoff_used"] = int(used_at)
             if total_at:
                 chat["handoff_total"] = int(total_at)
-            save_chats(self.chats)
+            if persist:          # v1.2.13: a re-render must not rewrite the store
+                save_chats(self.chats)
         self._last_handoff[chat_id] = summary
         self._last_handoff_file[chat_id] = file_path   # v1.1.10: the note THIS handoff wrote
         if self._closed or self.current_chat_id != chat_id:
@@ -9752,11 +11629,34 @@ class DeskpilotApp:
         pct = _handoff_threshold_pct(self.settings)
         # Live gauge values when available; fall back to the persisted ones on a
         # re-render (e.g. after a restart, where the gauge has been reset).
-        used = int(self._ctx_used or 0) or int((chat or {}).get("handoff_used") or 0)
+        used = int(self._ctx_used or 0)
+        if not used and chat is not None:
+            # v1.2.13 RE-RENDER. A chat-open sets self._ctx_used = 0 (a fresh view has
+            # no usage yet), so the old `or chat["handoff_used"]` fallback always
+            # resurrected the gauge from WHEN THE HANDOFF FIRED and presented it as
+            # current. Measured live: the Radiance chat's panel said 262144/262144 =
+            # 100% while its real post-eviction estimate was 136133 = 52% (threshold
+            # 93%), and all 10 chats carrying a summary were below threshold. Re-
+            # estimate from the chat's own messages: 1.6 ms on the biggest one, so it
+            # belongs on the main thread, unlike the 680 ms write it replaces.
+            try:
+                used = _outgoing_prompt_tokens(chat.get("messages") or [], self.settings)
+            except Exception:
+                used = int(chat.get("handoff_used") or 0)
         total = int(self._ctx_total or 0) or int((chat or {}).get("handoff_total") or 0)
-        title = (f"\U0001F4E6 Session Handoff \u00b7 {_handoff_gauge_text(used, total)} "
-                 f"({pct}% threshold)")
-        sid = self._add_accordion(title, COL["warning"], expanded=True)
+        # v1.2.13: is this handoff still NEEDED, or is it history? It used to render
+        # expanded in a warning colour on every open forever, which read as "this
+        # session is broken / did not save" on a chat sitting at 52% and fine. Below
+        # threshold it is informational: quieter title, collapsed body. The accordion
+        # elides the BODY only - the buttons live on their own untagged line, so Copy
+        # / Start New Session / Auto-Continue stay reachable while collapsed.
+        now_pct = (100.0 * used / total) if total > 0 else -1.0
+        # An unknown window (total <= 0) cannot be shown to be stale, so it stays loud.
+        urgent = persist or total <= 0 or now_pct >= float(pct)
+        head = "\U0001F4E6 Session Handoff" if urgent else "\U0001F4E6 Handoff summary available"
+        title = (f"{head} \u00b7 {_handoff_gauge_text(used, total)} "
+                         f"({pct}% threshold)")
+        sid = self._add_accordion(title, COL["warning"], expanded=urgent)
         self._render_handoff_body(sid, summary)
         # Action buttons on their own line (NOT elided - stay available when the
         # summary body is collapsed).
@@ -9777,7 +11677,7 @@ class DeskpilotApp:
             new_btn = tk.Button(
                 self.chat_text, text="\u2795 Start New Session",
                 command=lambda c=chat_id: self._start_new_session(c),
-                bg=COL["accent"], fg="#FFFFFF", activebackground="#2563EB",
+                bg=COL["accent"], fg="#FFFFFF", activebackground=COL["accent_hover"],
                 relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=F(11))
             self._code_buttons.append(new_btn)
             self.chat_text.window_create(b1, window=new_btn)
@@ -9786,7 +11686,7 @@ class DeskpilotApp:
             go_btn = tk.Button(
                 self.chat_text, text="\u2795\u26a1 Auto-Continue",
                 command=lambda c=chat_id: self._auto_continue_session(c),
-                bg=COL["success"], fg="#FFFFFF", activebackground="#059669",
+                bg=COL["success"], fg="#FFFFFF", activebackground=COL["success_hover"],
                 relief="flat", bd=0, padx=10, pady=3, cursor="hand2", font=F(11))
             self._code_buttons.append(go_btn)
             self.chat_text.window_create(b2, window=go_btn)
@@ -9796,6 +11696,30 @@ class DeskpilotApp:
         if file_path:
             self.render_note(f"Handoff saved to: {file_path}")
         self._autoscroll()
+
+    def _dlg_parent(self):
+        """The window a modal dialog should be owned by - None when there is none.
+
+        Ownership is what keeps a dialog ABOVE its owner. An unparented dialog is not,
+        and because a Tk dialog runs a NATIVE MODAL LOOP the main window stops pumping
+        events while it is open: Windows then reports "not responding" and the owner
+        cannot be maximized. At the user's saved 2028x1363 geometry a dialog behind the
+        main window is indistinguishable from a total freeze - that is the 2026-10-23
+        hang, and the frame is in projects/deskpilot/history/app-hang-dump-2026-10-23.md.
+
+        Returns None instead of raising when there is no live root: `parent=None` is
+        Tk's own default, so the call degrades to the pre-v1.1.93 behaviour. That is not
+        defensive padding - the headless suites drive these very methods on a stub app
+        with no Tk window at all, and `parent=self.root` there raised AttributeError and
+        cost one gate test (caught by the differential, not by assumption).
+        """
+        try:
+            root = getattr(self, "root", None)
+            if root is not None and root.winfo_exists():
+                return root
+        except Exception:
+            pass
+        return None
 
     def _auto_continue_session(self, source_chat_id: str) -> None:
         """Handoff accordion's Auto-Continue: start the fresh session AND immediately ask
@@ -9807,7 +11731,9 @@ class DeskpilotApp:
             return
         src = self.chats["chats"].get(source_chat_id)
         if not src:
-            messagebox.showinfo(APP_NAME, "The source chat of this handoff no longer exists.")
+            # Owned by the main window (see _dlg_parent) so it cannot open behind it.
+            messagebox.showinfo(APP_NAME, "The source chat of this handoff no longer exists.",
+                                parent=self._dlg_parent())
             return
         # A missing summary is NOT checked here: _start_new_session validates BOTH sources (the
         # persisted / in-memory summary and the chat note files), so a notes-only handoff is not a
@@ -9830,7 +11756,7 @@ class DeskpilotApp:
             messagebox.showinfo(
                 APP_NAME,
                 "No handoff summary is available to carry over, and this chat has no handoff "
-                "notes (its notes folder appears to be empty).")
+                "notes (its notes folder appears to be empty).", parent=self._dlg_parent())
             return
         self.new_chat()
         fresh = self.current_chat()
@@ -9902,7 +11828,8 @@ class DeskpilotApp:
                       ("" if note_paths else " (create one in that folder if none exists)") +
                       " if that folder is writable.")
         _intro_ts = datetime.now().isoformat(timespec="seconds")
-        fresh["messages"].append({"role": "user", "content": intro, "ts": _intro_ts})
+        fresh["messages"].append({"role": "user", "content": intro, "ts": _intro_ts,
+                                  "tnote": build_time_note()})  # v1.2.19 frozen stamp
         base = (src.get("title") or "Session").strip()[:24]
         fresh["title"] = f"Continued: {base}"
         save_chats(self.chats)
@@ -9919,12 +11846,13 @@ class DeskpilotApp:
             # - same button/busy bookkeeping as any turn, so _finish_turn_ui still owns it.
             self._busy = True
             self._stop_event.clear()
-            self.send_btn.configure(text="\u23f9 Stop", bg=COL["danger"], activebackground="#B91C1C",
+            self.send_btn.configure(text="\u23f9 Stop", bg=COL["danger"], activebackground=COL["stop_hover"],
                                     command=self.stop_generation)
             self.speed_label.configure(text="\u26a1 \u2026")
             self._refresh_revert_button()   # v1.1.46: disable revert while the turn runs
             cid = self.current_chat_id
             self._run_chat_id = cid
+            self._run_project = self._project_of_chat(cid)
             threading.Thread(target=self._chat_worker,
                              args=(cid, list(fresh["messages"])), daemon=True).start()
 
@@ -10080,14 +12008,38 @@ class DeskpilotApp:
         val = str((chat or {}).get("thinking", "") or "").strip()
         self.think_combo.set(val if val in THINK_VALUES else THINK_DEFAULT)
 
+    def _apply_thinking_clamp(self, chat_id: str, sent: str) -> None:
+        """MAIN THREAD. Adopt the clamped level as this chat's setting.
+
+        The request path found the chat's level illegal for this model and sent a
+        different one; leaving the selector showing 'High' would make it lie, the
+        same defect _sync_thinking_combo's docstring already records once ('it used
+        to show High while sending nothing'). Writing it back also stops the note
+        repeating every turn. The ladder is remembered per endpoint+model, so a
+        chat later moved to a server that DOES have the tier keeps the level it was
+        actually shown rather than a name it never ran.
+
+        Returns before save_chats() when the stored value already matches: the chat
+        store is large enough that a save blocks the main thread measurably, so a
+        clamp must not become a per-turn write.
+        """
+        chat = self.chats["chats"].get(chat_id)
+        want = THINK_LABEL.get(sent)
+        if chat is None or not want or str(chat.get("thinking", "")) == want:
+            return
+        chat["thinking"] = want
+        save_chats(self.chats)
+        if self.current_chat_id == chat_id:
+            self._sync_thinking_combo(chat)
+
     def rename_chat(self) -> None:
         cid = self.selected_chat_id()
         chat = self.chats["chats"].get(cid) if cid else None
         if not chat:
-            messagebox.showinfo(APP_NAME, "Select a conversation to rename.")
+            messagebox.showinfo(APP_NAME, "Select a conversation to rename.", parent=self._dlg_parent())
             return
         new_title = simpledialog.askstring(
-            "Rename Chat", "New name:", initialvalue=chat.get("title", ""), parent=self.root)
+            "Rename Chat", "New name:", initialvalue=chat.get("title", ""), parent=self._dlg_parent())
         if new_title and new_title.strip():
             chat["title"] = new_title.strip()[:60]
             save_chats(self.chats)
@@ -10097,10 +12049,10 @@ class DeskpilotApp:
         cid = self.selected_chat_id()
         chat = self.chats["chats"].get(cid) if cid else None
         if not chat:
-            messagebox.showinfo(APP_NAME, "Select a conversation to delete.")
+            messagebox.showinfo(APP_NAME, "Select a conversation to delete.", parent=self._dlg_parent())
             return
         if not messagebox.askyesno(
-                APP_NAME, f"Delete “{chat.get('title')}” and its full history? Its images/attachments will be deleted too.", parent=self.root):
+                APP_NAME, f"Delete “{chat.get('title')}” and its full history? Its images/attachments will be deleted too.", parent=self._dlg_parent()):
             return
         # If this chat owns the in-flight turn, abort it BEFORE removing the
         # record. Otherwise the worker keeps streaming and burning tokens on a
@@ -10327,11 +12279,13 @@ class DeskpilotApp:
         self._pending_studio = None
         self._pending_project = None
         # Restore a previously generated handoff accordion (survives chat switches;
-        # _show_handoff re-persists harmlessly and refreshes the in-memory cache).
+        # v1.2.13: persist=False - a re-render, not a new handoff, and the store is
+        # 106 MB. _show_handoff recomputes the gauge from the chat's own messages
+        # rather than re-showing the figure saved when the handoff fired.
         if chat.get("handoff_summary"):
             self._show_handoff(chat["handoff_summary"], "", cid,
                                int(chat.get("handoff_used") or 0),
-                               int(chat.get("handoff_total") or 0))
+                               int(chat.get("handoff_total") or 0), persist=False)
         # v1.1.46 (#4c): the revert control is per-chat - a chat with checkpointed
         # turns shows it, one without hides it. Last so it reflects the record as
         # just loaded (and stays correct when switching to a chat mid-turn).
@@ -10554,9 +12508,23 @@ class DeskpilotApp:
             except tk.TclError:
                 pass
         self._search_result_widgets = []
-        if not query:
-            return
         parent = self.chat_search_hits
+        if not query:
+            # v1.2.2: pack_forget, NOT just destroying the children. Measured: after the
+            # rows were destroyed the Frame still held the 211px pack had given it, so the
+            # sidebar kept a dead black band under the search box and the chat Listbox
+            # stayed squeezed to 212px instead of its natural 383px - permanently, until
+            # restart. Only removing the Frame from the geometry manager gives the space
+            # back. Re-packed below whenever there is something to show.
+            try:
+                parent.pack_forget()
+            except tk.TclError:
+                pass
+            return
+        try:
+            parent.pack(fill="x", padx=12)
+        except tk.TclError:
+            return
         if not hits:
             lab = tk.Label(parent, text="No message matches found", bg=COL["bg_deep"],
                            fg=COL["text_dim"], font=F(9), justify="left", wraplength=230)
@@ -10701,6 +12669,8 @@ class DeskpilotApp:
             self.chat_search.configure(fg=COL["text_dim"])
         except tk.TclError:
             return
+
+
         self._on_chat_search()
 
     def _chat_search_focus_in(self, _event=None) -> None:
@@ -10777,12 +12747,12 @@ class DeskpilotApp:
         cid = self.selected_chat_id()
         chat = self.chats["chats"].get(cid) if cid else None
         if not chat:
-            messagebox.showinfo(APP_NAME, "Select a conversation to export.")
+            messagebox.showinfo(APP_NAME, "Select a conversation to export.", parent=self._dlg_parent())
             return
         title = (chat.get("title") or "chat").strip().replace("/", "-")[:60] or "chat"
         stamp = datetime.now().strftime("%Y-%m-%d_%H%M")
         path = filedialog.asksaveasfilename(
-            parent=self.root, title="Export Chat",
+            parent=self._dlg_parent(), title="Export Chat",
             initialfile=f"{title}_{stamp}.md", defaultextension=".md",
             filetypes=[("Markdown", "*.md"), ("Text", "*.txt"), ("All files", "*.*")])
         if not path:
@@ -10790,7 +12760,7 @@ class DeskpilotApp:
         try:
             Path(path).write_text(self._chat_to_markdown(chat), encoding="utf-8")
         except OSError as e:
-            messagebox.showerror(APP_NAME, f"Export failed:\n{e}")
+            messagebox.showerror(APP_NAME, f"Export failed:\n{e}", parent=self._dlg_parent())
             return
         self._set_status(f"📥 Exported to {Path(path).name}")
 
@@ -11217,6 +13187,8 @@ class DeskpilotApp:
             idx = self.chat_text.index(f"@{event.x},{event.y}")
         except tk.TclError:
             return
+
+
         url = self._link_at(idx)
         if url:
             try:
@@ -11307,6 +13279,8 @@ class DeskpilotApp:
                 clip = self.root.clipboard_get()
             except tk.TclError:
                 return
+
+
             if not clip:
                 return
             r = w.tag_ranges(tk.SEL)          # standard paste semantics: replace selection
@@ -11457,6 +13431,8 @@ class DeskpilotApp:
             text = self.input_text.get("1.0", "end-1c")
         except tk.TclError:
             return
+
+
         hits = spell_scan(text, eng, self.settings.get("spellcheck_words") or [])
         self._spell_hits = hits
         try:
@@ -11541,6 +13517,8 @@ class DeskpilotApp:
             self.input_text.insert(self._spell_index(text, s), new)
         except tk.TclError:
             return
+
+
         self._spell_schedule(delay=0)
 
     def _spell_add_word(self, word: str) -> None:
@@ -12002,6 +13980,23 @@ class DeskpilotApp:
             self.render_note("\u23f9 Stopped by user")
         self._finish_turn_ui()
 
+    def _flush_pending_client_invalidate(self) -> None:
+        """v1.1.94: run any Save that deferred its client invalidation while a turn was
+        in flight. Called on the release path (turn end / Stop). Safe to call always:
+        it no-ops unless _busy is False AND the pending flag is set, and clears the flag
+        first so an invalidate arriving after this flush defers again rather than racing."""
+        if self._busy or not self._pending_client_invalidate.is_set():
+            return
+        self._pending_client_invalidate.clear()
+        with self._clients_lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for c in clients:
+            try:
+                c.close()
+            except Exception:
+                pass
+
     def _finish_turn_ui(self, status: Optional[str] = None) -> None:
         """End a turn: persist history, release _busy, restore the Send button.
 
@@ -12014,9 +14009,12 @@ class DeskpilotApp:
         save_chats(self.chats)
         self._last_chats_save = time.monotonic()
         self._busy = False
+        # v1.1.94: release the turn first, then flush any Save that deferred its client
+        # invalidation while this turn ran - now safe, the worker no longer holds it.
+        self._flush_pending_client_invalidate()
         self._stop_event.clear()
         try:
-            self.send_btn.configure(text="➤ Send", bg=COL["accent"], activebackground="#2563EB",
+            self.send_btn.configure(text="➤ Send", bg=COL["accent"], activebackground=COL["accent_hover"],
                                     command=self.send_message)
         except tk.TclError:
             pass
@@ -12129,7 +14127,8 @@ class DeskpilotApp:
             self.new_chat()                    # start a brand-new conversation for this message
             chat = self.current_chat()
         _ts = datetime.now().isoformat(timespec="seconds")
-        chat["messages"].append({"role": "user", "content": content, "ts": _ts})
+        chat["messages"].append({"role": "user", "content": content, "ts": _ts,
+                                 "tnote": build_time_note()})   # v1.2.19 frozen stamp
 
         # auto-title from the first user message
         if chat.get("title") in (None, "", "New Chat"):
@@ -12152,12 +14151,13 @@ class DeskpilotApp:
         self._steer_clear()      # never carry a stale steering message into a new turn
         # The Send button becomes the Stop button for the duration of the turn:
         # it must stay ENABLED so the user can click it to abort.
-        self.send_btn.configure(text="⏹ Stop", bg=COL["danger"], activebackground="#B91C1C",
+        self.send_btn.configure(text="⏹ Stop", bg=COL["danger"], activebackground=COL["stop_hover"],
                                 command=self.stop_generation)
         self.speed_label.configure(text="⚡ …")
         self._refresh_revert_button()   # v1.1.46: disable revert while the turn runs
         cid = self.current_chat_id
         self._run_chat_id = cid
+        self._run_project = self._project_of_chat(cid)
         messages = list(chat["messages"])
         self._refresh_ctx_topbar()   # pick up server-side context changes (e.g. after a model restart)
         threading.Thread(target=self._chat_worker, args=(cid, messages), daemon=True).start()
@@ -12185,18 +14185,29 @@ class DeskpilotApp:
         Split out of _get_client so a SECOND endpoint (the ask_expert consultant)
         can have its own client without touching the primary one. The cache is
         keyed on the pair, so the two never collide and each keeps its own warm
-        connection pool."""
+        connection pool.
+
+        v1.1.94: read + write of _clients are under self._clients_lock, so a Save
+        that defers (busy) cannot clear the dict while this returns a live client,
+        and an invalidate that does fire is ordered against the fetch."""
         if OpenAI is None:
             return None
-        cached = self._clients.get((url, key))
-        if cached is not None:
-            return cached
+        with self._clients_lock:
+            cached = self._clients.get((url, key))
+            if cached is not None:
+                return cached
         try:
             client = OpenAI(base_url=url or None, api_key=key)
         except Exception as e:
             self._post(lambda m=str(e): self.render_error(f"Could not create API client:\n{m}"))
             return None
-        self._clients[(url, key)] = client
+        with self._clients_lock:
+            # A Save may have closed+cleared the cache between the two reads. If so,
+            # drop the client we just built and reuse whatever the new state is.
+            existing = self._clients.get((url, key))
+            if existing is not None:
+                return existing
+            self._clients[(url, key)] = client
         return client
 
     def _get_client(self) -> Optional[Any]:
@@ -12211,13 +14222,23 @@ class DeskpilotApp:
         return self._client_for(url, key)
 
     def _invalidate_clients(self) -> None:
-        """Drop cached OpenAI clients (called when server URL / API key change)."""
-        for c in self._clients.values():
+        """Drop cached OpenAI clients (called when server URL / API key change).
+
+        v1.1.94: a turn in flight holds one client for the whole turn, so closing it
+        here would kill that turn's stream (the reported bug). While _busy is set we
+        DEFER - mark the pending flag and return; the release path flushes it once the
+        worker has finished using the client. When idle we invalidate immediately."""
+        if self._busy:
+            self._pending_client_invalidate.set()
+            return
+        with self._clients_lock:
+            clients = list(self._clients.values())
+            self._clients.clear()
+        for c in clients:
             try:
                 c.close()
             except Exception:
                 pass
-        self._clients.clear()
 
     # ── ask_expert: the consultant ────────────────────────────────────
     def _expert_root(self) -> Path:
@@ -12529,6 +14550,12 @@ class DeskpilotApp:
         step = 0
         usage_opts_ok = True
         thinking_ok = True          # flipped off if the server rejects enable_thinking
+        # v1.2.23: per TURN, like thinking_ok. thinking_clamp_retry_ok allows ONE
+        # retry after learning the ladder from a refusal (without it, a refusal whose
+        # clamp changes nothing would re-send the identical request forever);
+        # thinking_clamp_noted keeps the clamp note to once per turn, not per step.
+        thinking_clamp_retry_ok = True
+        thinking_clamp_noted = False
         sampling_ok = True        # flipped off if the server rejects the sampler extension keys
         pruned_keys = set()       # individual sampler keys a strict server rejected (kept out of later steps)
         sampling_noted = False    # the "what was sent" note fires once per user prompt
@@ -12542,6 +14569,15 @@ class DeskpilotApp:
         # per step, restored when a step completes, so it can never loop.
         empty_retry_ok = True
         retry_uncapped = False   # set on that retry: drop an explicit cap that may have caused it
+        # v1.2.21: a reply cut off by the token budget (finish_reason='length') used to
+        # look EXACTLY like a finished answer, because the streaming loop never read
+        # finish_reason at all. That is why "it just stops" was undiagnosable for weeks:
+        # the turn ended mid-sentence, often right after a lead-in that announced a tool
+        # call, and nothing anywhere said the generation had been truncated. Now the
+        # reason is captured, shown, and the turn is continued automatically a bounded
+        # number of times so a long answer finishes instead of vanishing.
+        trunc_continues = 0
+        dangling_nudges = 0  # v1.2.22: nudges spent this TURN (bounded, see below)
         model_fix_ok = True      # one auto-correction of a stale model name per turn
         self._ctx_used_run = 0   # gauge as of the last completed step of THIS prompt (worker-side copy;
                                  # _ctx_used is main-thread state and must not be written from here)
@@ -12562,12 +14598,10 @@ class DeskpilotApp:
         # _run_cancellable) is what stops a single long call mid-flight either way.
         turn_limit = _turn_time_limit(self.settings)
         turn_deadline = (time.monotonic() + turn_limit) if turn_limit else None
-        # v1.1.73: the date/time note is built ONCE per user prompt, not per step.
-        # This loop runs one iteration per tool call, so a turn routinely outlives
-        # a minute boundary; re-reading the clock each step would change the stamp
-        # mid-turn and throw away the engine's KV prefix cache for the whole
-        # conversation - exactly the cost this change exists to remove. A stamp
-        # that is a few minutes stale inside one turn is harmless.
+        # v1.2.19: the stamp is now FROZEN into each user message at append time
+        # ("tnote", re-attached by _prepare_request_messages). This per-turn build
+        # survives only as the fallback for histories appended before this version
+        # (no tnote key); it is passed to _stamp_last_user as the explicit note.
         time_note = build_time_note()
         # v1.1.75: the two efficiency knobs are read ONCE per prompt, like turn_limit.
         # Settings cannot change mid-turn, and a value that is constant across steps
@@ -12593,6 +14627,7 @@ class DeskpilotApp:
                 for _sc in _steered:
                     messages.append({"role": "user", "content": _sc,
                                      "ts": datetime.now().isoformat(timespec="seconds"),
+                                     "tnote": build_time_note(),   # v1.2.19 frozen stamp
                                      "steered": 1})
                     # Persist + render. Posted, never inline (self.chats is main-thread
                     # only, invariant #4). Snapshot the list so the callback cannot see
@@ -12678,41 +14713,53 @@ class DeskpilotApp:
             # generative output thin. Studio 'pure' still gets NOTHING (unchanged).
             # build_system_message('full') returns STUDIO_SYSTEM_PROMPT and ignores
             # these arguments, so the memory rides in only via the appended block.
-            _proj = chat_project(_chat)
-            # v1.1.86 (SOW item 5 Gap 1): the active project's OWN MEMORY.md, not just
-            # the workspace index. 'off' passes it through as an argument; 'full'
-            # appends it here alongside the index; 'pure' still gets NOTHING.
-            _proj_full = _project_memory_project_text(self.settings, _proj)
+            # v1.2.5: 'full' carries the ROOT workspace index only. The active
+            # project's own MEMORY.md and the ledger are no longer injected for any
+            # mode; the prompt is SYSTEMPROMPT.md + skills + index + persona.
             _mem_full = ""
             if _studio == "full":
-                _mem_full = "\n\n".join(x for x in (_project_memory_text(self.settings),
-                                                    _proj_full) if x)
+                _mem_full = _project_memory_text(self.settings)
+            # v1.2.10: the active project's own MEMORY.md, keyed to the chat RUNNING this
+            # turn (captured on the main thread above - reading chat state here would
+            # break invariant #4 and would follow whatever chat the user switched to).
+            # 'pure' still gets NOTHING: that mode means "answer from the model alone".
+            if _studio != "pure" and self._run_project:
+                _pblock = _active_project_block(self._run_project)
+                if _pblock:
+                    _mem_full = (_mem_full + "\n\n" + _pblock) if _mem_full else _pblock
+            # v1.2.6: keep the file current, then send it. Idempotent, so a turn that
+            # changes nothing writes nothing and the KV prefix survives.
+            if _studio == "off":
+                try:
+                    sync_system_prompt(self.settings, "turn")
+                except Exception as e:
+                    print(f"[{APP_NAME}] system prompt sync failed: {e}")
             _sysmsg = build_system_message(str(self.settings.get("file_workspace") or ""),
-                               str(self.settings.get("exa_api_key") or ""),
-                               str(self.settings.get("firecrawl_api_key") or ""),
-                               "" if _studio != "off" else effective_custom_prompt(self.settings),
-                               "" if _studio != "off" else _skills_index_text(self.settings),
-                               "" if _studio != "off" else self._ledger_inject(chat_id),
-                               "" if _studio != "off" else _project_memory_text(self.settings),
-                               # Which project this chat declared. Read-only off-thread
-                               # access, same as _chat itself two lines above.
-                               "" if _studio != "off" else _proj,
-                               studio=_studio,
-                               project_memory_full=("" if _studio != "off" else _proj_full))
+                               studio=_studio)
             if _sysmsg is not None and _mem_full:
                 _sysmsg = {"role": "system",
                            "content": str(_sysmsg.get("content") or "")
                                       + "\n\n" + _mem_full}
+            # v1.2.19: a frozen-stamped message carries its own note through
+            # _prepare_request_messages; the explicit note is the legacy fallback
+            # only, so it must not be appended a second time.
+            _note = "" if _studio == "pure" else time_note
+            for _x in reversed(messages):
+                if isinstance(_x, dict) and _x.get("role") == "user":
+                    if str(_x.get("tnote") or ""):
+                        _note = ""
+                    break
+            # Studio 'pure' means "answer from the model alone, nothing injected" -
+            # and the date/time note is injected context, so stamp= suppresses the
+            # frozen one too. 'full' and 'off' keep the stamp byte-identical to
+            # before. The handoff/summarizer path is deliberately NOT gated: it
+            # runs in operator mode and writes a record, not a reply.
             _req_msgs = _stamp_last_user(
                 ([_sysmsg] if _sysmsg is not None else [])
-              + _evict_old_tool_results(_prepare_request_messages(list(messages)),
-                                        _keep_results),
-                # Studio 'pure' means "answer from the model alone, nothing injected" -
-                # and the date/time note is injected context. 'full' and 'off' keep the
-                # stamp byte-identical to before. The handoff/summarizer path is
-                # deliberately NOT gated: it runs in operator mode and writes a record,
-                # not a reply.
-                "" if _studio == "pure" else time_note)
+              + _evict_old_tool_results(_prepare_request_messages(
+                    list(messages), stamp=(_studio != "pure")),
+                    _keep_results),
+                _note)
             # The tool-economy paragraph is operator framing: it tells the model to
             # batch calls and stop early. Meaningless with no tools in the request.
             _nudge = None if _studio_no_tools else _tool_economy_nudge(step, _nudge_every)
@@ -12758,6 +14805,20 @@ class DeskpilotApp:
             eb: Dict[str, Any] = {}
             if thinking_ok:
                 _tb = chat_thinking_extra_body(self.chats["chats"].get(chat_id))
+                # v1.2.23: a chat template decides which effort names are legal, and
+                # this chat may have been set under a different one. Clamp to the
+                # ladder this endpoint+model actually reported, and SAY SO once per
+                # turn - silently running another thinking level is exactly what made
+                # the Radiance 'high' refusal invisible for a day.
+                _tb, _asked, _sent = clamp_thinking_body(
+                    _tb, self.settings.get("server_url") or "", model)
+                if _asked and not thinking_clamp_noted:
+                    thinking_clamp_noted = True
+                    self._post(lambda a=_asked, s=_sent: self.render_note(
+                        "\U0001f9e0 Thinking: this model has no '" + a + "' tier - using '"
+                        + THINK_LABEL.get(_sent, _sent) + "' instead (saved for this chat)."))
+                    self._post(lambda cid=chat_id, s=_sent:
+                               self._apply_thinking_clamp(cid, s))
                 if _tb is not None:
                     eb.update(_tb)
             _sw = sampling_kwargs(self.settings,
@@ -12822,10 +14883,30 @@ class DeskpilotApp:
                     usage_opts_ok = False         # server rejected the option → retry without it
                     continue
                 if thinking_ok and any(k in low_msg for k in
-                                       ("enable_thinking", "chat_template_kwargs", "reasoning_effort")):
-                    thinking_ok = False           # server rejects the extension -> retry: kwargs is
-                    continue                        # rebuilt at the top of every step and gated by
-                                                    # this flag (the old in-place pop was inert)
+                                       ("enable_thinking", "chat_template_kwargs",
+                                        "reasoning_effort", "reasoning effort")):
+                    # v1.2.23: 'reasoning effort' (SPACE) is added because that is how
+                    # the Jinja template words its own exception - 'Unexpected
+                    # reasoning effort high.' Radiance's 400 body also carries the
+                    # underscore form, so the old tuple happened to catch it, but
+                    # learning the ladder must not depend on a server echoing the
+                    # parameter name back in exactly one spelling.
+                    # v1.2.23: the refusal normally NAMES the tiers the template
+                    # accepts ('Supported types are xhigh (default), medium, and
+                    # low.'). Learn them and retry, so the clamp at the build site
+                    # keeps the user's deliberation instead of the blunt drop below
+                    # silently turning thinking off for the rest of the turn.
+                    _tiers = parse_reasoning_tiers(msg)
+                    if _tiers and thinking_clamp_retry_ok:
+                        thinking_clamp_retry_ok = False
+                        remember_reasoning_tiers(self.settings.get("server_url") or "",
+                                                 model, _tiers)
+                        continue
+                    # server rejects the extension -> retry: kwargs is rebuilt at the
+                    # top of every step and gated by this flag (the old in-place pop
+                    # was inert)
+                    thinking_ok = False
+                    continue
                 if sampling_ok and any(k in low_msg for k in SAMPLING_ALL_KEYS):
                     # Strict server (real OpenAI, many proxies): drop ONLY the offending sampler
                     # key and retry, so one rejected field cannot silently kill the rest.
@@ -12911,6 +14992,8 @@ class DeskpilotApp:
             buf_r = ""
             last_flush = time.time()
             full_content = ""
+            step_finish_reason = ""   # v1.2.21: last non-null finish_reason of this step
+            stream_error = ""           # v1.2.23: server text if this step's stream raised
             full_reasoning = ""          # thinking tokens (for the fallback estimate)
             tool_acc: Dict[int, dict] = {}
             usage = None
@@ -12964,6 +15047,12 @@ class DeskpilotApp:
                     choices = getattr(chunk, "choices", None) or []
                     if not choices:
                         continue
+                    # v1.2.21: the finish_reason rides on the LAST chunk's choice, and
+                    # many servers send that chunk with an empty delta - so read it
+                    # BEFORE the delta guard below, which would skip right past it.
+                    _fr = getattr(choices[0], "finish_reason", None)
+                    if _fr:
+                        step_finish_reason = str(_fr)
                     delta = choices[0].delta
                     if delta is None:
                         continue
@@ -13008,9 +15097,13 @@ class DeskpilotApp:
                     buf_c = ""      # drop unflushed tokens so finally's flush posts nothing
                     buf_r = ""
                     self._post(self._ui_discard_partial_render)
+                    # v1.2.23: this branch now also catches an engine that DIED, not
+                    # just a dropped socket, so the wording cannot claim 'connection'.
+                    # Quote the server's own reason - it is the diagnosis.
                     self._post(lambda m=str(e): self.render_note(
-                        f"\u26a1 Connection interrupted ({m[:80]}) - retrying this step once\u2026"))
+                        f"\u26a1 Reply interrupted ({m[:120]}) - retrying this step once\u2026"))
                     continue
+                stream_error = str(e)
                 self._post(lambda m=str(e): self.render_error(f"Stream interrupted:\n{m}"))
             finally:
                 flush(force=True)
@@ -13074,6 +15167,73 @@ class DeskpilotApp:
                     "function": {"name": s["name"], "arguments": args_raw},
                 })
 
+            # ── reply hit the token budget mid-answer → continue it (v1.2.21) ──
+            # finish_reason='length' with prose and no tool call means the engine ran
+            # out of budget, NOT that the model chose to stop. Left alone it looks like
+            # the assistant quit mid-sentence (and, worse, the turn ends there). Feed
+            # the partial back as its own assistant turn and ask for the remainder -
+            # bounded, so a pathological loop cannot burn the session.
+            if (step_finish_reason == "length" and not tool_calls
+                    and full_content.strip() and not self._closed
+                    and not self._stop_event.is_set()
+                    and trunc_continues < TRUNC_CONTINUES_MAX):
+                trunc_continues += 1
+                self._post(self._ui_finish_active_md)
+                self._post(lambda n=trunc_continues: self.render_note(
+                    f"\u26a1 Reply hit the token limit - continuing "
+                    f"({n}/{TRUNC_CONTINUES_MAX})\u2026"))
+                # Assistant PREFILL, not a fake user turn: the partial is re-sent as a
+                # trailing assistant message and the engine continues it in place.
+                # Measured on Radiance 1.17.0 / qwen4exp - it resumes the exact sentence
+                # with finish_reason=stop, no repetition. This keeps the transcript
+                # honest (no invented user message, which would also be summarised into
+                # every future handoff) and leaves the KV prefix untouched, since the
+                # partial is already the front of what the model just produced.
+                # A SECOND truncation extends that same assistant message rather than
+                # stacking another one: chat templates vary on consecutive assistant
+                # turns, and one growing message is exactly what the model produced.
+                if trunc_continues > 1 and messages \
+                        and messages[-1].get("role") == "assistant":
+                    messages[-1] = dict(
+                        messages[-1],
+                        content=str(messages[-1].get("content") or "") + full_content)
+                else:
+                    messages.append({"role": "assistant", "content": full_content,
+                                     "ts": datetime.now().isoformat(timespec="seconds")})
+                self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
+                retry_uncapped = True    # a cap we set is the likeliest cause
+                continue
+
+            # ── announced an action, then stopped without one -> nudge once ──
+            # v1.2.22. THE failure mode behind "it quit again": finish_reason=stop,
+            # text present, NO tool call - the model writes a lead-in that ends in a
+            # colon ("One last check that could turn this into a single command:")
+            # and emits EOS instead of the call it just promised. Measured on Radiance
+            # 1.17.0 / qwen4exp by replaying that exact turn as a trailing assistant
+            # message: 2/4 runs regenerate the same sentence and stop again (rt=0 - it
+            # stopped THINKING and merely completed the sentence), while 4/4 runs
+            # recover into a real tool call once the dangling promise is pointed out.
+            # So it is an unstable sampling outcome, not a dead end, and one nudge is
+            # worth a step. Bounded per TURN (DANGLING_NUDGES_MAX) and gated on the
+            # text actually reading as a promise, so a genuine final answer is never
+            # interrupted and a stuck model cannot nudge-loop to full context.
+            if (dangling_nudges < DANGLING_NUDGES_MAX and not tool_calls
+                    and enabled_tools and not self._closed
+                    and not self._stop_event.is_set()
+                    and _announces_pending_action(full_content)):
+                dangling_nudges += 1
+                buf_c = buf_r = ""          # so finally's flush posts nothing more
+                self._post(self._ui_finish_active_md)
+                self._post(lambda: self.render_note(
+                    "\u26a1 The reply announced a tool call but did not emit one - "
+                    "asking for it\u2026"))
+                messages.append({"role": "assistant", "content": full_content,
+                                 "ts": datetime.now().isoformat(timespec="seconds")})
+                messages.append({"role": "user",
+                                 "content": DANGLING_INTENT_NUDGE})
+                self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
+                continue
+
             # ── nothing usable came back → retry this step once (v1.1.74, #6) ──
             # Deliberately AFTER tool_calls is finalised: a streamed tool call IS an
             # answer (the model chose to act rather than talk), so only a step with no
@@ -13086,6 +15246,9 @@ class DeskpilotApp:
             # the retry is a plain re-issue. When a cap IS set, drop it for the retry:
             # "spent the whole budget on thinking" is a real cause of empty content.
             if (empty_retry_ok and not tool_calls and not full_content.strip()
+                    and not stream_error      # v1.2.23: a raised error is
+                    # already on screen with the server's own reason; retrying
+                    # buries it under "Empty response - retrying this step"
                     and not self._closed and not self._stop_event.is_set()):
                 empty_retry_ok = False
                 retry_uncapped = True
@@ -13108,11 +15271,33 @@ class DeskpilotApp:
 
             if not tool_calls:
                 # ── final answer → persist + finish ───────────────────────
+                # v1.2.21: fold the continuations back into ONE answer. The stored
+                # history must read as a single reply, not "cut off mid-" followed by
+                # a separate turn, and the next request must not carry consecutive
+                # assistant messages. full_content is what TTS and the completion
+                # render use, so merging here fixes the transcript AND the replay.
+                if trunc_continues and messages \
+                        and messages[-1].get("role") == "assistant":
+                    full_content = (str(messages[-1].get("content") or "")
+                                    + full_content)
+                    messages.pop()
                 messages.append({"role": "assistant", "content": full_content,
                                  "ts": datetime.now().isoformat(timespec="seconds")})
                 self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
-                if not full_content.strip():
+                if not full_content.strip() and not stream_error:
+                    # v1.2.23: only claim 'empty' when nothing actually failed. When
+                    # the stream raised, the server's own words are already on screen
+                    # and this note would bury them - that masking is why an engine
+                    # crash that self-heals on the next request read as a mystery
+                    # 'empty response' for a day.
                     self._post(lambda: self.render_note("(model returned an empty response)"))
+                elif step_finish_reason == "length":
+                    # Out of budget with the continuation budget spent. Say so - the
+                    # alternative is a silent mid-sentence ending that reads as a crash.
+                    self._post(lambda: self.render_note(
+                        "\u26a0 Reply truncated at the token limit "
+                        f"(finish_reason=length, {TRUNC_CONTINUES_MAX} continuations used). "
+                        "Raise Settings \u2192 Max Tokens, or ask for a shorter answer."))
                 self._post(lambda c=full_content: self._ui_turn_complete(c))
                 return
 
@@ -13723,7 +15908,22 @@ class DeskpilotApp:
         # Hard cap on tool output so a huge read/fetch can't blow the context window.
         # The marker tells the model (and the user in the accordion) content was cut.
         if len(result) > TOOL_OUTPUT_LIMIT:
-            return result[:TOOL_OUTPUT_LIMIT] + f"\n[... output truncated at {TOOL_OUTPUT_LIMIT} chars]"
+            result = (result[:TOOL_OUTPUT_LIMIT]
+                      + f"\n[... output truncated at {TOOL_OUTPUT_LIMIT} chars]")
+        # v1.2.14: the memory-file budget rides in the receipt, appended AFTER the
+        # output cap on purpose - a big diff block can push a receipt past the cap,
+        # and the note sits at the very end, so wrapping before the cap would truncate
+        # away the one number this exists to deliver. Wrapped HERE rather than at each
+        # return site because every tool result already passes through this place:
+        # four separate edits would have been four ways to forget one. Success only -
+        # a receipt for a write that did not happen would report a size the file
+        # does not have.
+        if name in ("write_local_file", "edit_local_file") and result.startswith("OK:"):
+            try:
+                result += memory_budget_note(str((args or {}).get("path") or ""),
+                                             self.settings)
+            except Exception:
+                pass      # a receipt note must never be the reason a tool fails
         return result
 
     # ════════════════════════════════════════════════════════════════════
@@ -14993,7 +17193,7 @@ class DeskpilotApp:
                 f"  files:  {t['count']}\n\n"
                 f"Every file that turn wrote or edited goes back to how it was BEFORE "
                 f"the turn, and files it created are deleted. This does not touch the "
-                f"conversation text.{shell_note}\n\nProceed?", parent=self.root):
+                f"conversation text.{shell_note}\n\nProceed?", parent=self._dlg_parent()):
             self._set_status("Revert cancelled - nothing changed")
             return
         report = self._checkpoint_restore(chat.get("id") or self.current_chat_id or "", t["turn_id"])
@@ -15274,12 +17474,18 @@ class DeskpilotApp:
                 "frontmatter that has at least 'name:' and 'description:'.")
         lines.append(f"\n{len(skills)} skill(s):")
         for s in skills:
-            lines.append(f"  {s['name']}" + (f" - {s['description']}" if s["description"] else ""))
+            state = "enabled" if _is_skill_enabled(self.settings, s["name"]) else "disabled"
+            lines.append(f"  [{state}] {s['name']}" + (f" - {s['description']}" if s["description"] else ""))
             lines.append(f"      {s['path']}")
         return "\n".join(lines)
 
-    def _tool_load_skill(self, name: str = "") -> str:
-        """Return one skill's SKILL.md body plus the files bundled with it."""
+    def _tool_load_skill(self, name: str = "", file: str = "") -> str:
+        """Return one skill's SKILL.md body plus the files bundled with it.
+
+        v1.1.97: pass file=<path within the skill folder> to read ONE bundled file
+        (scripts/references/templates) directly; the path must stay inside the skill
+        directory (jail). A skill whose frontmatter 'platforms:' excludes this OS is
+        refused rather than handed back instructions that cannot run here."""
         want = str(name or "").strip().lower()
         if not want:
             return "ERROR: load_skill needs the skill's name (see list_skills)."
@@ -15290,6 +17496,48 @@ class DeskpilotApp:
             near = [s["name"] for s in skills if want in s["name"].lower()]
             hint = f" Partial matches: {', '.join(near)}." if near else ""
             return f"ERROR: No skill named {name!r}.{hint} Available: {avail}"
+        # v1.1.95: installed but the owner has it DISABLED - say so clearly rather than
+        # pretending it doesn't exist, so the model knows to point the user at Manage Skills.
+        if not _is_skill_enabled(self.settings, hit["name"]):
+            return (f"SKILL INSTALLED-BUT-DISABLED: {hit['name']}. It exists on disk but the "
+                    "owner has it turned off, so it is neither injected nor loadable. Enable it "
+                    "in Settings -> Manage Skills.")
+        # v1.1.97: platform guard - a skill declaring platforms that exclude this OS is
+        # flagged in discovery and refused here, so the model isn't handed instructions
+        # referencing tools/paths it cannot run (42 Hermes skills are linux/macos-only).
+        if not hit.get("supported_here", True):
+            plats = ", ".join(hit.get("platforms") or []) or "(unspecified)"
+            return (f"SKILL NOT SUPPORTED ON THIS PLATFORM: {hit['name']} declares platforms "
+                    f"[{plats}], which do not include {_current_platform()}. It is installed but "
+                    "cannot run here; enable it only on a matching OS.")
+        # v1.1.97: load_skill(name, file=...) reads ONE bundled file from this skill's own
+        # folder - Hermes' skill_view can read its bundled scripts/references; ours only
+        # listed them. Containment is enforced so a skill cannot smuggle a read outside its
+        # folder (jail fix: the resolved path must stay inside hit['dir']).
+        if file.strip():
+            base = Path(hit["dir"]).resolve()
+            try:
+                cand = (base / str(file).strip().lstrip("/\\")).resolve()
+            except Exception as e:
+                return f"ERROR: bad bundled file path {file!r}: {e}"
+            if not cand.is_relative_to(base):
+                return (f"ERROR: bundled file {file!r} resolves outside this skill's folder "
+                        f"({hit['dir']}); reads are confined to the skill's own directory.")
+            try:
+                data = cand.read_bytes()
+            except Exception as e:
+                return f"ERROR: could not read bundled file {cand}: {e}"
+            head = (f"# Skill file: {hit['name']}/{cand.name}\n"
+                    f"Skill folder: {hit['dir']}")
+            if len(data) > SKILL_BODY_MAX:
+                return (head + "\n\n" + data[:SKILL_BODY_MAX].decode("utf-8", "replace")
+                        + f"\n[... file truncated at {SKILL_BODY_MAX} chars]")
+            try:
+                text = data.decode("utf-8")
+            except UnicodeDecodeError:
+                return (f"(bundled file {cand.name} is binary, {len(data)} bytes; not decoded. "
+                        "Ask the model to describe it another way.)")
+            return head + "\n\n" + text
         try:
             raw = Path(hit["path"]).read_text(encoding="utf-8", errors="replace")
         except Exception as e:
@@ -15297,6 +17545,10 @@ class DeskpilotApp:
         _meta, body = _skill_frontmatter(raw)
         if len(body) > SKILL_BODY_MAX:
             body = body[:SKILL_BODY_MAX] + f"\n[... skill body truncated at {SKILL_BODY_MAX} chars]"
+        # v1.1.97: Hermes skills name tools DeskPilot doesn't have by those names. Surface a
+        # one-line map of ONLY the aliases this skill actually mentions, so load_skill's reader
+        # translates on the fly (cheaper than editing 161 skill bodies).
+        preamble = _hermes_tool_preamble(body)
         # Bundled resources are why skills beat prompts: the body refers to scripts/
         # and references/ by RELATIVE path. Listing them saves a list_directory hop.
         extras: List[str] = []
@@ -15310,7 +17562,7 @@ class DeskpilotApp:
                 f"Skill folder (resolve any relative path in the body against it): {hit['dir']}")
         if extras:
             head += "\nAlso in the skill folder: " + ", ".join(extras[:60])
-        return head + "\n\n" + (body or "(this skill has no instructions in its body)")
+        return head + preamble + "\n\n" + (body or "(this skill has no instructions in its body)")
 
     def _tool_search_chats(self, query: str = "", limit: int = SEARCH_MAX_SNIPPETS,
                            full: bool = False) -> str:
@@ -15441,6 +17693,152 @@ class DeskpilotApp:
             lines.append("\nEnd of this compaction event.")
         return "\n".join(lines)
 
+    def _tool_memory_note(self, fact: str = "", topic: str = "", pointer: str = "",
+                          section: str = "", project: str = "", **kwargs) -> str:
+        """Record one durable project fact and keep the index pointed at it, atomically.
+
+        WHY THIS EXISTS instead of another paragraph in the prompt: the owner reported 10
+        seconds of work followed by 5 minutes of memory churn - add a fact, blow the
+        budget, hunt for a cut, verify the cut has a home, find none, append to a sibling,
+        re-run the linter, still over. About six calls per fact. Prose had said for five
+        releases that the index holds pointers and not facts; the model kept writing facts.
+        So the decision is removed rather than restated: the fact and its pointer are one
+        operation, and the index can only ever gain one row per TOPIC.
+
+        Runs on the WORKER thread: it must not touch self.chats (invariant #4), so the
+        active project comes from self._run_project, captured on the main thread at turn
+        start. It writes only inside projects/<slug>/, never app state.
+        """
+        body = re.sub(r"[ \t]+$", "", str(fact or "").strip(), flags=re.M)
+        if not body:
+            return "ERROR: memory_note() needs a fact. One fact per call."
+        if len(body) > MEMORY_NOTE_FACT_MAX:
+            return (f"ERROR: that is {len(body):,} chars, over the {MEMORY_NOTE_FACT_MAX:,}"
+                    f"-char limit for one note. memory_note records a fact, not a file: "
+                    f"write the detail with write_local_file, then note its path and what "
+                    f"you learned from it.")
+
+        # B6: never fall back to the workspace index. Root MEMORY.md is the index OF
+        # projects; a project fact landing there is invisible to the project it belongs to.
+        proj = (str(project or "").strip()
+                or str(getattr(self, "_run_project", "") or "").strip())
+        if not proj:
+            return ("ERROR: no active project, and memory_note refuses to write to the "
+                    "workspace index. Call set_project first, or pass project=<name>. "
+                    "Root MEMORY.md lists projects; it is not where project facts live.")
+        key = project_key(proj)
+        root = project_dir(key)
+        if not key or not root.is_dir():
+            return (f"ERROR: project {proj!r} has no folder under {PROJECT_MEMORY_SUBDIR}/. "
+                    f"set_project creates it.")
+        try:
+            root.resolve().relative_to(projects_root().resolve())
+        except ValueError:
+            return f"ERROR: {proj!r} resolves outside the projects folder."
+
+        # Exact topic match only, no fuzzy: measured across the 43 history files already
+        # named by hand - 43 files, 43 distinct names, one cluster of 3 that were genuinely
+        # different topics. Drift is not the real risk at this scale.
+        top = project_key(topic) or _note_slug_from_fact(body)
+        sib = root / "history" / f"{top}.md"
+        rel = f"history/{top}.md"
+        idx_path = project_memory_path(key)
+
+        # B1 + B2: look before writing. A hit in the file we would write to is the
+        # idempotence case (say so, change nothing). A hit elsewhere means the fact already
+        # has a home, and the answer is to point at it, not to copy it.
+        try:
+            hits = memory_note_search(key, body)
+        except Exception:
+            hits = []
+        for rel_hit, line_no, score in hits:
+            norm_hit = str(rel_hit).replace("\\", "/").lower()
+            if norm_hit == rel.lower():
+                return (f"ALREADY RECORDED: {rel}:{line_no} already carries this fact "
+                        f"(similarity {score}). Nothing written. The file is append-only, so "
+                        f"edit it directly if the fact itself has changed.")
+            if score >= 0.95:
+                return (f"DUPLICATE: this fact already has a home at "
+                        f"{PROJECT_MEMORY_SUBDIR}/{key}/{rel_hit}:{line_no} (similarity "
+                        f"{score}). Nothing written. If the index does not point there, "
+                        f"call memory_note again with topic set to that file's name to add "
+                        f"the pointer without copying the fact.")
+
+        try:
+            sib.parent.mkdir(parents=True, exist_ok=True)
+            if sib.exists():
+                cur = sib.read_bytes().decode("utf-8", "replace")
+                eol = "\r\n" if "\r\n" in cur else "\n"
+                add = cur.rstrip("\r\n") + "\n\n"
+                sec = str(section or "").strip()
+                if sec and ("\n## " + sec) not in ("\n" + cur) and ("\n# " + sec) not in ("\n" + cur):
+                    add += "## " + sec + "\n\n"
+                add += body.rstrip() + "\n"
+                sib.write_bytes((add.replace("\n", "\r\n") if eol == "\r\n" else add).encode("utf-8"))
+                action = "appended"
+            else:
+                # Undated on purpose: the corpus already separates dated = point-in-time
+                # event from undated = durable reference, and this writes reference.
+                head = ("# " + (str(topic or top)) + " - " + key + " project notes\n\n"
+                        "Durable reference for this project, appended by memory_note. For a "
+                        "point-in-time event log, use a dated file in this folder instead.\n\n"
+                        + body.rstrip() + "\n")
+                sib.write_bytes(head.encode("utf-8"))
+                action = "created"
+        except Exception as e:
+            return (f"ERROR: could not write {rel}: {e!r}. The fact was NOT recorded and "
+                    f"nothing else was changed.")
+
+        # B8/B9: the index row. An existing row means ZERO index growth, which is the
+        # owner's constraint - crossing the budget once is acceptable, climbing is not.
+        idx_act, idx_len, before_len = "unchanged", -1, -1
+        try:
+            before_len = memory_file_len(idx_path)
+            if before_len < 0:
+                idx_act = "no-index-file"
+            elif before_len > int(PROJECT_MEMORY_PROJECT_MAX):
+                idx_act = "over-budget-skipped"                       # B9
+            else:
+                idx_raw = idx_path.read_bytes().decode("utf-8", "replace")
+                e2 = "\r\n" if "\r\n" in idx_raw else "\n"
+                new_text, idx_act = memory_note_index_edit(
+                    idx_raw.replace("\r\n", "\n"), rel,
+                    str(pointer or "").strip() or _note_first_sentence(body))
+                if idx_act == "created":
+                    idx_path.write_bytes((new_text.replace("\n", "\r\n") if e2 == "\r\n"
+                                          else new_text).encode("utf-8"))
+            idx_len = memory_file_len(idx_path)
+        except Exception as e:
+            idx_act = "index-not-updated (%r)" % (e,)
+            idx_len = memory_file_len(idx_path)
+
+        # B5: measured AFTER the edit. Reporting the pre-write size here would break the
+        # one-number rule v1.2.15 established, which is the whole point of the receipt.
+        note = memory_budget_note(idx_path, self.settings)
+
+        bits = [f"OK: {action} {len(body):,} chars in {PROJECT_MEMORY_SUBDIR}/{key}/{rel}"]
+        if idx_act == "row-exists":
+            bits.append("index unchanged (+0 chars): it already points at this file, so "
+                        "adding a fact here cannot grow the index")
+        elif idx_act == "created":
+            bits.append("pointer row added to " + PROJECT_MEMORY_NAME)
+        elif idx_act == "over-budget-skipped":
+            bits.append(f"NO index row added: the index is already over its "
+                        f"{PROJECT_MEMORY_PROJECT_MAX:,}-char budget. The fact is safe in "
+                        f"{rel}; split the index before pointing at anything new")
+        elif idx_act == "no-index-file":
+            bits.append(f"no {PROJECT_MEMORY_NAME} for this project, so no pointer was "
+                        f"written - the fact is safe in {rel}")
+        else:
+            bits.append("index not updated: " + idx_act + " - the fact is safe in " + rel)
+        if (before_len >= 0 and idx_len > int(PROJECT_MEMORY_PROJECT_MAX)
+                and before_len <= int(PROJECT_MEMORY_PROJECT_MAX)):
+            bits.append(f"NOTE: this row took the index from {before_len:,} to {idx_len:,} "
+                        f"chars, crossing the budget. The last ~"
+                        f"{idx_len - int(PROJECT_MEMORY_PROJECT_MAX):,} chars are no longer "
+                        f"injected - split one section into a sibling now, before the next "
+                        f"note pushes it further")
+        return "\n".join(bits) + note
     def _tool_remember(self, text: str = "", tags: Optional[List[str]] = None,
                        global_: bool = False, **kwargs) -> str:
         """Append one durable note to the ledger.
@@ -15486,8 +17884,8 @@ class DeskpilotApp:
         return (f"Remembered ({scope}, entry {total}): {entry['text'][:200]}\n"
                 f"Appended to {where} - this file is never rewritten or pruned, and it "
                 f"survives compaction, handoff and deletion of this chat.\n"
-                f"Recent entries are injected into the system prompt automatically; "
-                f"read_ledger() reaches the older ones.")
+                f"Nothing from the ledger is injected into the system prompt, so "
+                f"read_ledger() is the only way to reach it.")
 
     def _tool_read_ledger(self, chat_id: str = "", tag: str = "", search: str = "",
                           limit: int = LEDGER_PAGE_DEFAULT, offset: int = 0) -> str:
@@ -15729,6 +18127,14 @@ class DeskpilotApp:
             self._project_active_chats.add(target_cid)
         self._update_project_topbar()
 
+    def _project_of_chat(self, cid) -> str:
+        """MAIN THREAD ONLY. The stored project of one chat, for capturing before a
+        worker starts. Reads chat state, so it must not be called from a worker."""
+        try:
+            return chat_project((self.chats.get("chats") or {}).get(cid))
+        except Exception:
+            return ""
+
     def _update_project_topbar(self) -> None:
         """Top bar shows the project being WORKED ON, or NOTHING.
 
@@ -15751,7 +18157,15 @@ class DeskpilotApp:
         browsing history looked identical to working. Reading an old chat is not
         working in it, so the name is gated on _project_active_chats: a chat joins
         that set when set_project() names it or a file tool touches its folder, and
-        the set is in-memory, so a fresh app session starts dark.
+        the set is in-memory, so a fresh app session started dark.
+
+        v1.2.10 CHANGED THE GATE to the stored `project` field, because memory injection now
+        follows that same field. The two must agree: a bar that is dark while a project's
+        memory is loaded tells the user something false. The original reason for the
+        stricter rule - browsing history looked like working - no longer applies once
+        opening that chat really does load its memory. _project_active_chats is still
+        maintained (it is cheap, and it records what this session touched) but the bar
+        no longer reads it.
         """
         lbl = getattr(self, "project_top_label", None)
         if lbl is None:
@@ -15764,7 +18178,7 @@ class DeskpilotApp:
                 # by construction - gating it would blank the bar during the exact
                 # turn that declares the project, before new_chat() hands off.
                 name = self._pending_project or ""
-            elif cid in self._project_active_chats:
+            elif chat_project(self.current_chat()):   # v1.2.10: the SAME field the memory is injected from
                 name = chat_project(self.current_chat())
             else:
                 name = ""
@@ -15937,7 +18351,7 @@ class DeskpilotApp:
 
     def attach_files(self) -> None:
         paths = filedialog.askopenfilenames(
-            parent=self.root, title="Attach files",
+            parent=self._dlg_parent(), title="Attach files",
             filetypes=[("Supported files", "*.png *.jpg *.jpeg *.pdf *.txt *.md *.json *.csv "
                                             "*.py *.js *.html *.xml *.log"),
                        ("All files", "*.*")])
@@ -15960,7 +18374,7 @@ class DeskpilotApp:
             tk.Label(chip, text=f"{icon} {p.name}", bg=COL["bg_raised"], fg=COL["text"],
                      font=F(11)).pack(side="left", padx=(8, 2), pady=3)
             tk.Button(chip, text="✖", command=lambda p=p: self._remove_attachment(p),
-                      bg=COL["bg_raised"], fg=COL["danger"], activebackground="#5B2323",
+                      bg=COL["bg_raised"], fg=COL["danger"], activebackground=COL["danger_hover"],
                       relief="flat", bd=0, width=2, cursor="hand2",
                       font=F(11)).pack(side="left", padx=(0, 6))
 
@@ -16288,6 +18702,8 @@ class DeskpilotApp:
                 cur = w.cget("font")
             except tk.TclError:
                 return
+
+
             if not isinstance(cur, str) or "Segoe" not in cur:
                 return
             toks = cur.split()
@@ -16303,6 +18719,8 @@ class DeskpilotApp:
                 kids = w.winfo_children()
             except tk.TclError:
                 return
+
+
             for c in kids:
                 walk(c)
 
@@ -16312,7 +18730,874 @@ class DeskpilotApp:
         # canvas width is unchanged.
         self._perm_reflow()
 
+    def _preview_system_prompt(self) -> None:
+        """MAIN THREAD. Show the exact system message that WOULD be sent for the current
+        chat, assembled through the same code path the worker uses - not a paraphrase.
+
+        Exists because injected context (skills index, workspace memory index, custom
+        prompt) is invisible in the UI: enabling a skill gave no on-screen confirmation,
+        and Studio silently withholds all of it."""
+        owner = self._dlg_parent() or self.root
+        chat = self.current_chat() or {}
+        studio = chat_studio_mode(chat)
+        proj = chat_project(chat)
+        ws = str(self.settings.get("file_workspace") or "")
+        # v1.2.6: at 'off' this IS the file, byte for byte - sync first so the window
+        # shows what the next request will send. Studio 'full'/'pure' are separate modes
+        # with their own prompt and are unchanged here.
+        if studio == "off":
+            try:
+                sync_system_prompt(self.settings, "preview")
+            except Exception as e:
+                self._set_status(f"Could not update {SYSTEMPROMPT_NAME}: {e}")
+        msg = build_system_message(ws, studio=studio)
+        mem_full = ""
+        if studio == "full":
+            mem_full = _project_memory_text(self.settings)
+        # v1.2.10: the project block rides on the real request, so it must appear here or
+        # this window would again claim to show what is sent while withholding part of it.
+        _pblock = _active_project_block(chat_project(chat))
+        if _pblock:
+            mem_full = (mem_full + "\n\n" + _pblock) if mem_full else _pblock
+        body = "" if msg is None else str(msg.get("content") or "")
+        if msg is not None and mem_full:
+            body = body + "\n\n" + mem_full
+
+        # v1.2.7b: this window is the only place the prompt is shown, so anything the
+        # model sees and the user cannot is the blind spot the whole revamp set out to
+        # close. The date/time stamp is exactly that - it rides on the NEWEST USER
+        # message (never the system message: build_time_note() records the measured
+        # KV-prefix-cache cost of putting it there) and is never stored in the
+        # transcript, so no other surface renders it. Shown below a rule, labelled as
+        # NOT part of the system message, because it is not.
+        stamp = "" if studio == "pure" else build_time_note()
+        shown = body
+        if stamp:
+            shown = (body + "\n\n" + "\u2500" * 62 + "\n"
+                     "NOT PART OF THE SYSTEM MESSAGE \u2014 the app appends this to your "
+                     "latest message\non every request, so the system prompt itself stays "
+                     "byte-identical and the\ninference server keeps its KV prefix cache. "
+                     "It is not saved to the\nsent transcript (frozen per message at send "
+                     "time, so older turns\nnever change on the wire).\n"
+                     + "\u2500" * 62 + stamp)
+
+        top = tk.Toplevel(owner)
+        top.title(f"{APP_NAME} \u2014 System Prompt")
+        try:
+            top.transient(owner)
+        except tk.TclError:
+            pass
+        saved = str(self.settings.get("prompt_preview_geometry") or "")
+        top.geometry(saved if saved else "900x640")
+        top.configure(bg=COL["bg_main"])
+
+        hdr = tk.Label(top, bg=COL["bg_main"], fg=COL["text_dim"], font=F(9), justify="left")
+        parts = [f"file: {system_prompt_file()}"
+                 f"\nchat: {chat.get('title') or '(no chat selected)'}"
+                 f"   \u00b7   studio: {studio}"
+                 f"   \u00b7   project: {proj or '(none)'}"
+                 f"   \u00b7   {len(body):,} chars"]
+        # v1.2.4: an unrecognised placeholder means a block the user asked for and is
+        # NOT getting. Say it here - this window is the only place the prompt is shown,
+        # and a silently missing block looks exactly like a correct one.
+        unknown = _unknown_prompt_tokens()
+        if unknown:
+            parts.append("\u26a0 unknown placeholder(s) in SYSTEMPROMPT.md: "
+                         + ", ".join("{{%s}}" % t for t in unknown)
+                         + " - sent literally; the block it should have replaced is missing.")
+        if studio == "pure":
+            parts.append("Studio 'pure' sends NO system message - the model sees only the "
+                         "conversation.")
+        elif studio == "full":
+            parts.append("Studio 'full' replaces the operator envelope with STUDIO_SYSTEM_PROMPT "
+                         "and keeps the workspace memory index; persona and skills index are "
+                         "withheld.")
+        n_inj = len(_skills_index_pick(self.settings)[1])
+        parts.append(f"skills: {n_inj} injected of {len(_active_skills(self.settings))} enabled"
+                     " (Settings \u2192 Manage Skills marks them)")
+        if stamp:
+            parts.append("+ %s chars stamped onto your message (below the rule; not part "
+                         "of the system message)" % f"{len(stamp):,}")
+        hdr.configure(text="\n".join(parts))
+        hdr.pack(side="top", anchor="w", padx=12, pady=(10, 6))
+
+        # ── v1.2.8 §16: this window is an EDITOR, not only a read-out ─────────────
+        # Two views, kept apart deliberately. The editable widget holds the FILE, which
+        # is what Save writes. "As sent" is what the model receives: the file, plus the
+        # workspace memory index under Studio 'full', plus the date stamp on the newest
+        # user message. Those are never the same bytes - editing the assembled view and
+        # saving it would bake a timestamp into the prompt file - so they are never the
+        # same widget either.
+        file_text = system_prompt_text()
+
+        # The button row is packed FIRST (side=bottom) and the text area second with
+        # expand=True. Pack allocates in order, so the reverse leaves the buttons with a
+        # zero-height cavity and they silently vanish - the same trap as the input row.
+        btns = tk.Frame(top, bg=COL["bg_main"])
+        btns.pack(side="bottom", fill="x", padx=12, pady=(0, 10))
+        body_fr = tk.Frame(top, bg=COL["bg_main"])
+        body_fr.pack(side="top", fill="both", expand=True, padx=12)
+
+        box = tk.Text(body_fr, bg=COL["bg_deep"], fg=COL["text"],
+                      insertbackground=COL["text"], relief="flat", bd=0, wrap="word",
+                      font=FM(10), padx=10, pady=8, undo=True)
+        sb = tk.Scrollbar(body_fr, command=box.yview)
+        box.configure(yscrollcommand=sb.set)
+        view = tk.Text(body_fr, bg=COL["bg_deep"], fg=COL["text"], relief="flat", bd=0,
+                       wrap="word", font=FM(10), padx=10, pady=8, state="disabled")
+        vsb = tk.Scrollbar(body_fr, command=view.yview)
+        view.configure(yscrollcommand=vsb.set)
+        box.insert("1.0", file_text)
+        # The insert above sets Tk's modified flag. Clear it before the queued
+        # <<Modified>> is processed, or the window opens already "dirty" and asks to
+        # discard changes the user never made (shipped in v1.2.8, fixed here).
+        # edit_reset() also empties the undo stack so the first Ctrl+Z cannot undo the
+        # app's own load and leave the buffer looking edited.
+        box.edit_modified(False)
+        box.edit_reset()
+
+        # App-owned regions get shaded. They read like prose and edit like prose, but
+        # sync_system_prompt() rewrites their bodies before every turn, so the only
+        # honest affordance is to show the boundary BEFORE the user types in it.
+        box.tag_configure("managed", background="#1B2430")
+        box.tag_configure("marker", foreground=COL["text_dim"])
+        st = {"dirty": False, "tab": "file", "loaded": _sp_norm(file_text)}
+
+        kind_var = tk.StringVar(value="")
+
+        def _shade(*_a) -> None:
+            if not box.winfo_exists():
+                return
+            txt = box.get("1.0", "end-1c")
+            box.tag_remove("managed", "1.0", "end")
+            kinds = []
+            for kind, s, e in _sp_managed_spans(txt):
+                mk = SP_MARK % kind
+                box.tag_add("managed", f"1.0+{s} chars", f"1.0+{e} chars")
+                box.tag_add("marker", f"1.0+{s} chars", f"1.0+{s + len(mk)} chars")
+                box.tag_add("marker", f"1.0+{e - len(mk)} chars", f"1.0+{e} chars")
+                kinds.append(kind)
+            try:
+                rel.configure(values=kinds)
+                if kind_var.get() not in kinds:
+                    kind_var.set(kinds[0] if kinds else "")
+            except tk.TclError:
+                pass
+
+        def _mark_dirty(*_a) -> None:
+            if not st["dirty"]:
+                st["dirty"] = True
+                sbtn.configure(bg=COL["warning"])
+
+        def _on_modify(*_a) -> None:
+            if box.winfo_exists() and box.edit_modified():
+                box.edit_modified(False)
+                _mark_dirty()
+
+        box.bind("<<Modified>>", _on_modify)
+        box.bind("<KeyRelease>", _shade)
+        box.bind("<ButtonRelease-1>", lambda e: top.after_idle(_shade))
+
+        def _show(which: str) -> None:
+            st["tab"] = which
+            # Scrollbar before its Text so the track spans the full height.
+            for w in (box, sb, view, vsb):
+                w.pack_forget()
+            if which == "file":
+                sb.pack(side="right", fill="y")
+                box.pack(side="left", fill="both", expand=True)
+                tbtn.configure(bg=COL["bg_raised"])
+                vbtn.configure(bg=COL["bg_main"])
+            else:
+                vsb.pack(side="right", fill="y")
+                view.configure(state="normal")
+                view.delete("1.0", "end")
+                view.insert("1.0", shown if shown else "(nothing would be sent)")
+                view.configure(state="disabled")
+                view.pack(side="left", fill="both", expand=True)
+                vbtn.configure(bg=COL["bg_raised"])
+                tbtn.configure(bg=COL["bg_main"])
+
+        status_lbl = tk.Label(btns, text="", bg=COL["bg_main"], fg=COL["text_dim"],
+                              font=F(9), justify="left", anchor="w", wraplength=820)
+
+        def _flash(text, bad=False):
+            status_lbl.configure(text=text, fg=COL["danger"] if bad else COL["success"])
+
+        def _bodies(t):
+            """kind -> inner body (module-level now - the web bridge needs it too)."""
+            return _prompt_bodies(t)
+
+        def _do_save() -> None:
+            # v1.2.27: the contract lives in save_prompt_text() so the Next web
+            # settings window saves through the SAME guards instead of a second
+            # copy. Everything below is presentation: paint the result, and reset
+            # the dirty state against the TRUE post-sync bytes.
+            res = save_prompt_text(box.get("1.0", "end-1c"), self.settings, st["loaded"])
+            if not res["ok"]:
+                _flash(res["message"], True)
+                return
+            # Reload from disk. sync regenerates every managed block, so the box may
+            # now hold text the file no longer does - an edit inside one of them
+            # would keep LOOKING saved while being gone. Showing the true post-sync
+            # bytes makes a doomed edit vanish in front of the user.
+            box.delete("1.0", "end")
+            box.insert("1.0", res["text"])
+            st["loaded"] = _sp_norm(res["text"])   # ours now, so Save can repeat
+            # Clear the flag BEFORE the queued <<Modified>> is processed, or the
+            # reload above reads as a fresh edit and the window would ask to discard
+            # changes that were just saved.
+            box.edit_modified(False)
+            box.edit_reset()
+            _shade()
+            st["dirty"] = False
+            sbtn.configure(bg=COL["bg_raised"])
+            _flash(res["message"], res["warn"])
+
+        def _release() -> None:
+            # v1.2.27: splice logic moved to release_prompt_block() (shared with the
+            # web bridge). Still buffer-only - the user must press Save, so the
+            # lost-update guard applies to a released block like any other edit.
+            res = release_prompt_block(box.get("1.0", "end-1c"), kind_var.get())
+            if not res["ok"]:
+                _flash(res["message"], True)
+                return
+            box.delete("1.0", "end")
+            box.insert("1.0", res["text"])
+            _shade()
+            _mark_dirty()
+            _flash(res["message"], res["warn"])
+
+        def _copy() -> None:
+            try:
+                top.clipboard_clear()
+                top.clipboard_append(box.get("1.0", "end") if st["tab"] == "file"
+                                     else shown)
+                cbtn.configure(text="Copied \u2713")
+                top.after(1500, lambda: cbtn.configure(text="Copy all"))
+            except tk.TclError:
+                pass
+
+        def _save_geom() -> None:
+            # Geometry only - never the prompt (the name said otherwise until v1.2.8).
+            try:
+                if top.winfo_exists():
+                    self.settings["prompt_preview_geometry"] = top.geometry()
+                    save_settings(self.settings)
+            except tk.TclError:
+                return
+
+        def _changed() -> bool:
+            """Is the buffer actually different from the file on disk?
+
+            The modified FLAG answers "was the widget touched"; the question at close is
+            "is there anything to lose". They disagree whenever the user types and then
+            deletes, or pastes and undoes - the flag says dirty, the content says equal,
+            and prompting then is crying wolf. Compare the same normalised forms that
+            _do_save() writes, so the two can never disagree."""
+            try:
+                return _sp_norm(box.get("1.0", "end-1c")) != _sp_norm(system_prompt_text())
+            except tk.TclError:
+                return False
+
+        def _close() -> None:
+            if _changed() and not messagebox.askyesno(
+                    "Discard changes?",
+                    "The prompt file has unsaved edits.\n\nDiscard them?", parent=top):
+                return
+            _save_geom()
+            top.destroy()
+
+        def _reload() -> None:
+            cur = _sp_norm(system_prompt_text())
+            box.delete("1.0", "end")
+            box.insert("1.0", cur)
+            box.edit_modified(False)
+            box.edit_reset()
+            st["loaded"] = cur
+            st["dirty"] = False
+            sbtn.configure(bg=COL["bg_raised"])
+            _shade()
+            _flash("Reloaded from disk. Anything typed in this window that was not saved "
+                   "is gone.")
+
+        tbtn = tk.Button(btns, text="Edit file", command=lambda: _show("file"),
+                         bg=COL["bg_raised"], fg=COL["text"], relief="flat", bd=0,
+                         padx=10, pady=4, cursor="hand2", font=F(10))
+        tbtn.pack(side="left")
+        vbtn = tk.Button(btns, text="As sent", command=lambda: _show("sent"),
+                         bg=COL["bg_main"], fg=COL["text"], relief="flat", bd=0,
+                         padx=10, pady=4, cursor="hand2", font=F(10))
+        vbtn.pack(side="left", padx=(2, 12))
+        rel = ttk.Combobox(btns, textvariable=kind_var, width=10, state="readonly",
+                           values=[x for x, _s, _e in _sp_managed_spans(file_text)])
+        rel.pack(side="left")
+        tk.Button(btns, text="Release block", command=_release, bg=COL["bg_raised"],
+                  fg=COL["text"], relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
+                  font=F(10)).pack(side="left", padx=(4, 12))
+        sbtn = tk.Button(btns, text="Save", command=_do_save, bg=COL["bg_raised"],
+                         fg=COL["text"], activebackground=COL["hover"], relief="flat",
+                         bd=0, padx=16, pady=4, cursor="hand2", font=F(10, "bold"))
+        sbtn.pack(side="left")
+        tk.Button(btns, text="Reload", command=_reload, bg=COL["bg_raised"],
+                  fg=COL["text"], relief="flat", bd=0, padx=10, pady=4, cursor="hand2",
+                  font=F(10)).pack(side="left", padx=(4, 0))
+        cbtn = tk.Button(btns, text="Copy all", command=_copy, bg=COL["bg_raised"],
+                         fg=COL["text"], relief="flat", bd=0, padx=12, pady=4,
+                         cursor="hand2", font=F(10))
+        cbtn.pack(side="right")
+        tk.Button(btns, text="Close", command=_close, bg=COL["bg_raised"], fg=COL["text"],
+                  relief="flat", bd=0, padx=12, pady=4, cursor="hand2",
+                  font=F(10)).pack(side="right", padx=(0, 6))
+        status_lbl.pack(side="top", fill="x", pady=(6, 0))
+        _shade()
+        _show("file")
+        _flash("Shaded regions are app-owned: they are rewritten before every turn. "
+               "Anything outside the markers is yours.")
+        # The title-bar X does not run a Close button's callback (RULES.md).
+        top.protocol("WM_DELETE_WINDOW", _close)
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+
+
+    def _manage_skills_dialog(self, parent=None) -> None:
+        """v1.1.95: Manage Skills window - the owner's curation surface for Agent Skills.
+
+        Lists every INSTALLED skill with a per-row toggle; only ENABLED skills are injected
+        into the system prompt and loadable by the model (opt-in, default-disabled). Toggling
+        persists immediately to settings. A search box filters by name/description. The
+        Add Skill button is Phase 2's import helper (stubbed here).
+
+        parent= : when opened from Settings, pass the SETTINGS window so this dialog stays
+        above it (a transient of the ROOT could slide behind the settings window when dragged).
+        Geometry (size + position) is remembered in settings and restored next open.
+
+        Headless-safe: returns quietly if there is no live root (the headless suites drive
+        these methods on a stub app with no Tk window)."""
+        try:
+            owner = parent or self._dlg_parent()
+            if owner is None:
+                return
+            top = tk.Toplevel(owner)
+            top.title(f"{APP_NAME} — Manage Skills")
+            top.configure(bg=COL["bg_main"])
+            # Transient to the OWNER (the settings window when opened from it) so the dialog
+            # always stays above it - a transient of the root could end up behind settings.
+            top.transient(owner)
+            # Remember size + position across sessions. On first open, 640x520 centered on the
+            # main screen; otherwise restore exactly where it was last closed (re-centered if
+            # that spot is off-screen / on a now-unplugged monitor).
+            saved_geo = self.settings.get("manage_skills_geometry")
+            sw, sh = owner.winfo_screenwidth(), owner.winfo_screenheight()
+            m_ = re.fullmatch(r"(-?\d+)x(-?\d+)([+-]\d+)([+-]\d+)", saved_geo or "") if saved_geo else None
+            if m_:
+                gw, gh, gx, gy = int(m_[1]), int(m_[2]), int(m_[3]), int(m_[4])
+                if not (gx > -gw + 60 and gx < sw - 60 and gy > -gh + 60 and gy < sh - 60):
+                    gx, gy = max(0, (sw - gw) // 2), max(0, (sh - gh) // 2)
+                top.geometry(f"{gw}x{gh}{gx:+d}{gy:+d}")
+            else:
+                top.geometry("640x520")
+        except tk.TclError:
+            return
+
+
+        installed = _discover_skills(self.settings)   # ALL installed, regardless of enable state
+        enabled_names = set(n.strip().lower() for n in _enabled_skill_names(self.settings))
+
+        # Count line + search box.
+        cnt_lbl = tk.Label(top, text="", bg=COL["bg_main"], fg=COL["text_dim"], font=F(9),
+                           justify="left")
+        cnt_lbl.pack(side="top", anchor="w", padx=12, pady=(10, 4))
+
+        def _injected_names() -> set:
+            """Names ACTUALLY in the current chat's system prompt, lowercased.
+
+            'Enabled' and 'injected' are different facts: Studio (full or pure) withholds
+            the skills index entirely - the same gate the request builder applies - and
+            even with Studio off the index budget can drop the tail. Read from
+            _skills_index_pick(), the function the request itself renders from."""
+            try:
+                _ch = self.current_chat()
+            except Exception:
+                _ch = None
+            if chat_studio_mode(_ch) != "off":
+                return set()
+            return set(str(n).strip().lower() for n in _skills_index_pick(self.settings)[1])
+
+        def _refresh_count() -> None:
+            installed_now = _discover_skills(self.settings)
+            n_on = sum(1 for s in installed_now if _is_skill_enabled(self.settings, s["name"]))
+            inj = _injected_names()
+            try:
+                _st = chat_studio_mode(self.current_chat())
+            except Exception:
+                _st = "off"
+            if _st != "off":
+                tail = ("none injected - Studio %s withholds the skills index" % _st)
+            else:
+                tail = "%d injected into this chat's prompt" % len(inj)
+            cnt_lbl.configure(text=f"{n_on} enabled of {len(installed_now)} installed"
+                                   f"  \u00b7  {tail}")
+
+        _refresh_count()
+
+        search_var = tk.StringVar()
+        srch_row = tk.Frame(top, bg=COL["bg_main"])
+        srch_row.pack(side="top", fill="x", padx=12, pady=(0, 6))
+        tk.Label(srch_row, text="Filter:", bg=COL["bg_main"], fg=COL["text_dim"], font=F(9)).pack(side="left")
+        tk.Entry(srch_row, textvariable=search_var, bg=COL["bg_raised"], fg=COL["text"],
+                 insertbackground=COL["text"], relief="flat", font=F(10), width=32).pack(
+            side="left", fill="x", expand=True, padx=(6, 0))
+
+        # Scrollable list of rows.
+        list_frame = tk.Frame(top, bg=COL["bg_main"])
+        list_frame.pack(side="top", fill="both", expand=True, padx=12, pady=(0, 4))
+        canvas = tk.Canvas(list_frame, bg=COL["bg_main"], highlightthickness=0, bd=0)
+        vbar = tk.Scrollbar(list_frame, orient="vertical", command=canvas.yview,
+                            bg=COL["bg_raised"], troughcolor=COL["bg_deep"],
+                            highlightthickness=0, borderwidth=0)
+        canvas.configure(yscrollcommand=vbar.set)
+        # v1.1.98: the scrollbar is packed FIRST and the canvas SECOND (expand=True). Packing
+        # the canvas first let it claim all vertical space and collapse the scrollbar to its
+        # arrows; and canvas.pack() had been dropped entirely, so the rows were built inside a
+        # 1x1 unmapped canvas - the list looked empty. Mirrors Add-Skill's working order.
+        vbar.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+        inner = tk.Frame(canvas, bg=COL["bg_main"])
+        cid = canvas.create_window((0, 0), window=inner, anchor="nw")
+        # v1.1.98: keep the scrollregion honest. _rebuild_rows() sets it once, but at that
+        # moment the window is not mapped yet so bbox("all") measures 1x1 and the scrollbar
+        # stays dead - rows below the fold were unreachable. Re-measure whenever the inner
+        # frame settles, and keep rows as wide as the viewport. (Add Skill does the same.)
+        inner.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda _e: canvas.itemconfigure(cid, width=max(_e.width, 1)))
+
+        # v1.1.99: the wheel was dead here. Tk does NOT propagate <MouseWheel> to ancestors,
+        # so binding only the canvas leaves every row (a Frame+Checkbutton+Label) a scroll
+        # dead-zone - and rows are what covers this list. Same recipe as Add Skill: bind the
+        # widget AND its descendants. `inner` is bound ONCE (it is never destroyed) and each
+        # rebuilt row is bound as it is created, so rebuilds cannot stack duplicate handlers
+        # and make the wheel scroll faster with every keystroke in the filter.
+        def _wheel(ev) -> None:
+            try:
+                if getattr(ev, "num", None) == 4:
+                    d = 1        # X11 wheel up
+                elif getattr(ev, "num", None) == 5:
+                    d = -1       # X11 wheel down
+                else:
+                    d = (ev.delta > 0) - (ev.delta < 0)
+            except (AttributeError, ValueError, TypeError):
+                d = 0
+            if not d:
+                return
+            bb = canvas.bbox("all")
+            total = (bb[3] - bb[1]) if bb else 0
+            if total <= 0:
+                return
+            px = 60 if abs(int(getattr(ev, "delta", 0) or 0)) >= 120 else 18
+            top_ = canvas.yview()[0] - d * (px / total)
+            canvas.yview_moveto(max(0.0, min(top_, 1.0)))
+
+        def _bind_wheel(w) -> None:
+            try:
+                w.bind("<MouseWheel>", _wheel, add="+")
+                w.bind("<Button-4>", _wheel, add="+")
+                w.bind("<Button-5>", _wheel, add="+")
+            except tk.TclError:
+                pass
+            for c in getattr(w, "winfo_children", lambda: [])():
+                if isinstance(c, (tk.Text, tk.Listbox)):
+                    continue        # multi-line boxes keep their native scrolling
+                _bind_wheel(c)
+
+        _bind_wheel(canvas)
+        _bind_wheel(inner)
+
+        var_map: Dict[str, tk.BooleanVar] = {}
+
+        def _rebuild_rows() -> None:
+            for w in inner.winfo_children():
+                try:
+                    w.destroy()
+                except tk.TclError:
+                    pass
+            var_map.clear()
+            shown = _skill_filter(installed, search_var.get())
+            if not shown:
+                tk.Label(inner, text="No skills installed yet. Add one with \u201cAdd Skill\u201d "
+                                     "(or drop a <name>/SKILL.md folder into the skills folder).",
+                         bg=COL["bg_main"], fg=COL["text_dim"], font=F(9), justify="left",
+                         wraplength=500).pack(side="top", anchor="w", padx=4, pady=8)
+            for s in shown:
+                name = str(s.get("name") or "").strip()
+                desc = str(s.get("description") or "").strip()
+                row = tk.Frame(inner, bg=COL["bg_main"])
+                row.pack(side="top", fill="x", padx=2, pady=(3, 0))
+                var = tk.BooleanVar(value=_is_skill_enabled(self.settings, name))
+                var_map[name.lower()] = var
+                # Toggle persists immediately - no Save button needed.
+                # v1.2.0: two bugs fixed here.
+                #  (a) it used to be wired with cb.bind("<Button-1>", ...), which fires on
+                #      PRESS, BEFORE the Checkbutton's class binding flips the variable on
+                #      RELEASE - so v.get() read the PREVIOUS state and every click saved the
+                #      INVERSE of what the user chose (checking a skill stored it disabled, so
+                #      it came back unchecked). `command=` is Tk's documented hook and runs
+                #      AFTER the variable is set.
+                #  (b) the body referenced the LOOP variable `name` instead of its own `nm`
+                #      default. Once _rebuild_rows() returns, `name` is the last row iterated,
+                #      so ticking any checkbox mutated the LAST skill in the list.
+                def _on_toggle(v=var, nm=name):
+                    on = bool(v.get())
+                    cur = set(n.strip() for n in _enabled_skill_names(self.settings))
+                    if on:
+                        cur.add(nm)
+                    else:
+                        cur.discard(nm)
+                    self.settings["skills_enabled"] = sorted(cur, key=str.lower)
+                    save_settings(self.settings)
+                    # v1.2.6: enabling a skill adds its line to SYSTEMPROMPT.md; disabling
+                    # removes it. The file is the only place the model can see them.
+                    try:
+                        sync_system_prompt(self.settings, "skill-toggle")
+                    except Exception as e:
+                        print(f"[{APP_NAME}] system prompt sync failed: {e}")
+                    # Keep the "N enabled of M installed" header in step with the boxes.
+                    _refresh_count()
+                cb = tk.Checkbutton(row, variable=var, command=_on_toggle,
+                                    bg=COL["bg_main"], fg=COL["text"],
+                                    activebackground=COL["bg_main"], activeforeground=COL["text"],
+                                    selectcolor=COL["bg_deep"], font=F(9))
+                cb.pack(side="left")
+                lbl = tk.Label(row, bg=COL["bg_main"], fg=COL["text_dim"], font=F(9),
+                               justify="left", wraplength=430)
+                if desc:
+                    lbl.configure(text=f"{name}  —  {desc}")
+                else:
+                    lbl.configure(text=name)
+                # v1.2.1: say what is ACTUALLY sent, not just what is ticked. Packed
+                # side="right" BEFORE the expanding label, so the tag sits at the right
+                # edge instead of being swallowed by it (RULES.md - pack funds and places).
+                _nm_l = name.strip().lower()
+                if not _is_skill_enabled(self.settings, name):
+                    tag_txt, tag_fg = "disabled", COL["text_dim"]
+                elif _nm_l in _injected_names():
+                    tag_txt, tag_fg = "injected", COL["accent"]
+                else:
+                    tag_txt, tag_fg = "enabled, not injected", COL["warning"]
+                tk.Label(row, text=tag_txt, bg=COL["bg_main"], fg=tag_fg,
+                         font=F(8, "bold")).pack(side="right", padx=(0, 6))
+                lbl.pack(side="left", fill="x", expand=True, padx=(8, 0))
+                _bind_wheel(row)   # v1.1.99: new widgets each rebuild, so no duplicates
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        search_var.trace_add("write", lambda *_a: _rebuild_rows())
+        _rebuild_rows()
+
+        # Remember the window's size + position when it closes, so next open restores them.
+        def _save_skills_geometry() -> None:
+            try:
+                if top.winfo_exists():
+                    self.settings["manage_skills_geometry"] = top.geometry()
+                    save_settings(self.settings)
+            except tk.TclError:
+                pass
+
+        # v1.1.98: this must sit at DIALOG level (8 spaces), not inside _save_skills_geometry
+        # (12) - nested there it was only ever registered when that function ran, so the
+        # title-bar X closed the window without saving and the size reset every open.
+        top.protocol("WM_DELETE_WINDOW", lambda: (_save_skills_geometry(), top.destroy()))
+
+        # Footer buttons.
+        btns = tk.Frame(top, bg=COL["bg_main"])
+        btns.pack(side="top", fill="x", padx=12, pady=(6, 10))
+        def _reload() -> None:
+            _refresh_count()
+            _rebuild_rows()
+        tk.Button(btns, text="Add Skill…", command=lambda: self._add_skill_dialog(top, _reload),
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
+                  relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(9)).pack(side="left")
+        tk.Button(btns, text="Reload", command=_reload,
+                  bg=COL["bg_raised"], fg=COL["text_dim"], activebackground=COL["hover"],
+                  relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(9)).pack(side="left", padx=(8, 0))
+        tk.Button(btns, text="Close", command=lambda: (_save_skills_geometry(), top.destroy()),
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
+                  relief="flat", bd=0, padx=12, pady=2, cursor="hand2", font=F(9)).pack(side="right")
+
+    def _add_skill_dialog(self, parent=None, on_done=None) -> None:
+        """v1.1.96 (Phase 2): browse the official Hermes skill catalog and download chosen
+        skills into <workspace>/skills/<folder>/. Offline-safe: shows the bundled snapshot
+        (_catalog_records); a Refresh button pulls the live catalog from GitHub on explicit
+        user request only - never automatic. Installed skills are disabled by default."""
+        owner = parent or self._dlg_parent() or self.root
+        top = tk.Toplevel(owner)
+        top.title(f"{APP_NAME} \u2014 Add Skill")
+        top.configure(bg=COL["bg_main"])
+        top.transient(owner)
+        # withdrawn -> build rows -> deiconify: no 0,0 flash (same pattern as Settings).
+        top.withdraw()
+
+        records = _catalog_records()
+        by_name = {r["name"]: r for r in records}
+        vars_ = {}
+        search_var = tk.StringVar()
+        status_var = tk.StringVar(value="")
+        install_btn_ref = {"btn": None}
+        cv_ref = {"canvas": None}
+        chrome_ref = {"built": False}
+
+        def _matches(rec) -> bool:
+            q = (search_var.get() or "").strip().lower()
+            if not q:
+                return True
+            hay = (rec.get("name", "") + " " + rec.get("description", "")).lower()
+            return q in hay
+
+        def _wheel(ev):
+            # Windows <MouseWheel> delta=120/notch; X11 wheels send Button-4/5; touchpads
+            # send many small deltas. Fraction-based stepping (yview_moveto) is exact -
+            # yview_scroll("units") means pixels on some Tk builds, lines on others.
+            try:
+                if getattr(ev, "num", None) == 4:
+                    d = 1        # X11 wheel up
+                elif getattr(ev, "num", None) == 5:
+                    d = -1       # X11 wheel down
+                else:
+                    d = (ev.delta > 0) - (ev.delta < 0)
+            except (AttributeError, ValueError, TypeError):
+                d = 0
+            if not d:
+                return
+            canvas = cv_ref["canvas"]
+            if canvas is None:
+                return
+            bb = canvas.bbox("all")
+            total = (bb[3] - bb[1]) if bb else 0
+            if total <= 0:
+                return
+            px = 60 if abs(int(getattr(ev, "delta", 0) or 0)) >= 120 else 18
+            top_ = canvas.yview()[0] - d * (px / total)
+            canvas.yview_moveto(max(0.0, min(top_, 1.0)))
+
+        def _bind_wheel(w) -> None:
+            # Tk does NOT propagate <MouseWheel> to ancestors, so binding the canvas alone
+            # leaves every checkbox (a Frame+Label under inner) a scroll dead-zone - that is
+            # why the wheel appeared to do nothing. Bind on the widget AND recursively on its
+            # children, add="+", so hovering anywhere in the list scrolls it.
+            try:
+                w.bind("<MouseWheel>", _wheel, add="+")
+                w.bind("<Button-4>", _wheel, add="+")
+                w.bind("<Button-5>", _wheel, add="+")
+            except tk.TclError:
+                pass
+            for c in getattr(w, "winfo_children", lambda: [])():
+                if isinstance(c, (tk.Text, tk.Listbox)):
+                    continue        # multi-line boxes keep their native scrolling
+                _bind_wheel(c)
+
+        def _build_chrome() -> None:
+            # Built ONCE. The header/search bar and the scrollable canvas+scrollbar persist;
+            # only the inner list frame is repopulated (see _populate_list), so the scrollbar
+            # never collapses to its bottom-right arrows and the wheel binding survives typing.
+            if chrome_ref["built"]:
+                return
+            hdr = tk.Frame(top, bg=COL["bg_main"])
+            hdr.pack(side="top", fill="x", padx=10, pady=(8, 4))
+            tk.Label(hdr, text="Official Hermes skills \u2014 select any to install "
+                              "(installed, then disabled).", bg=COL["bg_main"],
+                     fg=COL["text"], font=F(9), justify="left").pack(side="left", fill="x", expand=True)
+            # Security note: enabling a skill means its SKILL.md instructions are read into the
+            # context every turn; importing it runs no code. (v1.1.96 acceptance item.)
+            tk.Label(hdr, text="Enabled = its instructions are read every turn; no code executes on import.",
+                     bg=COL["bg_main"], fg=COL["text_dim"], font=F(8), justify="left",
+                     wraplength=640).pack(side="top", anchor="w", padx=(10, 0))
+            bar = tk.Frame(top, bg=COL["bg_main"])
+            bar.pack(side="top", fill="x", padx=10, pady=(2, 4))
+            tk.Label(bar, text="Search:", bg=COL["bg_main"], fg=COL["text_dim"],
+                     font=F(9)).pack(side="left")
+            # v1.1.98: tk.Entry, NOT ttk.Entry. ttk widgets reject fg=/insertbackground=
+            # ("unknown option \"-fg\""), so passing them crashed _build_chrome() right after
+            # the header and the skill list was never built (empty window). A bare ttk.Entry
+            # also renders light-on-light, so the typed text was invisible. tk.Entry accepts
+            # all three - same recipe as the Manage Skills filter box.
+            tk.Entry(bar, textvariable=search_var, width=34,
+                     bg=COL["bg_raised"], fg=COL["text"], insertbackground=COL["text"],
+                     relief="flat", font=F(10)).pack(
+                side="left", fill="x", expand=True, padx=(4, 8))
+            tk.Button(bar, text="Refresh", command=_do_refresh,
+                      bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
+                      relief="flat", bd=0, padx=8, pady=2, cursor="hand2", font=F(9)
+                      ).pack(side="left")
+
+            body = tk.Frame(top, bg=COL["bg_main"])
+            body.pack(side="top", fill="both", expand=True, padx=8, pady=(0, 4))
+            # Create the widgets first so references resolve; then PACK the scrollbar before
+            # the canvas. Packing the expand=True canvas first would let it claim all vertical
+            # space and collapse the scrollbar to its bottom-right arrows - exactly what was seen.
+            list_canvas = tk.Canvas(body, bg=COL["bg_main"], highlightthickness=0, bd=0)
+            inner = tk.Frame(list_canvas, bg=COL["bg_main"])
+            sid = list_canvas.create_window((0, 0), window=inner, anchor="nw")
+            vsb = ttk.Scrollbar(body, orient="vertical", command=list_canvas.yview)
+            vsb.pack(side="right", fill="y")
+            list_canvas.pack(side="left", fill="both", expand=True)
+            cv_ref["canvas"] = list_canvas
+            list_canvas.configure(yscrollcommand=vsb.set)
+            inner.bind("<Configure>", lambda e: list_canvas.configure(scrollregion=list_canvas.bbox("all")))
+            list_canvas.bind("<Configure>", lambda e: list_canvas.itemconfigure(sid, width=max(e.width, 1)))
+            # Bind the wheel on the canvas itself; the inner frame + its items are (re)bound
+            # every time _populate_list runs, so we do NOT bind them here (avoids a double
+            # binding on `inner` that would scroll twice when over the gaps).
+            try:
+                list_canvas.bind("<MouseWheel>", _wheel, add="+")
+                list_canvas.bind("<Button-4>", _wheel, add="+")
+                list_canvas.bind("<Button-5>", _wheel, add="+")
+            except tk.TclError:
+                pass
+            chrome_ref["built"] = True
+
+        def _populate_list() -> None:
+            canvas = cv_ref["canvas"]
+            if canvas is None:
+                return
+            inner_children = canvas.winfo_children()
+            if not inner_children:
+                return
+            inner = inner_children[0]           # the single window inside the canvas
+            for w in list(inner.winfo_children()):
+                w.destroy()
+            vars_.clear()
+            shown = 0
+            cur_cat = None
+            for rec in records:
+                if not _matches(rec):
+                    continue
+                cat = rec.get("category") or "other"
+                if cat != cur_cat:
+                    cur_cat = cat
+                    tk.Label(inner, text=cat.title(), bg=COL["bg_main"], fg=COL["text_dim"],
+                             font=F(9, weight="bold")).pack(side="top", anchor="w", padx=6, pady=(8, 0))
+                var = tk.IntVar()
+                vars_[rec["name"]] = var
+                cb = tk.Checkbutton(inner, variable=var, bg=COL["bg_main"], fg=COL["text"],
+                                    activebackground=COL["bg_main"], selectcolor=COL["bg_raised"],
+                                    font=F(9), wraplength=560, justify="left",
+                                    text=f"{rec['name']}  \u2014  {rec.get('description', '')}")
+                cb.pack(side="top", anchor="w", padx=8, pady=(1, 3))
+                shown += 1
+            if not shown:
+                tk.Label(inner, text="No skills match.", bg=COL["bg_main"], fg=COL["text_dim"],
+                         font=F(9)).pack(side="top", padx=6, pady=8)
+            _bind_wheel(inner)
+
+        def _build_rows():
+            _build_chrome()
+            _populate_list()
+
+        def _do_refresh():
+            status_var.set("Refreshing from GitHub \u2026")
+            fresh = _refresh_catalog_from_github()
+            if not fresh:
+                status_var.set("Refresh failed (offline or unreachable). Showing the bundled snapshot.")
+                return
+            records.clear()
+            records.extend(fresh)
+            by_name.clear()
+            by_name.update({r["name"]: r for r in fresh})
+            _build_rows()
+            status_var.set(f"Live catalog loaded ({len(records)} skills).")
+
+        def _do_install(selected):
+            ok_n = 0
+            for name in selected:
+                rec = by_name.get(name)
+                if not rec:
+                    continue
+                folder = _skill_folder_key(rec)
+                dest = _skill_install_dir(folder)
+                if dest is None:
+                    self._post(lambda n=name: status_var.set(f"{n}: unsafe path blocked"))
+                    continue
+                ok, msg = _skill_folder_download(folder, dest)
+                ok_n += 1 if ok else 0
+                tag = "[OK] " if ok else "[FAIL] "
+                self._post(lambda n=name, t=tag, m=msg: status_var.set(t + n + ": " + m))
+            self._post(lambda c=len(selected), o=ok_n: status_var.set(
+                f"Done \u2014 {o}/{c} installed."))
+            self._post(_finish)     # refresh Manage Skills (via on_done) then close this picker
+
+        def _finish():
+            if on_done:
+                on_done()          # refresh Manage Skills so the new skills appear (disabled)
+            top.destroy()          # close this picker; releases the grab
+
+        footer = tk.Frame(top, bg=COL["bg_main"])
+        footer.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        status_lbl = tk.Label(footer, textvariable=status_var, bg=COL["bg_main"], fg=COL["text_dim"],
+                              font=F(9), justify="left")
+        status_lbl.pack(side="left", fill="x", expand=True)
+
+        def _on_install():
+            selected = [n for n, v in vars_.items() if v.get()]
+            if not selected:
+                status_var.set("Select at least one skill.")
+                return
+            btn = install_btn_ref["btn"]
+            if btn is not None:
+                btn.configure(state="disabled")
+            threading.Thread(target=_do_install, args=(selected,), daemon=True).start()
+
+        actions = tk.Frame(top, bg=COL["bg_main"])
+        actions.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        btn = tk.Button(actions, text="Install Selected", command=_on_install,
+                        bg=COL["accent"], fg=COL["text"], activebackground=COL["hover"],
+                        relief="flat", bd=0, padx=12, pady=3, cursor="hand2", font=F(9, weight="bold"))
+        install_btn_ref["btn"] = btn
+        btn.pack(side="right")
+
+        # Remember size + position across sessions, like Manage Skills. On first open,
+        # 720x520 centered on the main screen; otherwise restore where it was last closed
+        # (re-centered if that spot is off-screen / on a now-unplugged monitor).
+        saved_geo = self.settings.get("add_skill_geometry")
+        sw, sh = owner.winfo_screenwidth(), owner.winfo_screenheight()
+        m_ = re.fullmatch(r"(-?\d+)x(-?\d+)([+-]\d+)([+-]\d+)", saved_geo or "") if saved_geo else None
+        if m_:
+            gw, gh, gx, gy = int(m_[1]), int(m_[2]), int(m_[3]), int(m_[4])
+            if not (gx > -gw + 60 and gx < sw - 60 and gy > -gh + 60 and gy < sh - 60):
+                gx, gy = max(0, (sw - gw) // 2), max(0, (sh - gh) // 2)
+            top.geometry(f"{gw}x{gh}{gx:+d}{gy:+d}")
+        else:
+            top.geometry("720x520")
+
+        def _save_add_skill_geometry() -> None:
+            try:
+                if top.winfo_exists():
+                    self.settings["add_skill_geometry"] = top.geometry()
+                    save_settings(self.settings)
+            except tk.TclError:
+                pass
+
+        # The X button (and any other close path) must persist geometry first.
+        top.protocol("WM_DELETE_WINDOW", lambda: (_save_add_skill_geometry(), top.destroy()))
+        # reveal once at final size; grab AFTER deiconify (no flash, focus intact).
+        top.deiconify()
+        try:
+            top.grab_set()
+        except tk.TclError:
+            pass
+        _build_rows()
+
     def open_settings(self) -> None:
+        """⚙ Settings. WebView2 window when the bundle supports it, Tk otherwise.
+
+        The web window is a CHILD PROCESS because pywebview owns the main thread and
+        cannot coexist with Tk's. Everything about trying it is best-effort: if
+        pywebview is not bundled, the spawn fails, or the child exits non-zero, this
+        falls through to the Tk dialog below. A user must never be left without
+        Settings because a newer UI failed to start.
+        """
+        if self._open_settings_webview():
+            return
         # Hardening (v1.1.12): the modal grab is taken at map time, BEFORE the ~600 lines
         # of dialog build. If that build throws, the half-built dialog has no Cancel button
         # and the grab outlives it; destroying the Toplevel releases the grab, so report
@@ -16333,11 +19618,153 @@ class DeskpilotApp:
             except Exception:
                 pass
 
+    def _open_settings_webview(self) -> bool:
+        """True if the child was spawned. False means: use the Tk dialog.
+
+        Deliberately does NOT wait for the child. It runs its own message loop, so
+        waiting here would freeze the main window for as long as Settings is open.
+        Instead a daemon thread waits for it to exit and then re-reads the store -
+        the same refresh sequence the Tk dialog runs after Save, without which a
+        skill ticked in the window would not be injected until the next restart.
+        """
+        # Tests must not open a real window. A suite that calls open_settings() and
+        # then inspects Tk widgets would otherwise spawn a live WebView2 window on the
+        # user's desktop AND fail to find the dialog it asserts on - a silent,
+        # side-effecting failure, so the escape hatch lives here rather than only at
+        # each call site. Set by the settings-layout suites.
+        if os.environ.get("DESKPILOT_FORCE_TK_SETTINGS"):
+            return False
+
+        try:
+            import subprocess
+            import threading
+
+            argv = _settings_child_argv(SETTINGS_FILE)
+
+            # The parent is --windowed and may hold no valid std handles, so the
+            # child gets its own: DEVNULL stdin (it speaks no stdin protocol - the
+            # bridge is pywebview's JS one) and a log for everything it writes.
+            # Without this, the child's own failure print() would raise inside its
+            # except block and the reason would be lost. Truncated per spawn so it
+            # describes the latest attempt and cannot grow.
+            log_fh = None
+            try:
+                # SETTINGS_FILE.parent, NOT data_dir: data_dir is a local of main()
+                # and is not in scope inside this method. The settings dir is the
+                # right place anyway - it is the profile the child is editing.
+                log_fh = open(SETTINGS_FILE.parent / SETTINGS_LOG_NAME,
+                              "w", encoding="utf-8")
+            except Exception:
+                log_fh = None
+            devnull = subprocess.DEVNULL
+            child = subprocess.Popen(
+                argv,
+                cwd=str(Path(sys.executable).resolve().parent)
+                      if getattr(sys, "frozen", False) else None,
+                stdin=devnull,
+                stdout=(log_fh if log_fh is not None else devnull),
+                stderr=subprocess.STDOUT)
+            if log_fh is not None:
+                log_fh.close()          # the child holds its own handle now
+
+            # A child that dies at once means the web window is not usable in this
+            # build (pywebview not bundled, WebView2 runtime missing, next/ not
+            # shipped). Returning True here would skip the Tk fallback and leave the
+            # user with NO settings window, so give it a moment and look: a live
+            # process is genuinely opening, a fast non-zero exit is a failure.
+            import time as _t
+            _deadline = _t.monotonic() + 1.5
+            while _t.monotonic() < _deadline:
+                if child.poll() is not None:
+                    break
+                _t.sleep(0.05)
+            rc = child.poll()
+            if rc is not None and rc != 0:
+                print(f"[{APP_NAME}] settings child exited {rc} - using the "
+                      f"built-in settings dialog")
+                return False
+
+            def _after() -> None:
+                # The child writes the store on Save but cannot tell us it did, so it
+                # touches a sentinel beside the store and we watch for it. Without this
+                # the reload only happens when the window CLOSES: the value is on disk
+                # the whole time, the running app just keeps behaving the old way -
+                # which is exactly how "UI Font Size didn't change" looked in 1.2.30,
+                # after _apply_ui_font had already been added to the reload list.
+                post = getattr(self, "_post", None)
+                if post is None:
+                    try:
+                        child.wait()
+                    except Exception:
+                        pass
+                    return
+                try:
+                    sentinel = Path(SETTINGS_FILE).with_name(SETTINGS_SENTINEL_NAME)
+                except Exception:
+                    sentinel = None
+                seen = None
+                while child.poll() is None:
+                    _t.sleep(SETTINGS_POLL_S)
+                    if sentinel is None:
+                        continue
+                    try:
+                        tok = sentinel.stat().st_mtime_ns
+                    except OSError:
+                        tok = None
+                    if tok and tok != seen:
+                        seen = tok
+                        try:
+                            post(self._reload_settings_after_window)
+                        except Exception:
+                            pass
+                try:
+                    child.wait()
+                except Exception:
+                    pass
+                # One final pass: covers a save whose sentinel landed between the last
+                # poll and the child's exit, and the pre-existing "reload on close".
+                try:
+                    post(self._reload_settings_after_window)
+                except Exception:
+                    pass
+
+            threading.Thread(target=_after, daemon=True).start()
+            return True
+        except Exception:
+            traceback.print_exc()
+            return False
+
+    def _reload_settings_after_window(self) -> None:
+        """MAIN THREAD. Re-read the store and refresh everything that depends on it."""
+        try:
+            fresh = load_settings()
+        except Exception:
+            return
+        self.settings = fresh
+        # The SAME sequence the Tk dialog's Save button runs, in the same order. It is
+        # a tuple of names rather than inline calls so a future settings side effect
+        # has exactly one obvious place to be added - the web window replaced a dialog
+        # that had grown this list over a dozen versions, and porting only the rows it
+        # DISPLAYS silently drops the effects it APPLIED. First casualty was
+        # _apply_ui_font: UI Font Size persisted to disk but the running window kept
+        # its old fonts until restart, because nothing here re-scaled them.
+        for fn in ("_refresh_perm_colors", "_sync_prompt_check", "_mcp_connect_all",
+                   "_invalidate_clients", "_update_topbar_labels", "_refresh_ctx_topbar",
+                   "_apply_ui_font"):
+            try:
+                getattr(self, fn)()
+            except Exception:
+                pass
+
     def _open_settings_inner(self) -> None:
         top = tk.Toplevel(self.root)
         top.title(f"{APP_NAME} — Settings")
         top.configure(bg=COL["bg_main"])
         top.transient(self.root)
+        # v1.1.95: build the dialog while it is still withdrawn so it never flashes at
+        # 0,0 for one frame (Tk auto-maps a fresh Toplevel at the screen origin); it is
+        # deiconified once at the end with its real geometry already applied.
+        top.withdraw()
 
         # v1.1.11 Option A: every settings row lives inside a scrollable Canvas body;
         # the Save/Test/Cancel footer is pinned OUTSIDE it, so shrinking the window
@@ -16429,18 +19856,10 @@ class DeskpilotApp:
             except tk.TclError:
                 pass
 
-        # Map the window BEFORE grabbing: on some Tk builds (e.g. Tk 9) a grab
-        # taken while the toplevel is still unmapped leaves keyboard focus on
-        # the main window, so typing in the fields below silently goes nowhere.
-        try:
-            top.update_idletasks()
-        except tk.TclError:
-            pass
-        try:
-            top.grab_set()
-        except tk.TclError:
-            pass
-
+        # Grab is taken AFTER the window is deiconified (see below): a grab on an
+        # unmapped toplevel leaves keyboard focus on the main window, so typing would
+        # go nowhere. The build between here and there is synchronous Python with no
+        # event-loop processing, so deferring the grab costs nothing.
         rows = [
             ("Server URL (OpenAI-compatible base)", "server_url"),
             ("API Key",                             "api_key"),
@@ -16461,11 +19880,9 @@ class DeskpilotApp:
             ("Tool results kept verbatim (newest N tool outputs re-sent in full; older ones become short stubs. 0 = off, nothing is deleted from the chat)", "tool_keep_verbatim"),
             ("Tool-economy nudge every N steps (advisory note to the model inside a long tool loop; 0 = off, it never ends a turn)", "tool_nudge_every"),
             ("Chat render window (messages shown per chat view; older ones behind 'Load earlier messages'; 0 = show all)", "chat_render_window"),
-            ("Ledger in system prompt (chars of append-only notes injected each request; 0 = off, read_ledger() still reaches them)", "ledger_inject_chars"),
             ("Project memory index (chars of the workspace MEMORY.md injected each request; 0 = off)", "project_memory_chars"),
             ("Project memory file (blank = <workspace>/MEMORY.md)", "project_memory_file"),
-            ("Active project memory (chars of the ACTIVE project's own MEMORY.md injected each request; 0 = off)", "project_memory_project_chars"),
-            ("Custom System Prompt (appended to the built-in system prompt on every request; blank = none)", "custom_system_prompt"),
+            ("Custom System Prompt (shown in SYSTEMPROMPT.md as the persona block on every request; blank = none)", "custom_system_prompt"),
             ("Exa API Key (blank = Exa Search disabled)", "exa_api_key"),
             ("Firecrawl API Key (blank = Firecrawl Scrape disabled)", "firecrawl_api_key"),
             ("Allow Local Network (fetch_url)", "allow_local_network"),
@@ -16557,7 +19974,7 @@ class DeskpilotApp:
                 # bounded requests into a read-only box - it writes NOTHING to chat history, chats.json or
                 # settings, and lives inside this sub-frame, so the dialog's own plain-Entry count is unchanged.
                 verify_btn = tk.Button(samp_frame, text="Verify parameters", font=F(10), bg=COL["bg_raised"],
-                   fg=COL["text"], activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
+                   fg=COL["text"], activebackground=COL["hover"], relief="flat", bd=0, padx=10, pady=2,
                    cursor="hand2", command=lambda: self._verify_sampling(verify_btn, verify_out))
                 verify_out = tk.Text(samp_frame, width=58, height=6, wrap="word", state="disabled",
                    bg=COL["bg_deep"], fg=COL["text_dim"], insertbackground=COL["text"], relief="flat", font=F(9))
@@ -16708,7 +20125,7 @@ class DeskpilotApp:
 
         entries["file_workspace"].pack(in_=ws_rowf, side="left", fill="x", expand=True)
         tk.Button(ws_rowf, text="Browse...", command=_browse_ws, bg=COL["bg_raised"], fg=COL["text"],
-                  activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
+                  activebackground=COL["hover"], relief="flat", bd=0, padx=10, pady=2,
                   cursor="hand2", font=F(10)).pack(side="left", padx=(8, 0))
 
         # Handoff notes folder row: picker + the EFFECTIVE folder shown live, so it is always
@@ -16744,7 +20161,7 @@ class DeskpilotApp:
         nd_btns = tk.Frame(nd_rowf, bg=COL["bg_main"])
         nd_btns.pack(side="top", anchor="w", pady=(2, 0))
         tk.Button(nd_btns, text="Browse...", command=_browse_notes, bg=COL["bg_raised"], fg=COL["text"],
-                  activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
+                  activebackground=COL["hover"], relief="flat", bd=0, padx=10, pady=2,
                   cursor="hand2", font=F(10)).pack(side="left")
         notes_dir_lbl = tk.Label(nd_rowf, text="", bg=COL["bg_main"], fg=COL["text_dim"],
                                  font=F(9), justify="left", wraplength=260)
@@ -16767,9 +20184,10 @@ class DeskpilotApp:
             try:
                 found = _discover_skills(self.settings)
                 scanned = _skill_dirs({"skills_dir": entries["skills_dir"].get().strip()})
+                n_on = sum(1 for s in found if _is_skill_enabled(self.settings, s["name"]))
                 skills_dir_lbl.configure(
                     text="Scanning:\n" + "\n".join(str(p) for p in scanned)
-                         + f"\n{len(found)} skill(s) currently installed")
+                         + f"\n{n_on} enabled of {len(found)} skill(s) installed")
             except tk.TclError:
                 pass
             except Exception:
@@ -16782,11 +20200,17 @@ class DeskpilotApp:
         sk_btns = tk.Frame(sk_rowf, bg=COL["bg_main"])
         sk_btns.pack(side="top", anchor="w", pady=(2, 0))
         tk.Button(sk_btns, text="Browse...", command=_browse_skills, bg=COL["bg_raised"], fg=COL["text"],
-                  activebackground="#4B5563", relief="flat", bd=0, padx=10, pady=2,
+                  activebackground=COL["hover"], relief="flat", bd=0, padx=10, pady=2,
                   cursor="hand2", font=F(10)).pack(side="left")
         skills_dir_lbl = tk.Label(sk_rowf, text="", bg=COL["bg_main"], fg=COL["text_dim"],
                                   font=F(9), justify="left", wraplength=260)
         skills_dir_lbl.pack(side="top", anchor="w", padx=(8, 0))
+        # v1.1.95: Manage Skills opens the per-skill enable/disable curation window.
+        tk.Button(sk_btns, text="Manage Skills…",
+                  command=lambda: self._manage_skills_dialog(top),
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
+                  relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(9)) \
+            .pack(side="left", padx=(8, 0))
         _update_skills_note()
         entries["skills_dir"].bind("<KeyRelease>", lambda _e: _update_skills_note())
 
@@ -16807,6 +20231,7 @@ class DeskpilotApp:
                 model_combo.configure(state="disabled")
             except tk.TclError:
                 return
+
 
             def _worker():
                 info = fetch_model_info(url, key)
@@ -16867,14 +20292,14 @@ class DeskpilotApp:
         # the far-right dead space of the stretched row.
         refresh_btn = tk.Button(model_row, text="Refresh models",
                                 command=lambda: _refresh_models(False, auto_fix=False),
-                                bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                                bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                                 relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
         refresh_btn.pack(side="left", padx=(8, 0))
 
         # "Use loaded model": copies the single loaded model's exact server ID into
         # Model Name - the reliable fix when you do not know the name yourself.
         use_btn = tk.Button(model_row, text="Use loaded model", state="disabled",
-                            bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                            bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                             relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
         use_btn.pack(side="left", padx=(8, 0))
 
@@ -16903,6 +20328,7 @@ class DeskpilotApp:
                 expert_combo.configure(state="disabled")
             except tk.TclError:
                 return
+
 
             def _eworker():
                 info = fetch_model_info(eurl, ekey, timeout=20)
@@ -16944,7 +20370,7 @@ class DeskpilotApp:
 
         exp_btn = tk.Button(exp_row, text="List models",
                             command=_refresh_expert_models,
-                            bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                            bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                             relief="flat", bd=0, padx=10, pady=2, cursor="hand2", font=F(10))
         exp_btn.pack(side="left", padx=(8, 0))
         exp_lbl = tk.Label(exp_row, text="", bg=COL["bg_main"], fg=COL["text_dim"],
@@ -17004,12 +20430,15 @@ class DeskpilotApp:
             except tk.TclError:
                 return
 
+
         def _keep_dialog_focus(n_left: int) -> None:
             try:
                 if not top.winfo_exists():
                     return
             except tk.TclError:
                 return
+
+
             _ensure_dialog_focus()
             if n_left > 0:
                 try:
@@ -17046,7 +20475,8 @@ class DeskpilotApp:
                     messagebox.showwarning(
                         f"{APP_NAME} - File Workspace",
                         "That folder cannot be used as the File Workspace:\n\n"
-                        f"{e}\n\nLeave the field blank to keep the file tools unrestricted.")
+                        f"{e}\n\nLeave the field blank to keep the file tools unrestricted.",
+                        parent=top)
                     return
             # Handoff notes folder: blank = default_handoff_notes_dir(); anything else must be an absolute
             # folder this app can create. Validated BEFORE mutating self.settings (same reason as File
@@ -17066,7 +20496,7 @@ class DeskpilotApp:
                         f"{APP_NAME} - Handoff notes folder",
                         "That folder cannot be used for handoff notes:\n\n"
                         f"{e}\n\nLeave the field blank to use the app working folder: "
-                        f"{default_handoff_notes_dir()}")
+                        f"{default_handoff_notes_dir()}", parent=top)
                     return
             # Skills folder: like the notes folder, blank = the app defaults. Anything
             # else must be an ABSOLUTE folder that already EXISTS - skills are read-only
@@ -17086,7 +20516,7 @@ class DeskpilotApp:
                         f"{APP_NAME} - Skills folder",
                         "That folder cannot be used for skills:\n\n"
                         f"{e}\n\nLeave the field blank to scan only the app defaults: "
-                        f"{default_workspace_root() / SKILLS_SUBDIR}")
+                        f"{default_workspace_root() / SKILLS_SUBDIR}", parent=top)
                     return
             # Custom System Prompt: multi-line text box (not a plain entry).
             # Validate BEFORE mutating self.settings so an over-limit prompt's early
@@ -17096,7 +20526,7 @@ class DeskpilotApp:
                 messagebox.showwarning(
                     f"{APP_NAME} - Custom System Prompt too long",
                     f"That text is {len(cp)} characters; the limit is {CUSTOM_PROMPT_MAX}.\n"
-                    "Shorten it and save again (nothing was saved this time).")
+                    "Shorten it and save again (nothing was saved this time).", parent=top)
                 return
             for k, e in entries.items():
                 self.settings[k] = e.get().strip()
@@ -17215,15 +20645,6 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 _rw = CHAT_RENDER_WINDOW_DEFAULT
             self.settings["chat_render_window"] = max(0, min(2000, _rw))
-            # Ledger injection budget: chars, clamped to 0..LEDGER_INJECT_MAX (invalid ->
-            # default). 0 means OFF (nothing injected; read_ledger() still reaches every
-            # entry). _ledger_inject clamps again at read time, so a hand-edited settings
-            # file cannot make a request carry an unbounded block.
-            try:
-                _lg = int(float(self.settings.get("ledger_inject_chars", LEDGER_INJECT_DEFAULT)))
-            except (TypeError, ValueError):
-                _lg = LEDGER_INJECT_DEFAULT
-            self.settings["ledger_inject_chars"] = max(0, min(LEDGER_INJECT_MAX, _lg))
             # Project memory index budget: same clamp shape as the ledger, and 0 = OFF.
             # _project_memory_text clamps again at read time, so a hand-edited settings
             # file cannot make every request carry an unbounded index.
@@ -17233,16 +20654,6 @@ class DeskpilotApp:
             except (TypeError, ValueError):
                 _pm = PROJECT_MEMORY_DEFAULT
             self.settings["project_memory_chars"] = max(0, min(PROJECT_MEMORY_MAX, _pm))
-            # Active project memory budget: same clamp shape, and 0 = OFF. Clamped again
-            # at read time, so a hand-edited settings file cannot make every request
-            # carry an unbounded project memory.
-            try:
-                _pmp = int(float(self.settings.get("project_memory_project_chars",
-                                                   PROJECT_MEMORY_PROJECT_DEFAULT)))
-            except (TypeError, ValueError):
-                _pmp = PROJECT_MEMORY_PROJECT_DEFAULT
-            self.settings["project_memory_project_chars"] = max(
-                0, min(PROJECT_MEMORY_PROJECT_MAX, _pmp))
             # Sampling: coerce + clamp each field; blank/garbage -> "" (key omitted from requests).
             _samp: Dict[str, Any] = {}
             for _sk, _sl, _lo, _hi, _si, _st, _so in SAMPLING_SCHEMA:
@@ -17271,12 +20682,24 @@ class DeskpilotApp:
             # MCP servers may have been added/removed in the dialog: reconnect
             # everything so the permission bar matches the saved configuration.
             self._mcp_connect_all()
+            # v1.2.6: workspace, API keys and the persona can all change here, and each
+            # one is now text in the file rather than something computed per request.
+            try:
+                _sp = sync_system_prompt(self.settings, "settings-save")
+                if _sp.get("refused"):
+                    messagebox.showwarning(
+                        f"{APP_NAME} - {SYSTEMPROMPT_NAME} not updated",
+                        "Settings were saved but the system prompt file could not be "
+                        f"updated:\n\n{_sp['refused']}\n\nThe model will keep receiving "
+                        "the previous prompt.", parent=top)
+            except Exception as e:
+                print(f"[{APP_NAME}] system prompt sync failed: {e}")
             if not save_settings(self.settings):
                 messagebox.showwarning(
                     f"{APP_NAME} - Could not save settings",
                     "Settings could not be written to:\n\n"
                     f"{SETTINGS_FILE}\n\nThe folder may be read-only. Saving is\n"
-                    "retried automatically when the app closes.")
+                    "retried automatically when the app closes.", parent=top)
             self._invalidate_clients()   # server URL / API key may have changed
             self._update_topbar_labels()
             self._refresh_ctx_topbar()   # server/model may have changed - refresh context readout
@@ -17322,6 +20745,15 @@ class DeskpilotApp:
             # No offset part in the string -> the WM centers the window.
             top.geometry(f"{min(reqw, cap_w - 40)}x{min(reqh, cap_h - 40)}")
 
+        # v1.1.95: reveal the dialog ONCE, at its final size/position. It was withdrawn
+        # at creation; deiconify here so the grab (taken just below) lands on a window
+        # that is already where it belongs - no 0,0 flash.
+        top.deiconify()
+        try:
+            top.grab_set()          # modal: all input routed to Settings while open
+        except tk.TclError:
+            pass
+
         def _save_settings_geometry() -> None:
             # Routes BOTH Close buttons (Save/Cancel) and WM_DELETE_WINDOW: remembers
             # where the dialog was; settings CONTENTS are untouched by this path.
@@ -17348,22 +20780,37 @@ class DeskpilotApp:
         tk.Label(btns, text=f"Data files saved in: {SETTINGS_FILE.parent}", bg=COL["bg_main"],
                  fg=COL["text_dim"], font=F(9)).pack(side="top")
 
+        # v1.1.93: the connection result is written HERE instead of into a messagebox.
+        # A Tk dialog runs a native modal loop, so while that popup was open the main
+        # window stopped pumping events: Windows called the app "not responding" and
+        # the owner could not be maximized. One dump of that exact frame is what the
+        # 2026-10-23 hang reports caught. An async result has no business being shown
+        # in a blocking modal in the first place.
+        conn_lbl = tk.Label(btns, text="", bg=COL["bg_main"], fg=COL["text_dim"],
+                            font=F(9), wraplength=560, justify="left",
+                            anchor="w")
+        conn_lbl.pack(side="top", fill="x", pady=(0, 2))
+
         def test():
             # Read every field on the MAIN thread: Test must try the key as TYPED in the
             # dialog, not the previously saved settings (a freshly pasted key was tested
             # against the stale saved one -> bogus 401 before v1.1.12).
             url = (entries["server_url"].get().strip() or "http://localhost:11434/v1")
             key = entries["api_key"].get().strip()
-            threading.Thread(target=self._test_connection, args=(url, key, top), daemon=True).start()
+            conn_lbl.configure(text="Testing…", fg=COL["text_dim"])
+            test_btn.configure(state="disabled")
+            threading.Thread(target=self._test_connection,
+                             args=(url, key, top, conn_lbl, test_btn), daemon=True).start()
 
         tk.Button(btns, text="Save", command=save, bg=COL["accent"], fg="#FFFFFF",
-                  activebackground="#2563EB", relief="flat", bd=0, padx=18, pady=6,
+                  activebackground=COL["accent_hover"], relief="flat", bd=0, padx=18, pady=6,
                   cursor="hand2", font=F(11, "bold")).pack(side="left", padx=6)
-        tk.Button(btns, text="Test Connection", command=test, bg=COL["bg_raised"], fg=COL["text"],
-                  activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=6,
-                  cursor="hand2", font=F(11)).pack(side="left", padx=6)
+        test_btn = tk.Button(btns, text="Test Connection", command=test, bg=COL["bg_raised"],
+                             fg=COL["text"], activebackground=COL["hover"], relief="flat",
+                             bd=0, padx=12, pady=6, cursor="hand2", font=F(11))
+        test_btn.pack(side="left", padx=6)
         tk.Button(btns, text="Cancel", command=_close_settings, bg=COL["bg_raised"], fg=COL["text"],
-                  activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=6,
+                  activebackground=COL["hover"], relief="flat", bd=0, padx=12, pady=6,
                   cursor="hand2", font=F(11)).pack(side="left", padx=6)
 
     # ════════════════════════════════════════════════════════════════════
@@ -17785,7 +21232,7 @@ class DeskpilotApp:
         if not isinstance(props, dict) or not props:
             # No fields: the server is only asking for confirmation.
             ok = messagebox.askyesno(f"{APP_NAME} — MCP question", f"{server_name}:\n\n{message}",
-                                     parent=self.root)
+                                     parent=self._dlg_parent())
             return {"action": "accept", "content": {}} if ok else {"action": "decline"}
         required = set(schema.get("required") or [])
         props_all = props
@@ -18073,11 +21520,11 @@ class DeskpilotApp:
                 self._draw_mcp_server_rows(frame, parent_top)
 
             tk.Button(rowf, text="Remove", command=_remove, bg=COL["bg_raised"],
-                      fg=COL["danger"], activebackground="#5B2323", relief="flat", bd=0,
+                      fg=COL["danger"], activebackground=COL["danger_hover"], relief="flat", bd=0,
                       padx=8, pady=1, cursor="hand2", font=F(9)).pack(side="right")
         tk.Button(frame, text="+ Add MCP Server",
                   command=lambda: self._mcp_add_server_dialog(parent_top, frame),
-                  bg=COL["bg_raised"], fg=COL["text"], activebackground="#4B5563",
+                  bg=COL["bg_raised"], fg=COL["text"], activebackground=COL["hover"],
                   relief="flat", bd=0, padx=8, pady=2, cursor="hand2", font=F(10)) \
             .pack(anchor="w", pady=(4, 0))
         # Rows were destroyed + rebuilt above: re-apply the dialog wheel binding. The very
@@ -18172,10 +21619,10 @@ class DeskpilotApp:
         btns = tk.Frame(d, bg=COL["bg_main"])
         btns.grid(row=len(fields) + 1, column=0, columnspan=2, pady=(0, 12))
         tk.Button(btns, text="Add & Connect", command=ok, bg=COL["accent"], fg="#FFFFFF",
-                  activebackground="#2563EB", relief="flat", bd=0, padx=14, pady=5,
+                  activebackground=COL["accent_hover"], relief="flat", bd=0, padx=14, pady=5,
                   cursor="hand2", font=F(11)).pack(side="left", padx=6)
         tk.Button(btns, text="Cancel", command=d.destroy, bg=COL["bg_raised"], fg=COL["text"],
-                  activebackground="#4B5563", relief="flat", bd=0, padx=12, pady=5,
+                  activebackground=COL["hover"], relief="flat", bd=0, padx=12, pady=5,
                   cursor="hand2", font=F(11)).pack(side="left", padx=6)
         try:
             d.lift()
@@ -18307,7 +21754,8 @@ class DeskpilotApp:
             self._verify_running = False
             self._verify_set_button(btn, "normal")
 
-    def _test_connection(self, url: str, key: str, top: tk.Toplevel) -> None:
+    def _test_connection(self, url: str, key: str, top: tk.Toplevel,
+                         lbl=None, btn=None) -> None:
         # `key` comes from the LIVE dialog entry, captured on the main thread by the
         # caller; this method runs on a worker thread and must not touch widgets.
         ok = False
@@ -18327,14 +21775,25 @@ class DeskpilotApp:
             ok = True
             detail = "Connected! Models: " + (", ".join(models) if models else "(none listed)")
         except Exception as e:
-            detail = f"Connection failed:\n{e}"
+            detail = f"Connection failed: {e}"
 
         def show():
+            # MAIN THREAD. The dialog may have been CLOSED while the request was in
+            # flight - impossible while this opened a modal, so the guard is new with
+            # v1.1.93 and is what makes the non-blocking version safe. winfo_exists()
+            # RAISES on a destroyed widget, so it is inside the try, not before it.
             try:
-                (messagebox.showinfo if ok else messagebox.showerror)(
-                    f"{APP_NAME} — Connection Test", detail, parent=top)
-            except Exception:
+                if lbl is not None and top.winfo_exists():
+                    lbl.configure(text=("\u2713 " if ok else "\u2717 ") + detail,
+                                  fg=COL["success"] if ok else COL["danger"])
+            except (tk.TclError, KeyError):
                 pass
+            finally:
+                try:
+                    if btn is not None and top.winfo_exists():
+                        btn.configure(state="normal")
+                except tk.TclError:
+                    pass      # dialog gone: nothing left to re-enable
 
         self._post(show)
 
@@ -18401,13 +21860,28 @@ class DeskpilotApp:
         _release_instance_lock(SETTINGS_FILE.parent)   # drop our lock (no-op in --multi / tests)
         if not (save_settings(self.settings) and save_chats(self.chats)):
             try:
+                # Owned via _dlg_parent: root is still alive here (it is destroyed just
+                # below), so this dialog CAN be owned. Unparented it could sit behind the
+                # main window during shutdown and block the close on an unclosable modal.
                 messagebox.showwarning(
                     f"{APP_NAME} - Could not save data",
                     "Settings/chat history could not be written to:\n\n"
-                    f"{SETTINGS_FILE.parent}\n\nThey will be lost when the app closes.")
+                    f"{SETTINGS_FILE.parent}\n\nThey will be lost when the app closes.",
+                    parent=self._dlg_parent())
             except Exception:
                 pass
         try:
+
+            # v1.2.17: the last chance to capture this session. Synchronous on purpose -
+            # the process is about to exit and a daemon thread would be killed mid-copy.
+            # ~1 s on the live 106 MB store, at a moment the user already expects the app
+            # to be finishing. Its guards make a bad store a no-op rather than a rotation
+            # over the last good copy.
+            try:
+                run_data_backups("close")
+            except Exception:
+                pass      # never block shutdown on a backup
+
             self.root.destroy()
         except tk.TclError:
             pass
@@ -18579,6 +22053,86 @@ def _cleanup_multi_profile(scratch: Path) -> None:
         pass
 
 
+# Written by the settings child next to the store every time it saves, and polled by
+# the parent. There is otherwise NO channel between the two processes: the child's
+# stdout is redirected to a log file rather than a pipe, and pywebview's JS bridge is
+# in-process to the child only. See _open_settings_webview().
+SETTINGS_SENTINEL_NAME = "settings_window.saved"
+
+# How often the parent checks for that sentinel while the window is open. The child
+# is a GUI process that sits idle between saves, so this thread costs one stat() per
+# interval and nothing else; 400 ms is well under the point where a font change feels
+# laggy and far above any realistic save rate.
+SETTINGS_POLL_S = 0.4
+
+
+def _settings_child_paths() -> List[str]:
+    """Directories to search for the settings UI, in order.
+
+    Frozen: PyInstaller drops --add-data payloads in sys._MEIPASS, with the next/
+    tree under it. Source: beside this script. Separate from the spawn so the
+    ordering can be checked without opening a window.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    out = []
+    if meipass:
+        out.append(str(Path(meipass) / "next"))
+        out.append(str(Path(meipass)))
+    here = Path(__file__).resolve().parent
+    out.append(str(here / "next"))
+    out.append(str(here))
+    return out
+
+
+def _settings_child_argv(settings_file) -> List[str]:
+    """How to re-enter this program as the settings child.
+
+    A frozen build has no interpreter to hand a .py script, so the child is the same
+    exe with --settings-window. --settings-file is ALWAYS passed: --multi relocates
+    SETTINGS_FILE into scratch_<pid>, and a child that re-derived the path would open
+    a different profile than the one the user is looking at.
+    """
+    if getattr(sys, "frozen", False):
+        argv = [sys.executable, "--settings-window"]
+    else:
+        argv = [sys.executable, str(Path(__file__).resolve()), "--settings-window"]
+    argv += ["--settings-file", str(settings_file)]
+    return argv
+
+
+def _run_settings_window_child(data_dir: Path) -> int:
+    """Child mode: open the WebView2 settings window against THIS profile.
+
+    Spawned as `DeskPilot.exe --settings-window [--settings-file <path>]` by
+    open_settings(). isolated=False: it reads and writes the same store the parent
+    app is using, which is the only way a Save in the window can affect the running
+    app. The parent passes its own resolved SETTINGS_FILE because --multi relocates
+    it into scratch_<pid>, and a child that re-derived the path would edit the wrong
+    profile.
+
+    Returns non-zero on any failure; the parent falls back to the Tk dialog, so a
+    broken bundle degrades to the old UI rather than leaving the user with no
+    Settings at all.
+    """
+    target = None
+    argv = sys.argv[1:]
+    for i, a in enumerate(argv):
+        if a == "--settings-file" and i + 1 < len(argv):
+            target = argv[i + 1]
+            break
+    path = Path(target) if target else SETTINGS_FILE
+    try:
+        for d in _settings_child_paths():
+            if (Path(d) / "settings_window.py").is_file() and d not in sys.path:
+                sys.path.insert(0, d)
+        import settings_window as sw
+        return sw.run(settings_path=path, isolated=False, write_override=path)
+    except Exception as e:
+        traceback.print_exc()
+        print(f"[{APP_NAME}] settings window failed to start: {e}")
+        return 1
+
+
 def main() -> int:
     if OpenAI is None:
         print("ERROR: the 'openai' package is required.  Run:  pip install openai")
@@ -18592,9 +22146,12 @@ def main() -> int:
         except Exception:
             pass
         return 1
-    global SETTINGS_FILE, CHATS_FILE, GEN_DIR
+    global SETTINGS_FILE, CHATS_FILE, GEN_DIR, DATA_DIR
     multi = "--multi" in sys.argv[1:]
     data_dir = resolve_data_dir()
+    # Set BEFORE _setup_multi_profile(): that call relocates SETTINGS_FILE/CHATS_FILE into
+    # scratch_<pid>/ and must NOT move the prompt, which is one shared user file.
+    DATA_DIR = data_dir
     if data_dir != BASE_DIR:
         SETTINGS_FILE = data_dir / "deskpilot_settings.json"
         CHATS_FILE = data_dir / "deskpilot_chats.json"
@@ -18603,6 +22160,16 @@ def main() -> int:
             GEN_DIR.mkdir(parents=True, exist_ok=True)   # module-level mkdir only covered the script folder
         except Exception:
             pass
+    # ── --settings-window: the WebView2 settings child ───────────────────────
+    # Dispatched HERE, deliberately: after SETTINGS_FILE/CHATS_FILE/DATA_DIR are
+    # resolved (the child must edit the same store the parent is using) and BEFORE
+    # _acquire_instance_lock below (the lock refuses a second instance on the same
+    # profile, and this child IS a second process - taking it would pop "Already
+    # running" instead of opening Settings). It also returns before the chat store
+    # is loaded, so the child never touches the 122 MB history or writes a backup.
+    if "--settings-window" in sys.argv[1:]:
+        return _run_settings_window_child(data_dir)
+
     if multi:
         _setup_multi_profile(data_dir)   # ephemeral scratch_<pid> seeded from main; no lock
     elif not _acquire_instance_lock(data_dir):
@@ -18633,6 +22200,12 @@ def main() -> int:
             r.destroy()
         except Exception:
             pass
+    # v1.2.6: materialize the managed blocks before the first turn, so a fresh install
+    # has a SYSTEMPROMPT.md that already says everything the model will be told.
+    try:
+        sync_system_prompt(load_settings(), "startup")
+    except Exception as e:
+        print(f"[{APP_NAME}] system prompt sync failed at startup: {e}")
     app = DeskpilotApp()
     app.run()
     return 0
@@ -18640,3 +22213,9 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+
+
+

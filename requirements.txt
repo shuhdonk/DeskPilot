@@ -19,3 +19,20 @@ av<19                   # faster-whisper needs av.open(metadata_errors=...); av 
 nvidia-cublas-cu12      # GPU dictation: ctranslate2 needs cuBLAS (deskpilot.py adds it to the library path)
                         # Windows: that is all - ctranslate2 bundles cudnn64_9.dll itself.
                         # Linux: also install nvidia-cudnn-cu12 (cuDNN 9) - see INSTALL_LINUX.md.
+
+# ── The modern Settings window ───────────────────────────────
+# pywebview renders the dark Settings window (the one with the section list down the
+# left). Without it everything still works - Settings opens the classic Tk dialog -
+# so this is optional in the "the app runs" sense and required in the "you get the
+# documented UI" sense. It is NOT auto-discovered by PyInstaller at build time either:
+# see INSTALL_WINDOWS.md Step 7 for the --collect-all flags.
+#
+# Linux: pywebview cannot choose a browser engine by itself, so the [qt] extra is
+# mandatory there - it pulls PyQt6 + PyQt6-WebEngine, which bundle their own render
+# engine and need no system packages. On Windows/macOS the plain package is right:
+# it uses the WebView2 runtime (ships with Edge) and WKWebView respectively.
+pywebview>=5.3.2 ; sys_platform != "linux"
+pywebview[qt]>=5.3.2 ; sys_platform == "linux"
+                        # pythonnet needs no line: pywebview declares it automatically
+                        # on Windows (and pyobjc on macOS). Verified against the
+                        # published wheel metadata, pywebview 6.2.1.
