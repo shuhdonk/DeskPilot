@@ -224,7 +224,7 @@ Takes a few minutes. Notes:
 ## Step 5 — Download the app files (PowerShell, one line)
 
 ```powershell
-New-Item -ItemType Directory -Force C:\Deskpilot\next | Out-Null; $h="https://raw.githubusercontent.com/shuhdonk/DeskPilot/main"; foreach($f in @("deskpilot.py","next/settings_window.py","next/settings_schema.py","next/settings_ui.html")){ Invoke-WebRequest -UseBasicParsing "$h/$f" -OutFile "C:\Deskpilot\$($f.Replace("/","\"))" }; Get-ChildItem C:\Deskpilot -Recurse -File | Select-Object FullName,Length
+$z="$env:TEMP\deskpilot.zip"; Invoke-WebRequest -UseBasicParsing "https://github.com/shuhdonk/DeskPilot/archive/refs/heads/main.zip" -OutFile $z; Expand-Archive $z "$env:TEMP\deskpilot_src" -Force; New-Item -ItemType Directory -Force C:\Deskpilot\next | Out-Null; Copy-Item "$env:TEMP\deskpilot_src\DeskPilot-main\deskpilot.py" C:\Deskpilot\ -Force; Copy-Item "$env:TEMP\deskpilot_src\DeskPilot-main\next\*" C:\Deskpilot\next\ -Force; Remove-Item $z,"$env:TEMP\deskpilot_src" -Recurse -Force; Get-ChildItem C:\Deskpilot -Recurse -File | Select-Object FullName,Length
 ```
 
 You should end up with exactly these four files, none of them tiny:
@@ -240,13 +240,22 @@ Prefer git? `git clone https://github.com/shuhdonk/DeskPilot.git C:\Deskpilot` g
 same four files. Bringing your own copy? Then copy `deskpilot.py` **and** the whole
 `next` folder — both halves are needed.
 
+⚠️ **Do not download `deskpilot.py` from `raw.githubusercontent.com`** — that URL
+returns `404` for this one file, even though the file is committed correctly and
+every smaller file in the repo downloads fine. So a raw-based script appears to work
+and silently leaves you without the app. Download the **archive** as above, or use
+git. (The same 404 hits the GitHub web page for the file; the archive and `git clone`
+both contain it.)
+
 ⚠️ **`next\` is not optional if you want the modern Settings window.** It holds the
 three files that window is built from, and they are *data* — the app loads them at
 runtime, so nothing in `deskpilot.py` imports them and no build tool can discover
 them for you. Missing? Settings quietly opens the classic dialog. Nothing errors.
 
-If a line above failed with a 404, the file is not published yet — grab it from
-<https://github.com/shuhdonk/DeskPilot> by hand instead.
+If `Copy-Item` complained that a path was not found, the folder inside the zip has a
+different name than `DeskPilot-main` (it follows the branch) — run
+`dir "$env:TEMP\deskpilot_src"` to see it, then re-run the two `Copy-Item` lines with
+that name.
 
 ## Step 6 — Test that it runs (PowerShell)
 

@@ -46,7 +46,7 @@ git clone https://aur.archlinux.org/python313.git /tmp/py313 && cd /tmp/py313 &&
 Easiest — one line, no git needed:
 
 ```bash
-mkdir -p ~/Deskpilot/next && h=https://raw.githubusercontent.com/shuhdonk/DeskPilot/main && for f in deskpilot.py next/settings_window.py next/settings_schema.py next/settings_ui.html; do curl -fL "$h/$f" -o ~/Deskpilot/$f; done && ls -la ~/Deskpilot ~/Deskpilot/next
+cd ~ && rm -rf /tmp/dp /tmp/dp.tgz && curl -fL https://github.com/shuhdonk/DeskPilot/archive/refs/heads/main.tar.gz -o /tmp/dp.tgz && mkdir -p /tmp/dp ~/Deskpilot && tar xzf /tmp/dp.tgz -C /tmp/dp && cp /tmp/dp/DeskPilot-main/deskpilot.py ~/Deskpilot/ && cp -r /tmp/dp/DeskPilot-main/next ~/Deskpilot/ && rm -rf /tmp/dp /tmp/dp.tgz && ls -la ~/Deskpilot ~/Deskpilot/next
 ```
 
 You should end up with exactly these four files, `deskpilot.py` around 1.2 MB:
@@ -67,9 +67,12 @@ same four files. Bringing your own copy? Then copy `deskpilot.py` **and** the wh
 ⚠️ **`next/` is not optional if you want the modern dark Settings window** — those
 three files are what it is built from. They are loaded at runtime as *data*, so
 nothing imports them and no build tool can discover them for you. Missing? Settings
-opens the classic dialog, with no error. A `curl` above that printed **404** means the
-file is not published yet — grab it from <https://github.com/shuhdonk/DeskPilot> by
-hand.
+opens the classic dialog, with no error.
+
+⚠️ **Do not fetch `deskpilot.py` from `raw.githubusercontent.com`** — that URL returns
+`404` for this one file while every smaller file in the repo downloads fine, so a
+raw-based script looks like it worked and leaves you without the app. The archive
+above contains it, and so does `git clone`.
 
 ### Step 3 — Python packages (terminal, one line)
 
@@ -168,7 +171,7 @@ sudo dnf install -y python3.13 python3.13-tkinter python3.13-devel portaudio-dev
 Easiest — one line, no git needed:
 
 ```bash
-mkdir -p ~/Deskpilot/next && h=https://raw.githubusercontent.com/shuhdonk/DeskPilot/main && for f in deskpilot.py next/settings_window.py next/settings_schema.py next/settings_ui.html; do curl -fL "$h/$f" -o ~/Deskpilot/$f; done && ls -la ~/Deskpilot ~/Deskpilot/next
+cd ~ && rm -rf /tmp/dp /tmp/dp.tgz && curl -fL https://github.com/shuhdonk/DeskPilot/archive/refs/heads/main.tar.gz -o /tmp/dp.tgz && mkdir -p /tmp/dp ~/Deskpilot && tar xzf /tmp/dp.tgz -C /tmp/dp && cp /tmp/dp/DeskPilot-main/deskpilot.py ~/Deskpilot/ && cp -r /tmp/dp/DeskPilot-main/next ~/Deskpilot/ && rm -rf /tmp/dp /tmp/dp.tgz && ls -la ~/Deskpilot ~/Deskpilot/next
 ```
 
 You should end up with exactly these four files, `deskpilot.py` around 1.2 MB:
@@ -189,9 +192,12 @@ same four files. Bringing your own copy? Then copy `deskpilot.py` **and** the wh
 ⚠️ **`next/` is not optional if you want the modern dark Settings window** — those
 three files are what it is built from. They are loaded at runtime as *data*, so
 nothing imports them and no build tool can discover them for you. Missing? Settings
-opens the classic dialog, with no error. A `curl` above that printed **404** means the
-file is not published yet — grab it from <https://github.com/shuhdonk/DeskPilot> by
-hand.
+opens the classic dialog, with no error.
+
+⚠️ **Do not fetch `deskpilot.py` from `raw.githubusercontent.com`** — that URL returns
+`404` for this one file while every smaller file in the repo downloads fine, so a
+raw-based script looks like it worked and leaves you without the app. The archive
+above contains it, and so does `git clone`.
 
 ### Step 3 — Python packages (terminal, one line)
 
