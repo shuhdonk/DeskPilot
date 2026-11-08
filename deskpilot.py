@@ -82,6 +82,7 @@ import ipaddress
 import json
 import os
 import queue
+import importlib.util
 import re
 import shutil
 import sqlite3
@@ -89,6 +90,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import traceback
@@ -104,12 +106,50 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, simpledialog
+from tkinter import font as tkfont
 
 # ── OpenAI SDK (required) ────────────────────────────────────────────────────
-try:
-    from openai import OpenAI
-except ImportError:         # pragma: no cover
-    OpenAI = None           # type: ignore
+# v1.2.34: imported LAZILY. Measured on this machine, `import openai` costs 764 ms of
+# the app's 1,291 ms import - 62% of the wait before the window appears - and it is
+# paid even when the user never sends a message, because openai.types pulls hundreds of
+# pydantic model definitions nobody touches until a request is actually built.
+#
+# OpenAI stays a module global so the existing `OpenAI is None` checks keep their
+# meaning and so a test can still install a stub with `g.OpenAI = fake` (one does).
+# _openai_class() resolves it on first real use: a stub or an already-imported class is
+# returned as-is, otherwise the import happens once and is remembered. _OPENAI_TRIED
+# keeps a missing package from re-attempting the import on every call.
+#
+# The startup guard must NOT use _openai_class() - that would import the package and
+# put the whole cost back. _openai_available() answers it with find_spec, which locates
+# the package without executing it (measured 0.5 ms, and it does not populate
+# sys.modules).
+OpenAI = None                # type: ignore
+_OPENAI_TRIED = False
+
+
+def _openai_class():
+    """The OpenAI class, importing the package on first use. None if unavailable."""
+    global OpenAI, _OPENAI_TRIED
+    if OpenAI is not None or _OPENAI_TRIED:
+        return OpenAI
+    _OPENAI_TRIED = True
+    try:
+        from openai import OpenAI as _cls
+        OpenAI = _cls
+    except ImportError:         # pragma: no cover
+        OpenAI = None           # type: ignore
+    return OpenAI
+
+
+def _openai_available() -> bool:
+    """Is the package installed? Answers the startup guard WITHOUT importing it."""
+    if OpenAI is not None:
+        return True
+    try:
+        return importlib.util.find_spec("openai") is not None
+    except Exception:           # pragma: no cover
+        return False
 
 # ── Optional dependencies (graceful degradation) ─────────────────────────────
 try:
@@ -1423,7 +1463,7 @@ class MCPClient:
 # ════════════════════════════════════════════════════════════════════════════
 
 APP_NAME   = "Deskpilot"
-VERSION    = "1.2.32"
+VERSION    = "1.2.34"
 # What the UI shows. VERSION itself must stay a bare dotted number: it goes on
 # the wire as the HTTP User-Agent ("Deskpilot/1.2.26") and in the MCP handshake's
 # clientInfo.version, so overloading it to label a fork would corrupt both.
@@ -1587,6 +1627,55 @@ DANGLING_INTENT_NUDGE = (
     "call for it. Do not restate the announcement or explain what you were about "
     "to do - emit the tool call now.]"
 )
+
+# v1.2.33: the second flavour of "the turn just ended", which the colon detector
+# above cannot see. The operator prompt tells the model to finish a clean response
+# with a completion marker, so a reply that stops WITHOUT it is the model declining
+# to certify its own completion - the failure measured here was a grammatically
+# complete sentence ("Now writing -") followed by EOS, which no punctuation heuristic
+# can catch. The marker is a signal the model emits about itself, so it beats
+# guessing at prose style. ONE nudge: if the convention is ignored once, repeating
+# the request mostly wastes a round-trip.
+MARKER_NUDGES_MAX = 1
+
+MARKER_NUDGE = (
+    "[Your reply ended without the completion marker your instructions require. If "
+    "the work is genuinely finished, end with the marker. If it is not - you "
+    "announced a step and stopped, or a tool call is still owed - do it now rather "
+    "than replying about it.]"
+)
+
+
+def _completion_marker(settings: dict) -> str:
+    """The token the operator prompt tells the model to end with, or "" if none applies.
+
+    Empty means "do not check", which is the whole point of routing it through
+    effective_custom_prompt(): that already returns "" when the Prompt toggle is off,
+    so a user who turned the persona off is never nudged about a rule they removed.
+    Studio is the other case - it drops the persona envelope in BOTH modes - so the
+    marker was never sent and its absence proves nothing. Callers check the mode.
+    """
+    try:
+        p = effective_custom_prompt(settings)
+    except Exception:
+        return ""
+    if not p.strip():
+        return ""
+    return "DONE" if "DONE" in p else ""
+
+
+def _reply_ends_with_marker(text: str, marker: str) -> bool:
+    """True if the reply finishes with the completion marker.
+
+    Trailing punctuation is stripped because the model writes "DONE.", "**DONE**"
+    and "DONE\n" interchangeably; all three satisfy the instruction.
+    """
+    if not marker:
+        return True
+    t = (text or "").rstrip()
+    while t and t[-1] in "`*'\"\u201d\u2019)]}.!?:;- \t\r\n":
+        t = t[:-1].rstrip()
+    return t.endswith(marker)
 
 # v1.2.22: does this reply read as a promise that was never kept?
 # The signal is a trailing colon: the model set up the thing it was about to show
@@ -3484,7 +3573,11 @@ def _expand_image_ref(p: dict) -> dict:
 #             wire text across turns (the stamp used to MIGRATE to each newest
 #             message every turn, diverging the prompt mid-list and busting the
 #             engine's KV prefix cache on every engine that reuses extensions).
-APP_LOCAL_MSG_KEYS = ("ts", "steered", "tnote")
+#   finish_reason - v1.2.33: why the model stopped ("stop" / "length" / "tool_calls").
+#             Persisted because "the turn just ended" was undiagnosable from the store:
+#             the reason was read for control flow and then thrown away, so 675 stored
+#             messages carried no evidence of how any of them finished.
+APP_LOCAL_MSG_KEYS = ("ts", "steered", "tnote", "finish_reason")
 
 
 def _with_note(m: dict, note: str) -> dict:
@@ -5865,6 +5958,16 @@ def _pad_cell(text: str, width: int, align: str) -> str:
     return text.ljust(width)
 
 
+# v1.2.33: table grids must fit ONE viewport line. chat_text is wrap="word", so a
+# grid wider than the widget is re-flowed by Tk and arrives as a staircase - measured
+# live as a 221-char grid built from a correctly aligned source. So the renderer sizes
+# the block to the widget and wraps long cells inside their own column.
+TABLE_FONT_SIZE = 11              # must match the table_row/table_border tag_configure
+TABLE_GRID_MIN_COL = 6            # never shrink a column below this
+TABLE_GRID_MARGIN_PX = 28         # padding + scrollbar allowance
+TABLE_GRID_FALLBACK_CHARS = 100   # used when nothing can be measured
+
+
 class MarkdownStream:
     """Incremental Markdown renderer for a tk.Text widget.
 
@@ -5908,6 +6011,47 @@ class MarkdownStream:
     def _insert(self, text: str, tags: Optional[List[str]] = None) -> None:
         self.app.chat_text.insert("end", text, tags or [])
 
+    def _avail_chars(self) -> int:
+        """How many monospace characters fit on one transcript line, best effort.
+
+        Every step is optional: a stub widget with no winfo, an unmapped window or a
+        missing Tk root all fall back to a fixed guess rather than raising, because a
+        table has to render even when nothing can be measured.
+        """
+        try:
+            w = self.app.chat_text.winfo_width()
+            if w <= 1:
+                w = self.app.chat_text.winfo_reqwidth()
+            px = tkfont.Font(font=FM(TABLE_FONT_SIZE)).measure("0")
+        except Exception:
+            return TABLE_GRID_FALLBACK_CHARS
+        if not px or w <= 1:
+            return TABLE_GRID_FALLBACK_CHARS
+        return max(40, (int(w) - TABLE_GRID_MARGIN_PX) // int(px))
+
+    def _fit_widths(self, widths: List[int]) -> List[int]:
+        """Shrink the columns so the finished grid fits one viewport line."""
+        ncols = len(widths)
+        if ncols == 0:
+            return widths
+        avail = self._avail_chars()
+
+        def total(ws: List[int]) -> int:
+            # A grid line is (ncols+1) border glyphs plus each cell's " x " padding,
+            # i.e. sum(w) + 2*ncols + ncols + 1. Getting this wrong by even 2 lets the
+            # emitted line exceed the viewport, which is the whole bug being fixed.
+            return sum(ws) + 3 * ncols + 1
+
+        if total(widths) <= avail:
+            return widths
+        room = max(ncols * TABLE_GRID_MIN_COL, avail - (3 * ncols + 1))
+        s = sum(widths) or 1
+        out = [max(TABLE_GRID_MIN_COL, int(w * room / s)) for w in widths]
+        # Proportional rounding can overshoot; claw back from the widest until it fits.
+        while total(out) > avail and max(out) > TABLE_GRID_MIN_COL:
+            out[out.index(max(out))] -= 1
+        return out
+
     def _flush_table(self) -> None:
         """v1.2.20: render the buffered | rows as a column-aligned grid.
 
@@ -5943,14 +6087,27 @@ class MarkdownStream:
             body.append(r)
         widths = [max([len(header[i])] + [len(r[i]) for r in body])
                   for i in range(ncols)]
+        # v1.2.33: fit the viewport, then wrap long cells across extra lines of the
+        # SAME row. Every emitted line is exactly the same length, so Tk's word wrap
+        # has nothing left to re-flow.
+        widths = self._fit_widths(widths)
 
         def border(l: str, m: str, rgt: str) -> str:
             return l + m.join("─" * (widths[i] + 2) for i in range(ncols)) + rgt
 
         def emit(cells: List[str], tags: List[str]) -> None:
-            parts = [" " + _pad_cell(cells[i], widths[i], aligns[i]) + " "
-                     for i in range(ncols)]
-            self._insert("│" + "│".join(parts) + "│\n", tags)
+            # break_long_words MUST stay True: an unbreakable token (a long
+            # identifier, a URL) left whole would overflow its column, make that line
+            # longer than the grid, and put us straight back to the staircase Tk
+            # produces. An ugly mid-word split costs less than a broken grid.
+            wrapped = [textwrap.wrap(cells[i], widths[i], break_long_words=True,
+                                     break_on_hyphens=False) or [""]
+                       for i in range(ncols)]
+            for n in range(max(len(w) for w in wrapped)):
+                parts = [" " + _pad_cell(w[n][:widths[i]] if n < len(w) else "",
+                                         widths[i], aligns[i]) + " "
+                         for i, w in enumerate(wrapped)]
+                self._insert("│" + "│".join(parts) + "│\n", tags)
 
         self._insert("\n")
         self._insert(border("┌", "┬", "┐") + "\n", ["table_border"])
@@ -14075,7 +14232,7 @@ class DeskpilotApp:
                 t.join(timeout=3)
         # Interrupt any in-flight TTS playback before starting a new turn.
         self.stop_tts()
-        if OpenAI is None:
+        if _openai_class() is None:
             return
         raw = self.input_text.get("1.0", "end-1c").strip()
         atts = list(self._attachments)
@@ -14190,14 +14347,15 @@ class DeskpilotApp:
         v1.1.94: read + write of _clients are under self._clients_lock, so a Save
         that defers (busy) cannot clear the dict while this returns a live client,
         and an invalidate that does fire is ordered against the fetch."""
-        if OpenAI is None:
+        cls = _openai_class()
+        if cls is None:
             return None
         with self._clients_lock:
             cached = self._clients.get((url, key))
             if cached is not None:
                 return cached
         try:
-            client = OpenAI(base_url=url or None, api_key=key)
+            client = cls(base_url=url or None, api_key=key)
         except Exception as e:
             self._post(lambda m=str(e): self.render_error(f"Could not create API client:\n{m}"))
             return None
@@ -14215,7 +14373,7 @@ class DeskpilotApp:
 
         Reusing one client across turns keeps its HTTP connection pool warm
         (keep-alive), so each request skips the TCP+TLS handshake."""
-        if OpenAI is None:
+        if _openai_class() is None:
             return None
         url = (self.settings.get("server_url") or "").strip()
         key = (self.settings.get("api_key") or "").strip() or "sk-local"
@@ -14578,6 +14736,8 @@ class DeskpilotApp:
         # number of times so a long answer finishes instead of vanishing.
         trunc_continues = 0
         dangling_nudges = 0  # v1.2.22: nudges spent this TURN (bounded, see below)
+        marker_nudges = 0    # v1.2.33: completion-marker nudges, bounded separately so
+                             # one failure mode cannot spend the other's budget
         model_fix_ok = True      # one auto-correction of a stale model name per turn
         self._ctx_used_run = 0   # gauge as of the last completed step of THIS prompt (worker-side copy;
                                  # _ctx_used is main-thread state and must not be written from here)
@@ -15228,9 +15388,35 @@ class DeskpilotApp:
                     "\u26a1 The reply announced a tool call but did not emit one - "
                     "asking for it\u2026"))
                 messages.append({"role": "assistant", "content": full_content,
+                                 "finish_reason": step_finish_reason or "stop",
                                  "ts": datetime.now().isoformat(timespec="seconds")})
                 messages.append({"role": "user",
                                  "content": DANGLING_INTENT_NUDGE})
+                self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
+                continue
+
+            # ── the reply skipped the completion marker the prompt asks for ────
+            # v1.2.33. Deliberately AFTER the colon check: a trailing colon is the
+            # stronger, better-measured signal and keeps priority. Skipped in Studio
+            # (the persona carrying the rule is not in the request) and when the
+            # Prompt toggle is off, so nobody is nudged about an instruction they
+            # removed or never received.
+            _marker = ("" if _studio != "off" or tool_calls
+                       else _completion_marker(self.settings))
+            if (marker_nudges < MARKER_NUDGES_MAX and _marker and full_content.strip()
+                    and not stream_error and enabled_tools
+                    and not self._closed and not self._stop_event.is_set()
+                    and not _reply_ends_with_marker(full_content, _marker)):
+                marker_nudges += 1
+                buf_c = buf_r = ""          # so finally's flush posts nothing more
+                self._post(self._ui_finish_active_md)
+                self._post(lambda: self.render_note(
+                    "\u26a1 The reply ended without the \"%s\" completion marker your "
+                    "prompt requires - asking it to finish or confirm\u2026" % _marker))
+                messages.append({"role": "assistant", "content": full_content,
+                                 "finish_reason": step_finish_reason or "stop",
+                                 "ts": datetime.now().isoformat(timespec="seconds")})
+                messages.append({"role": "user", "content": MARKER_NUDGE})
                 self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
                 continue
 
@@ -15282,6 +15468,10 @@ class DeskpilotApp:
                                     + full_content)
                     messages.pop()
                 messages.append({"role": "assistant", "content": full_content,
+                                 # v1.2.33: persisted so "why did that turn stop?" is
+                                 # answerable from the store. Stripped before sending
+                                 # (APP_LOCAL_MSG_KEYS), so no server ever sees it.
+                                 "finish_reason": step_finish_reason or "stop",
                                  "ts": datetime.now().isoformat(timespec="seconds")})
                 self._post(lambda cid=chat_id, m=list(messages): self._ui_sync_messages(cid, m))
                 if not full_content.strip() and not stream_error:
@@ -15313,6 +15503,7 @@ class DeskpilotApp:
             self._post(self._ui_mark_tool_phase)
             messages.append({"role": "assistant", "content": full_content or None,
                              "tool_calls": tool_calls,
+                             "finish_reason": step_finish_reason or "tool_calls",
                              "ts": datetime.now().isoformat(timespec="seconds")})
 
             for tc in tool_calls:
@@ -19750,7 +19941,15 @@ class DeskpilotApp:
         # its old fonts until restart, because nothing here re-scaled them.
         for fn in ("_refresh_perm_colors", "_sync_prompt_check", "_mcp_connect_all",
                    "_invalidate_clients", "_update_topbar_labels", "_refresh_ctx_topbar",
-                   "_apply_ui_font"):
+                   "_apply_ui_font",
+                   # NOT derivable from the Tk save() handler, which is why it is called
+                   # out here: the dialog applied spell-check through its own checkbox
+                   # callback (_spell_toggle), which writes the store and re-scans
+                   # immediately, so save() never mentions it. The web window has no
+                   # such callback - it only ever saves - so without this row toggling
+                   # Spell Check or editing the dictionary persists to disk and does
+                   # nothing until restart. Same class as the _apply_ui_font miss.
+                   "_spell_apply_state"):
             try:
                 getattr(self, fn)()
             except Exception:
@@ -21680,13 +21879,14 @@ class DeskpilotApp:
         timeout + max_retries=0 are the point: a chat turn wants keep-alive and SDK retries, a
         probe wants exactly one bounded attempt per request. Keeping them separate means this
         feature cannot perturb the turn path's samplers/thinking/handoff behaviour at all."""
-        if OpenAI is None:
+        cls = _openai_class()
+        if cls is None:
             return None
         url = (self.settings.get("server_url") or "").strip()
         key = (self.settings.get("api_key") or "").strip() or "sk-local"
         try:
-            return OpenAI(base_url=url or None, api_key=key,
-                          timeout=VERIFY_TIMEOUT, max_retries=0)
+            return cls(base_url=url or None, api_key=key,
+                       timeout=VERIFY_TIMEOUT, max_retries=0)
         except Exception:
             return None
 
@@ -21714,7 +21914,7 @@ class DeskpilotApp:
             self._verify_report(out_box, ["REFUSED: Model Name is empty - set it first."],
                                "Verification refused: no model name")
             return
-        if OpenAI is None:
+        if _openai_class() is None:
             self._verify_report(out_box, ["REFUSED: the 'openai' package is not installed."],
                                 "Verification refused: openai not installed")
             return
@@ -22134,7 +22334,9 @@ def _run_settings_window_child(data_dir: Path) -> int:
 
 
 def main() -> int:
-    if OpenAI is None:
+    # _openai_available(), NOT _openai_class(): the guard must not import the package,
+    # or the ~764 ms this whole change saves would simply move to startup.
+    if not _openai_available():
         print("ERROR: the 'openai' package is required.  Run:  pip install openai")
         try:
             r = tk.Tk()

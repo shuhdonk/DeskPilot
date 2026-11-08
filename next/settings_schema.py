@@ -34,8 +34,12 @@ Field record:
 
 Deliberately EXCLUDED (own panels / pure view state):
     window_geometry, sidebar_width, sidebar_collapsed, model_history,
-    prompt_preview_geometry, mcp_bar_expanded, spellcheck_words,
+    prompt_preview_geometry, mcp_bar_expanded,
     expert_model_history, tool_permissions.
+
+    (spellcheck_words used to be on that list, which is how the web window ended up
+    able to TOGGLE spell check but not manage the dictionary the toggle uses. It is a
+    `type="list"` field now.)
     skills_enabled and mcp_servers are LISTS, not scalar fields: they are edited
     by the Skills / MCP panels (`kind` sections) and written by the bridge, so
     they never appear as form fields.
@@ -104,6 +108,15 @@ SECTIONS = [
             dict(key="studio_sampling", label="Studio loosens sampling", type="bool", default=True,
                  store="top",
                  help="Studio chats use a looser top_k/temperature for more varied text."),
+            # An action, not a setting: type="probe" makes the UI render a button and
+            # apply_values() skip it entirely. It lives HERE because the classic dialog
+            # put "Verify parameters" under Sampling - it interrogates the values above
+            # it, and a user looking for it would look there.
+            dict(key="_verify_sampling", label="Verify parameters", type="probe",
+                 default="",
+                 help="Sends a few bounded probe requests and reports whether the "
+                      "server accepts each sampling key and whether the output looks "
+                      "like your settings are live. Evidence only - it changes nothing."),
         ],
     },
     {
@@ -195,6 +208,11 @@ SECTIONS = [
                  help="Lets fetch_url reach localhost/LAN. Off blocks SSRF-style targets."),
             dict(key="spellcheck_enabled", label="Spellcheck input", type="bool", default=False,
                  help="Underline suspected misspellings in the input box (needs pyspellchecker)."),
+            dict(key="spellcheck_words", label="Spell-check dictionary", type="list",
+                 default=[],
+                 help="Words you added so they stop being flagged - one per line. "
+                      "Right-clicking an underlined word in the message box adds to "
+                      "this same list."),
         ],
     },
     {
@@ -295,6 +313,29 @@ def coerce(key, value):
             return None, f"{f['label']} must be at most {hi:g}."
         return num, None
 
+    if t == "list":
+        # One entry per line; commas also accepted because people paste lists. Sorted
+        # and de-duplicated case-insensitively - the SAME normalisation _spell_add_word
+        # applies, so a word added by right-clicking the input box and one typed here
+        # cannot end up as near-duplicates that differ only by capitalisation.
+        parts = []
+        if isinstance(value, (list, tuple)):
+            # A list can arrive directly (a round-trip, or a programmatic caller).
+            # str()-ing it would produce "['a', 'b']" and the comma split below would
+            # then yield "['a'" and " 'b']" - silently corrupting the dictionary with
+            # bracket-and-quote fragments. Measured before this branch existed.
+            parts = [str(x) for x in value]
+        else:
+            for chunk in ("" if value is None else str(value)).split("\n"):
+                parts.extend(chunk.split(","))
+        out, seen = [], set()
+        for p in parts:
+            w = p.strip()
+            if w and w.lower() not in seen:
+                seen.add(w.lower())
+                out.append(w)
+        return sorted(out, key=str.lower), None
+
     raw = "" if value is None else str(value)
     if not f.get("multiline"):
         raw = raw.strip()
@@ -313,6 +354,9 @@ def build_payload(settings):
                 v = sampling.get(k, f["default"])
             else:
                 v = settings.get(k, f["default"])
+            if isinstance(v, list):
+                # A list field is edited as one-entry-per-line text.
+                v = "\n".join(str(x) for x in v)
             values[k] = "" if v is None else v
     # Suggestion lists for refreshable fields (previously-used model names). These
     # are deliberately NOT form fields - the user never edits a history list - but the
@@ -340,6 +384,11 @@ def apply_values(settings, incoming):
     for key, raw in incoming.items():
         f = FIELDS.get(key)
         if f is None:
+            continue
+        if f.get("type") == "probe":
+            # A probe is an ACTION rendered as a button, not a value. The UI sends the
+            # whole form on Save, so without this skip it would write a junk key into
+            # the settings file on every save.
             continue
         val, err = coerce(key, raw)
         if err:

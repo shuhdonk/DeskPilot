@@ -78,6 +78,13 @@
   /* Server feedback under a refreshable name field (which models are loaded, etc).
      Dimmer than .help because it is transient server state, not a permanent hint. */
   .model-note { margin-top: 6px; font-size: 11.5px; color: var(--text-dim); }
+  /* Probe evidence: monospace and scrollable, because alignment in the report is
+     meaningful and it is routinely 40+ lines long. */
+  .probe-out { margin-top: 8px; padding: 10px 12px; max-height: 320px; overflow: auto;
+               font-family: Consolas, "Courier New", monospace; font-size: 11.5px;
+               white-space: pre; color: var(--text-dim);
+               background: var(--bg-input); border: 1px solid var(--border-soft);
+               border-radius: 6px; }
 
   .toggle-row { display: flex; align-items: center; }
   .switch { position: relative; display: inline-block; width: 40px; height: 22px; }
@@ -247,6 +254,9 @@ const state = {
      refreshField(); the open-time silent pass fills model_name so a stale name is
      auto-corrected to the single loaded model, as the Tk dialog did. */
   models: {},
+  /* Verify parameters output, kept out of the DOM so re-rendering the section does
+     not discard evidence the user is still reading. */
+  probe: null,
   active: PAYLOAD.sections[0].id,
   filter: "",
   // panel caches, so switching nav tabs does not re-download anything
@@ -343,6 +353,48 @@ function fieldEl(f) {
     ta.oninput = () => { state.values[f.key] = ta.value; clearError(f.key); };
     ta.classList.toggle("err", !!state.errors[f.key]);
     wrap.appendChild(ta);
+  } else if (f.type === "list") {
+    /* A persisted list, edited one entry per line (the spell-check dictionary).
+       coerce() splits on newlines AND commas, de-dupes case-insensitively and sorts,
+       so pasting a comma-separated list works and re-saving cannot grow duplicates. */
+    const ta = document.createElement("textarea");
+    ta.rows = 6;
+    ta.value = state.values[f.key] ?? "";
+    ta.oninput = () => { state.values[f.key] = ta.value; clearError(f.key); };
+    ta.classList.toggle("err", !!state.errors[f.key]);
+    wrap.appendChild(ta);
+  } else if (f.type === "probe") {
+    /* An ACTION, not a value: apply_values() skips it so it never reaches the store.
+       Results live in state.probe so a re-render (Save, section switch) does not wipe
+       the evidence the user is still reading. */
+    const b = document.createElement("button");
+    b.className = "btn";
+    b.textContent = "Verify parameters";
+    b.onclick = async () => {
+      b.disabled = true;
+      b.textContent = "Verifying\u2026 (several requests, up to a minute)";
+      setStatus("Verifying sampling parameters\u2026");
+      let res;
+      try {
+        res = await window.pywebview.api.verify_sampling();
+      } catch (e) {
+        res = { ok: false, lines: ["Verification failed: " + e], status: "" };
+      }
+      state.probe = { lines: res.lines || [], status: res.status || "" };
+      b.disabled = false;
+      b.textContent = "Verify parameters";
+      render();
+      setStatus(res.status || (res.ok ? "Verification finished" : "Verification failed"),
+                res.ok ? "ok" : "bad");
+    };
+    wrap.appendChild(b);
+    const p = state.probe;
+    if (p && p.lines && p.lines.length) {
+      const box = document.createElement("pre");
+      box.className = "probe-out";
+      box.textContent = p.lines.join("\n");
+      wrap.appendChild(box);
+    }
   } else if (f.refresh) {
     /* Server-backed name field: editable text (free typing still works, exactly like
        the Tk editable combobox) plus a datalist of live ids merged with saved

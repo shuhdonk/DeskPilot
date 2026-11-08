@@ -453,6 +453,69 @@ class Api:
         return {"ok": bool(ids), "ids": ids, "loaded": [], "note": msg[:200],
                 "message": msg}
 
+    def verify_sampling(self) -> Dict[str, Any]:
+        """Settings -> Sampling -> Verify parameters, ported from the Tk dialog.
+
+        Asks the server, with a handful of bounded probe requests, whether it accepts
+        each configured sampling key and whether the output behaves as though the
+        settings were live - so a parameter the server silently ignores cannot
+        masquerade as applied. Evidence only; it never writes a setting.
+
+        Uses a PRIVATE client (timeout + max_retries=0), never the pooled chat client,
+        so it cannot perturb the turn path. Synchronous like skills_install: pywebview's
+        bridge is request/response, so the UI disables the button and waits.
+
+        ⚠ ONE BEHAVIOUR THE TK DIALOG HAD AND THIS CANNOT: it refused to run while a
+        chat turn was in flight, because two concurrent request streams make the
+        verdict meaningless. The settings child has no channel to the parent's _busy
+        flag (stdout is a log file; the bridge is in-process to the child). The probe
+        remains SAFE mid-turn - private client, no shared state - so it is offered with
+        the caveat stated in the result rather than silently dropped. Silently dropping
+        a behaviour is the exact bug class that lost the model list in 1.2.32.
+        """
+        model = str(self._settings.get("model_name") or "").strip()
+        if not model:
+            return {"ok": False, "lines": ["REFUSED: Model Name is empty - set it first."],
+                    "status": "Verification refused: no model name"}
+        cls = app._openai_class()
+        if cls is None:
+            return {"ok": False,
+                    "lines": ["REFUSED: the 'openai' package is not installed."],
+                    "status": "Verification refused: openai not installed"}
+        url = str(self._settings.get("server_url") or "").strip()
+        key = str(self._settings.get("api_key") or "").strip() or "sk-local"
+        try:
+            client = cls(base_url=url or None, api_key=key,
+                         timeout=app.VERIFY_TIMEOUT, max_retries=0)
+        except Exception as e:
+            return {"ok": False,
+                    "lines": ["REFUSED: could not create an API client "
+                              "(check Server URL / API Key).", str(e)],
+                    "status": "Verification failed: no API client"}
+
+        lines: List[str] = []
+        try:
+            info = app.fetch_model_info(url, key) if url else []
+            kwargs = app.sampling_kwargs(self._settings)
+            app.run_sampling_verify(
+                client, model, kwargs["top"], kwargs["flat"], info,
+                timeout=app.VERIFY_TIMEOUT,
+                report=lambda group: lines.extend(str(x) for x in group))
+            lines.append("(evidence only: a server can accept a key and ignore it)")
+            lines.append("")
+            lines.append("NOTE: unlike the classic dialog this cannot tell whether a "
+                         "chat turn is running; if one is, read the verdict as "
+                         "indicative rather than conclusive.")
+            return {"ok": True, "lines": lines,
+                    "status": "Sampling verification finished"}
+        except Exception as e:
+            # str(e) is often EMPTY (TypeError/KeyError with no args), which rendered
+            # as "Verification aborted: " and told the user nothing. The type name is
+            # the informative part when the message is not.
+            detail = f"{type(e).__name__}: {e}".strip()
+            return {"ok": False, "lines": lines + ["Verification aborted: " + detail],
+                    "status": "Sampling verification aborted"}
+
     # ── skills ─────────────────────────────────────────────────────────────
     def skills_list(self) -> Dict[str, Any]:
         """Installed skills (all of them) with their enabled flag."""
